@@ -33,6 +33,51 @@ per-source properties in `src/CMakeLists.txt`. The rest of the component is
 ordinary gz-rendering C++ that talks to it through the plain-C++ `O3deBackend`
 interface.
 
+## Reference environment (exact state used to produce this PoC)
+
+This backend was developed and verified against the specific O3DE checkout and
+toolchain below. O3DE's `development` branch and Atom move quickly; to fully
+reproduce the run, pin to these versions.
+
+| Component | Value |
+|-----------|-------|
+| OS | Ubuntu 24.04.4 LTS, kernel 6.17 |
+| GPU / driver | NVIDIA GeForce RTX 4060 Ti, driver 580.159.03 |
+| Vulkan | API 1.4.312 (NVIDIA ICD) |
+| Compiler | clang / clang++ **18.1.3** |
+| CMake | 3.28.3 |
+| Ninja | from a local venv (`uv venv … && uv pip install ninja`), on `PATH` |
+| **O3DE engine** | repo `git@github.com:o3de/o3de.git`, branch `development`, commit **`5bdb8cc3111d5064438780503f09e78ccc850738`**, engine version `4.2.0` |
+| O3DE 3rd-party (`LY_3RDPARTY_PATH=~/o3de-packages`) | 62 packages; key ones: `RapidJSON-1.1.0-rev1`, `RapidXML-1.13-rev1`, `cityhash-1.1`, `zlib-1.2.11-rev5`, `lz4-1.9.4-rev2`, `Lua-5.4.4-rev1`, `qt-5.15.2-rev9` |
+| O3DE build | `vendor/o3de/build/linux` (`profile` config, Ninja Multi-Config, clang-18) |
+
+### O3DE engine checkout
+
+```bash
+git clone git@github.com:o3de/o3de.git vendor/o3de
+git -C vendor/o3de checkout 5bdb8cc3111d5064438780503f09e78ccc850738
+```
+
+The 3rd-party packages are fetched automatically by O3DE's build into
+`LY_3RDPARTY_PATH` (`~/o3de-packages`) from its CDN; pinning the engine commit
+pins the package revisions it requests.
+
+### Cooked project (`GzAtomPoc`)
+
+Atom loads cooked assets (pipelines, AuxGeom shaders) at runtime from a project
+cache. The PoC uses a minimal project named **`GzAtomPoc`** (created from
+O3DE's `MinimalProject` template):
+
+| Item | Value |
+|------|-------|
+| Project name | `GzAtomPoc` (default `GZ_O3DE_PROJECT_NAME`) |
+| Enabled gems | `GzAtomPoc`, `Atom`, `CameraFramework`, `ImGui`, `ScriptAutomation` |
+| `engine_version` | `4.2.0` |
+| Cooked cache | `~/o3de-gzpoc/Cache/linux` (~885 MB, `AssetProcessorBatch --platforms=linux`) |
+
+> The backend only needs the cooked **cache** + the Atom **gem set** this
+> project pulls in; it does not run any project game code.
+
 ## Prerequisites
 
 1. **clang-18.** O3DE is built with clang and its Atom RHI headers use
