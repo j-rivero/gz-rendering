@@ -173,6 +173,10 @@ export DISPLAY=:1
 #                          N x the requested resolution and box-downsamples on
 #                          readback; N>1 antialiases the AuxGeom primitives that
 #                          pipeline MSAA cannot (they are drawn post-resolve).
+#   GZ_O3DE_INTEROP=1      (experimental, M4) request that Atom create exportable
+#                          images + semaphores (OPAQUE_FD), the foundation for the
+#                          future zero-copy Vulkan->GL display path. Off by
+#                          default; see o3de/M4_INTEROP_DESIGN.md.
 
 GZ_O3DE_DEMO_SHAPES=1 gz gui -c examples/config/scene3d.config   # <engine>o3de</engine>
 ```

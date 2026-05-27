@@ -63,6 +63,13 @@
 #include <AzFramework/Scene/Scene.h>
 #include <AzFramework/Scene/SceneSystemInterface.h>
 
+// M4 zero-copy interop: the Vulkan RHI's external-handle bus. Header-only EBus
+// (the bus context is shared across modules via the AZ environment), so no link
+// against the Vulkan RHI gem is needed just to connect a handler. <vulkan/vulkan.h>
+// supplies the Vk* flag types VulkanBus.h refers to but does not itself include.
+#include <vulkan/vulkan.h>
+#include <Atom/RHI.Reflect/Vulkan/VulkanBus.h>
+
 #include "O3deBackend.hh"
 
 namespace gz
@@ -92,6 +99,50 @@ namespace
     const char *value = std::getenv(_envName);
     return (value && value[0]) ? value : _fallback;
   }
+
+  // M4 interop foundation: connected before the RHI device is created, this
+  // handler makes Atom allocate every image's backing memory and every timeline
+  // semaphore as exportable (OPAQUE_FD). The Vulkan RHI queries this same bus at
+  // device creation (VMA pTypeExternalMemoryHandleTypes), image creation
+  // (VkExternalMemoryImageCreateInfo) and timeline-semaphore creation
+  // (VkExportSemaphoreCreateInfo) -- see Device.cpp / TimelineSemaphoreFence.cpp.
+  // With it connected, the offscreen render-target image can be exported as an
+  // FD and imported into GL (the zero-copy display path); see M4_INTEROP_DESIGN.md.
+  // The logs confirm Atom actually queried the bus (proving the resources are
+  // created exportable). Gated by GZ_O3DE_INTEROP so the default readback path is
+  // completely unaffected.
+  class GzExternalHandleProvider
+      : public AZ::Vulkan::ExternalHandleRequirementBus::Handler
+  {
+    public: void CollectExternalMemoryRequirements(
+        VkExternalMemoryHandleTypeFlagsKHR &_flags) override
+    {
+      _flags |= VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT_KHR;
+      if (!this->loggedMemory)
+      {
+        std::fprintf(stderr,
+            "[gz-o3de] interop: Atom queried external-memory requirements "
+            "-> requesting OPAQUE_FD (images become exportable)\n");
+        this->loggedMemory = true;
+      }
+    }
+
+    public: void CollectSemaphoreExportHandleTypes(
+        VkExternalSemaphoreHandleTypeFlags &_flags) override
+    {
+      _flags |= VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT_KHR;
+      if (!this->loggedSemaphore)
+      {
+        std::fprintf(stderr,
+            "[gz-o3de] interop: Atom queried semaphore-export requirements "
+            "-> requesting OPAQUE_FD (timeline semaphores become exportable)\n");
+        this->loggedSemaphore = true;
+      }
+    }
+
+    private: bool loggedMemory = false;
+    private: bool loggedSemaphore = false;
+  };
 }
 
 /// \brief Private Atom-owning data for O3deBackend.
@@ -119,6 +170,13 @@ class O3deBackend::Impl
   // SSAA factor (>=1). Set once from GZ_O3DE_SSAA during bootstrap; 1 disables
   // supersampling. outputWidth/Height track the supersampled render size.
   public: uint32_t ssaaScale = kDefaultSsaaScale;
+
+  // M4 interop (experimental, GZ_O3DE_INTEROP): when set, this handler is
+  // connected before the RHI device is created so Atom makes images + semaphores
+  // exportable. Member of the (leaked) Impl so it stays connected for the life of
+  // the runtime. Off by default -> zero effect on the readback path.
+  public: bool interop = false;
+  public: GzExternalHandleProvider externalHandleProvider;
 
   // ---- Cross-thread state (guarded by mutex) ------------------------------
   public: std::thread renderThread;
@@ -634,6 +692,9 @@ bool O3deBackend::Impl::BootstrapOnThread()
   }
   std::fprintf(stderr, "[gz-o3de] SSAA scale = %u\n", this->ssaaScale);
 
+  // M4 interop: opt-in request that Atom create exportable images + semaphores.
+  this->interop = (std::getenv("GZ_O3DE_INTEROP") != nullptr);
+
   const char *enginePath = EnvOr("GZ_O3DE_ENGINE_PATH",
       "/home/jrivero/code/gz/gz-rendering/vendor/o3de");
   const char *projectPath = EnvOr("GZ_O3DE_PROJECT_PATH",
@@ -693,6 +754,19 @@ bool O3deBackend::Impl::BootstrapOnThread()
   AZ::SettingsRegistryMergeUtils::
       MergeSettingsToRegistry_AddBuildSystemTargetSpecialization(
           *settingsRegistry, "gzatompoc_gamelauncher");
+
+  // Connect the external-handle bus BEFORE Start(): the RHI device (and its VMA
+  // allocator, which captures the external memory handle types once at creation)
+  // is built during Start(). The bus context lives in the AZ environment, which
+  // the GameApplication ctor above already brought up, so the handler is visible
+  // to the Vulkan RHI gem when it broadcasts during device creation.
+  if (this->interop)
+  {
+    this->externalHandleProvider.BusConnect();
+    std::fprintf(stderr,
+        "[gz-o3de] interop: ExternalHandleRequirementBus handler connected "
+        "(GZ_O3DE_INTEROP)\n");
+  }
 
   AzGameFramework::GameApplication::StartupParameters startupParams;
   this->app->Start({}, startupParams);

@@ -104,6 +104,47 @@ per frame:                                             (one-time, on the GL thre
 4. **Wire gz-gui:** flip `GraphicsAPI()`→`OPENGL`, return the texture from
    `RenderTextureGLId()`, verify the live viewer.
 
+## Implementation progress
+
+**Step 1a — DONE & verified (foundation).** A header-only
+`AZ::Vulkan::ExternalHandleRequirementBus::Handler` (`GzExternalHandleProvider`
+in `O3deBackend.cc`) is connected before `GameApplication::Start()`, gated by
+**`GZ_O3DE_INTEROP`** (off by default → the readback path is untouched). Verified:
+with it on, the runtime still boots and renders the box/sphere/cylinder (960×720
+→ readback), exit clean, no Vulkan/VMA errors, and the log confirms Atom queried
+the bus — `Atom queried external-memory requirements -> requesting OPAQUE_FD
+(images become exportable)`. So the RTT image and its VMA-backed memory are now
+created exportable. (The *semaphore* collector was not hit in the short offscreen
+run — the offscreen path appears to use binary fences, not timeline semaphores;
+revisit when wiring sync in step 3, possibly creating our own exportable
+semaphore.)
+
+**Step 1b — BLOCKED on a linkage decision (the real M4 obstacle).** Proving the
+FD export (`vkGetMemoryFdKHR` on the RTT image) needs the native handles
+(`AZ::Vulkan::GetNativeImage` / `GetImageMemory` / `GetDeviceNativeHandle`).
+Those live in `RHIVulkanInterface.cpp`, compiled into the **static** library
+`Gem::Atom_RHI_Vulkan.Interface`, which PUBLIC-depends on the whole
+`.Private.Static`. Our plugin loads the Vulkan RHI as a **runtime gem `.so`**, so
+linking that static lib pulls a *second* copy of the Vulkan RHI into the plugin
+(duplicate AZ type registration / static state) — a real risk to the working
+PoC. The functions themselves are thin casts
+(`static_cast<Vulkan::Image&>(img).GetNativeImage()`), so the candidate
+approaches are:
+  1. **Reimplement the 2–3 accessors inline** in `O3deBackend.cc` by including the
+     Vulkan RHI *Source* internal headers (`RHI/Image.h`, `RHI/Device.h`,
+     `MemoryView.h`) and doing the cast ourselves — *if* `GetNativeImage()` /
+     `GetMemoryView().GetNativeDeviceMemory()` are inline (no extra link). Lowest
+     duplication risk; needs the internal include dirs (+ glad/vma) to compile.
+  2. **Link `Gem::Atom_RHI_Vulkan.Interface` whole-archive** and rely on AZ's
+     UUID-based `azrtti_cast` + identical layout (same source/flags) making the
+     cross-module cast valid. Simplest to wire; carries the duplicate-static-state
+     risk — must validate no double-registration asserts.
+  3. **Add a tiny exporter to the GzAtomPoc gem** (built inside the O3DE tree,
+     where linking `.Interface` is natural) that exposes the FD via a clean C ABI
+     / EBus the plugin calls. Cleanest separation; most plumbing.
+
+Recommendation: try (1) first (least risk to the shipping PoC); fall back to (3).
+
 ## Risks / open questions
 
 * **Layout & tiling hand-off** (step 2/3) is the classic interop failure mode;

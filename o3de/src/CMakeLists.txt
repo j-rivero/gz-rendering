@@ -52,6 +52,9 @@ set(O3DE_BACKEND_INCLUDES
   ${O3DE_ROOT}/Gems/Atom/RPI/Code/Include
   ${O3DE_ROOT}/Gems/Atom/RPI/Code/External
   ${O3DE_ROOT}/Gems/Atom/RHI/Code/Include
+  # Vulkan RHI public Include: the ExternalHandleRequirementBus (VulkanBus.h)
+  # used to request exportable images/semaphores for M4 zero-copy interop.
+  ${O3DE_ROOT}/Gems/Atom/RHI/Vulkan/Code/Include
   ${O3DE_ROOT}/Gems/Atom/Feature/Common/Code/Include
   ${O3DE_ROOT}/Gems/Atom/Feature/Common/Code/3rdParty/ACES
   ${O3DE_ROOT}/Gems/Atom/Utils/Code/Include
