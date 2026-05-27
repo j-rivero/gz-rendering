@@ -131,12 +131,18 @@ target_link_libraries(${o3de_target}
       ${O3DE_BIN}/libAzCore.so
     -Wl,--end-group)
 
-# When interop is enabled, define GZ_O3DE_INTEROP_BUILD so O3deBackend.cc compiles
-# the native-handle accessor calls (which require the patched gem above). Without
-# it the file builds patch-free and the interop probe is a logged no-op.
+# When interop is enabled, define GZ_O3DE_INTEROP_BUILD for the whole component so
+# both O3deBackend.cc (the native-handle accessor calls, which require the patched
+# gem above) and O3deGlInterop.cc (the GL import self-test) compile their interop
+# bodies. Without it the component builds patch-free, links no GL/EGL, and the
+# interop probe / GL self-test are logged no-ops. The O3DE-specific compile model
+# (-fno-exceptions, O3DE defines/includes) stays scoped to O3deBackend.cc via the
+# set_source_files_properties() call above and is not affected by this.
 if (GZ_O3DE_INTEROP)
-  set_property(SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/O3deBackend.cc
-    APPEND PROPERTY COMPILE_DEFINITIONS GZ_O3DE_INTEROP_BUILD=1)
+  target_compile_definitions(${o3de_target} PRIVATE GZ_O3DE_INTEROP_BUILD=1)
+  # O3deGlInterop.cc imports the exported Vulkan image into a GL texture via a
+  # private EGL/desktop-GL context.
+  target_link_libraries(${o3de_target} PRIVATE EGL GL)
 endif()
 
 # Find the O3DE shared libs at runtime (PoC: point straight at the build tree).

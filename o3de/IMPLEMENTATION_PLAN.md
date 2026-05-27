@@ -123,7 +123,7 @@ gz HFOV → vertical FOV via `vFov = 2*atan(tan(hFov/2)/aspect)`.
 | **M2** | Fuse M0+M1 — real bootstrap/readback behind `O3deRenderTarget::Copy`; one hardcoded AuxGeom box in gz-gui via O3DE | **Done** |
 | **M3** | Wire the scene graph — `Create{Box,Sphere,Cylinder}Impl` + transforms + material colour drive AuxGeom from real scene contents | **Done** |
 | **M3.5** | Live gz-gui display — dedicated O3DE thread fixes the cross-thread asset-load deadlock; dynamic resize to the window's true aspect; ~60 fps continuous | **Done** |
-| **M4** | (post-PoC) zero-copy Vulkan↔GL interop for performance — design done + **step 1 (exportable-image foundation) DONE & verified**: an Atom image exports a valid OS FD via `vkGetMemoryFdKHR` under `-DGZ_O3DE_INTEROP=ON`; steps 2–4 (GL import, semaphore sync, gz-gui wiring) pending ([M4_INTEROP_DESIGN.md](M4_INTEROP_DESIGN.md)) | In progress |
+| **M4** | (post-PoC) zero-copy Vulkan↔GL interop for performance — design done + **steps 1–2 DONE & verified**: an Atom image exports a valid OS FD (`vkGetMemoryFdKHR`) and that FD imports into a GL texture that reads back bit-exact (`GZ_O3DE_INTEROP_GLTEST`), under `-DGZ_O3DE_INTEROP=ON`; remaining: render-into, semaphore sync, gz-gui wiring ([M4_INTEROP_DESIGN.md](M4_INTEROP_DESIGN.md)) | In progress |
 
 ## Risks & mitigations (outcomes)
 
@@ -142,8 +142,9 @@ gz HFOV → vertical FOV via `vFov = 2*atan(tan(hFov/2)/aspect)`.
 * Remove debug logging in `O3deBackend.cc` / `O3deRenderTarget.cc`.
 * Real meshes, textures, PBR materials, lights and shadows.
 * Zero-copy Vulkan↔GL interop (`RenderTextureGLId()`), M4 — see
-  [M4_INTEROP_DESIGN.md](M4_INTEROP_DESIGN.md). Step 1 (exportable-image
-  foundation) is **done & verified** behind `-DGZ_O3DE_INTEROP=ON` (needs the small
-  gem patch in `patches/`); remaining: GL import, semaphore sync, gz-gui wiring.
+  [M4_INTEROP_DESIGN.md](M4_INTEROP_DESIGN.md). Steps 1–2 (FD export + GL import,
+  bit-exact round-trip) are **done & verified** behind `-DGZ_O3DE_INTEROP=ON` (needs
+  the small gem patch in `patches/`); remaining: render the live scene into the
+  shared image, semaphore sync, gz-gui wiring.
 * Replace hard-coded `vendor/o3de` + `~/o3de-packages` build paths with cache
   variables; ship a minimal vendored asset bundle instead of a full project.

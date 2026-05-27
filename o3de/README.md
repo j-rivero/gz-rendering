@@ -206,6 +206,12 @@ export DISPLAY=:1
 #                          with -DGZ_O3DE_INTEROP=ON (which needs the O3DE gem
 #                          patch); otherwise it is a logged no-op. The default
 #                          readback path is unaffected. See o3de/M4_INTEROP_DESIGN.md.
+#   GZ_O3DE_INTEROP_GLTEST=1  (with GZ_O3DE_INTEROP=1) run a one-shot headless
+#                          self-test of the Vulkan->GL zero-copy import: a known
+#                          gradient is uploaded into the exportable image, imported
+#                          into a GL texture via its FD on a private EGL context,
+#                          read back and compared. Logs "gltest: PASS/FAIL". Proves
+#                          the import/tiling path without gz-gui or a visible window.
 
 GZ_O3DE_DEMO_SHAPES=1 gz gui -c examples/config/scene3d.config   # <engine>o3de</engine>
 ```

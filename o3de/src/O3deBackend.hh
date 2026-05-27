@@ -46,6 +46,21 @@ namespace gz
       float color[4] = {0.8f, 0.8f, 0.8f, 1.0f}; //!< RGBA diffuse color.
     };
 
+    /// \brief Everything a GL-context thread needs to import the backend's
+    /// exportable Vulkan colour image as a GL texture (M4 zero-copy interop).
+    /// Plain data: the FD is an OS handle, no Vulkan/GL types leak through.
+    /// The image is `R8G8B8A8_UNORM`, optimal tiling. The FD refers to the whole
+    /// VMA memory block (\ref allocationSize); the image starts at
+    /// \ref allocationOffset within it. The caller owns \ref fd and must close it.
+    struct O3deInteropImport
+    {
+      int fd = -1;                  //!< dup'd OPAQUE_FD for the backing memory.
+      uint32_t width = 0u;          //!< Image width in pixels.
+      uint32_t height = 0u;         //!< Image height in pixels.
+      uint64_t allocationSize = 0u; //!< Size of the whole memory block the FD maps.
+      uint64_t allocationOffset = 0u; //!< Byte offset of the image in that block.
+    };
+
     /// \brief Camera pose + projection for one frame, in gz world coordinates.
     struct O3deCameraData
     {
@@ -103,6 +118,17 @@ namespace gz
       public: bool RenderFrame(const O3deCameraData &_camera,
                   const std::vector<O3deShapeData> &_shapes,
                   uint32_t _width, uint32_t _height, uint8_t *_outRgba);
+
+      /// \brief Get import handles for the exportable interop colour image
+      /// (M4 zero-copy path). Only valid when the plugin was built with
+      /// -DGZ_O3DE_INTEROP=ON and the runtime was started with GZ_O3DE_INTEROP
+      /// set; otherwise returns false. On success \p _out.fd is a fresh dup the
+      /// caller must close. The image is filled with a deterministic gradient
+      /// (R=x, G=y, B=128) so a GL importer can verify a correct round-trip.
+      /// Safe to call from another thread (it dups a stored FD; no O3DE work).
+      /// \param[out] _out Import handles + geometry.
+      /// \return True if interop is built+enabled and the FD was produced.
+      public: bool GetInteropImport(O3deInteropImport &_out);
 
       /// \brief Constructor. Use Instance().
       private: O3deBackend();

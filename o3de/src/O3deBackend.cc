@@ -67,7 +67,9 @@
 #include <Atom/RPI.Reflect/System/RenderPipelineDescriptor.h>
 #include <Atom/RHI/RHISystemInterface.h>
 #include <Atom/RHI/Image.h>
+#include <Atom/RHI/ImagePool.h>
 #include <Atom/RHI/DeviceImage.h>
+#include <Atom/RHI.Reflect/ImageSubresource.h>
 #include <Atom/RHI.Reflect/MultisampleState.h>
 #include <Atom/Feature/Utils/FrameCaptureBus.h>
 
@@ -90,6 +92,7 @@
 #endif
 
 #include "O3deBackend.hh"
+#include "O3deGlInterop.hh"  // plain-types declaration; no GL headers leak here
 
 namespace gz
 {
@@ -227,6 +230,15 @@ class O3deBackend::Impl
   // is off.
   public: AZ::Data::Instance<AZ::RPI::AttachmentImage> interopImage;
   public: bool interopFdProven = false;
+  // Stored import handles for the exportable interop image (M4 step 2). The FD
+  // is kept open (dup'd to callers via GetInteropImport) so a GL-context thread
+  // can import the image without any O3DE call. interopImageReady gates access.
+  public: bool interopImageReady = false;
+  public: int interopFd = -1;
+  public: uint32_t interopWidth = 0u;
+  public: uint32_t interopHeight = 0u;
+  public: uint64_t interopAllocSize = 0u;
+  public: uint64_t interopAllocOffset = 0u;
 
   // M4 interop (experimental, GZ_O3DE_INTEROP): when set, this handler is
   // connected before the RHI device is created so Atom makes images + semaphores
@@ -460,7 +472,16 @@ bool O3deBackend::Impl::SetupScene(uint32_t _width, uint32_t _height)
   // foundation. No-op unless GZ_O3DE_INTEROP is set; the readback path is
   // untouched either way.
   if (this->interop)
+  {
     this->ProveFdExportOnce();
+
+    // M4 step 2b: optional headless GL self-test of the zero-copy import path.
+    // Off by default (GZ_O3DE_INTEROP_GLTEST) -- it creates its own GL context,
+    // imports the exported image, and verifies the gradient round-trips. Runs
+    // here (render thread, post-bootstrap) so the GL context lifetime is local.
+    if (std::getenv("GZ_O3DE_INTEROP_GLTEST"))
+      RunO3deInteropGlSelfTest();
+  }
 
   return true;
 }
@@ -493,10 +514,14 @@ void O3deBackend::Impl::ProveFdExportOnce()
         "[gz-o3de] interop: no system attachment pool; cannot probe FD export\n");
     return;
   }
+  const uint32_t kW = 256u;
+  const uint32_t kH = 256u;
+  // Color (future render-into) + ShaderRead (GL/Atom sampling) + CopyWrite (so we
+  // can upload the verification pattern) + CopyRead.
   const AZ::RHI::ImageDescriptor desc = AZ::RHI::ImageDescriptor::Create2D(
       AZ::RHI::ImageBindFlags::Color | AZ::RHI::ImageBindFlags::ShaderRead |
-          AZ::RHI::ImageBindFlags::CopyRead,
-      256u, 256u, AZ::RHI::Format::R8G8B8A8_UNORM);
+          AZ::RHI::ImageBindFlags::CopyRead | AZ::RHI::ImageBindFlags::CopyWrite,
+      kW, kH, AZ::RHI::Format::R8G8B8A8_UNORM);
   this->interopImage = AZ::RPI::AttachmentImage::Create(
       *imageSystem->GetSystemAttachmentPool(), desc,
       AZ::Name("GzInteropProbeImage"), nullptr, nullptr);
@@ -505,6 +530,45 @@ void O3deBackend::Impl::ProveFdExportOnce()
     std::fprintf(stderr,
         "[gz-o3de] interop: AttachmentImage::Create failed; cannot probe\n");
     return;
+  }
+
+  // Upload a deterministic gradient (R=x, G=y, B=128) so a GL importer can verify
+  // a correct memory/layout round-trip. Atom stages + copies this on a later tick.
+  {
+    std::vector<uint8_t> pattern(static_cast<size_t>(kW) * kH * 4u);
+    for (uint32_t y = 0u; y < kH; ++y)
+    {
+      for (uint32_t x = 0u; x < kW; ++x)
+      {
+        uint8_t *px = &pattern[(static_cast<size_t>(y) * kW + x) * 4u];
+        px[0] = static_cast<uint8_t>(x);
+        px[1] = static_cast<uint8_t>(y);
+        px[2] = 128u;
+        px[3] = 255u;
+      }
+    }
+    AZ::RHI::Image *uploadImage = this->interopImage->GetRHIImage();
+    AZ::RHI::DeviceImageSubresourceLayout devLayout =
+        AZ::RHI::GetImageSubresourceLayout(AZ::RHI::Size(kW, kH, 1u),
+            AZ::RHI::Format::R8G8B8A8_UNORM);
+    AZ::RHI::ImageSubresourceLayout srcLayout;
+    srcLayout.Init(uploadImage->GetDeviceMask(), devLayout);
+    AZ::RHI::ImageUpdateRequest update;
+    update.m_image = uploadImage;
+    update.m_sourceData = pattern.data();
+    update.m_sourceSubresourceLayout = srcLayout;
+    const AZ::RHI::ResultCode rc =
+        this->interopImage->UpdateImageContents(update);
+    std::fprintf(stderr,
+        "[gz-o3de] interop: gradient upload result=%d (%ux%u)\n",
+        static_cast<int>(rc), kW, kH);
+    // Tick so the async upload copy runs before the FD is handed to a GL thread.
+    for (int i = 0; i < 5; ++i)
+    {
+      this->app->PumpSystemEventLoopUntilEmpty();
+      this->app->TickSystem();
+      this->app->Tick();
+    }
   }
 
   // Atom RHI handles -> per-device objects -> native Vulkan handles (via the
@@ -565,13 +629,18 @@ void O3deBackend::Impl::ProveFdExportOnce()
   {
     std::fprintf(stderr,
         "[gz-o3de] interop: PROVED FD export -- vkGetMemoryFdKHR returned fd=%d "
-        "for the 256x256 image (VkImage=%p, VkDeviceMemory=%p, alloc size=%zu "
+        "for the %ux%u image (VkImage=%p, VkDeviceMemory=%p, alloc size=%zu "
         "offset=%zu). The exportable-image foundation works.\n",
-        fd, reinterpret_cast<void *>(vkImage),
+        fd, kW, kH, reinterpret_cast<void *>(vkImage),
         reinterpret_cast<void *>(vkMemory), allocSize, allocOffset);
-    // The FD is a dup'd OS handle we own; close it (this proof does not import
-    // it). Steps 2-4 will instead hand the FD to GL and keep it until import.
-    close(fd);
+    // Keep this FD open as the canonical export; GetInteropImport() hands callers
+    // their own dup. Record the geometry a GL importer needs.
+    this->interopFd = fd;
+    this->interopWidth = kW;
+    this->interopHeight = kH;
+    this->interopAllocSize = static_cast<uint64_t>(allocSize);
+    this->interopAllocOffset = static_cast<uint64_t>(allocOffset);
+    this->interopImageReady = true;
   }
   else
   {
@@ -706,6 +775,28 @@ O3deBackend::~O3deBackend()
 bool O3deBackend::IsReady() const
 {
   return this->dataPtr->ready;
+}
+
+//////////////////////////////////////////////////
+bool O3deBackend::GetInteropImport(O3deInteropImport &_out)
+{
+  Impl &d = *this->dataPtr;
+  std::lock_guard<std::mutex> lock(d.mutex);
+  if (!d.interopImageReady || d.interopFd < 0)
+    return false;
+
+  // Hand the caller its own dup of the export FD (they own and close it). The
+  // backend keeps d.interopFd as the canonical handle. dup() is just an OS fd
+  // operation -- no O3DE/Vulkan call -- so this is safe off the render thread.
+  const int dupFd = ::dup(d.interopFd);
+  if (dupFd < 0)
+    return false;
+  _out.fd = dupFd;
+  _out.width = d.interopWidth;
+  _out.height = d.interopHeight;
+  _out.allocationSize = d.interopAllocSize;
+  _out.allocationOffset = d.interopAllocOffset;
+  return true;
 }
 
 //////////////////////////////////////////////////

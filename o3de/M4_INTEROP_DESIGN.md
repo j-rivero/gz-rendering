@@ -1,15 +1,17 @@
 # M4 — zero-copy Vulkan↔GL interop (design & feasibility)
 
-**Status: step 1 (exportable-image foundation) DONE & verified; steps 2–4 not
-started.** This is the post-PoC performance milestone from
+**Status: steps 1–2 (export + GL import) DONE & verified; steps 3–4 not started.**
+This is the post-PoC performance milestone from
 [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md). It records the validated design
-plus the implemented/verified foundation: with `GZ_O3DE_INTEROP=ON` (build,
-**now the default**) and `GZ_O3DE_INTEROP=1` (runtime) an Atom-created image
-exports a valid OS FD via `vkGetMemoryFdKHR`. Remaining work (GL import, semaphore
-sync, gz-gui wiring) is unblocked. Because interop is the default build,
-`vendor/o3de` must have the gem export patch in `o3de/patches/` applied; build with
-`-DGZ_O3DE_INTEROP=OFF` for a patch-free backend (the interop probe is then a
-logged no-op).
+plus the implemented/verified pieces: with `GZ_O3DE_INTEROP=ON` (build, **now the
+default**) and `GZ_O3DE_INTEROP=1` (runtime) an Atom-created image exports a valid
+OS FD via `vkGetMemoryFdKHR` (step 1), **and** that FD imports into a GL texture
+that reads back bit-exact (step 2, `GZ_O3DE_INTEROP_GLTEST=1`: all 65536 texels
+of a known gradient matched). Remaining work: render the live scene into the
+shared image, frame-semaphore sync, and gz-gui wiring (steps 3–4). Because interop
+is the default build, `vendor/o3de` must have the gem export patch in
+`o3de/patches/` applied; build with `-DGZ_O3DE_INTEROP=OFF` for a patch-free
+backend (the interop probe / GL self-test are then logged no-ops).
 
 ## Goal
 
@@ -104,17 +106,26 @@ per frame:                                             (one-time, on the GL thre
    stable handle to share); fetch its per-device `DeviceImage`, call
    `GetImageMemory` + `vkGetMemoryFdKHR`, assert a valid FD. Proves the foundation
    **without any GL or display** (FD ≥ 0 is the pass/fail signal). ✅ verified.
-2. **GL import + render-into:** the shared image must be the **persistent**
-   `AttachmentImage` (step 1), not the transient RTT output — so either bind it as
-   the pipeline's output attachment or add a copy/blit pass that writes the RTT
-   result into it each frame. On the GL thread, import the FD to a GL texture
-   (`glImportMemoryFdEXT` with the **whole VMA block** size, then
-   `glTextureStorageMem2DEXT` at the image's `GetImageAllocationOffset`); sample it
-   into a tiny offscreen FBO and read back a few pixels to compare against the
-   existing readback path (still no gz-gui needed). Note: VMA sub-allocates, so the
-   FD is for the block and the image sits at a non-zero offset.
-3. **Semaphore sync:** export Atom's frame semaphore, import to GL, add the
-   wait/signal around the sample.
+2. **GL import — DONE.** On a GL context, import the FD to a GL texture
+   (`glCreateMemoryObjectsEXT` + `glImportMemoryFdEXT` with the **whole VMA block**
+   `allocationSize`, then `glTextureStorageMem2DEXT` at the image's
+   `allocationOffset`, `GL_OPTIMAL_TILING_EXT`); read the texels back and compare.
+   ✅ verified headlessly (`GZ_O3DE_INTEROP_GLTEST=1`, `O3deGlInterop.cc`): a known
+   gradient uploaded into the exportable image read back **bit-exact via GL** (all
+   65536 texels). Key results: VMA sub-allocates (FD is the whole block, image at a
+   non-zero offset — handled); optimal tiling imports correctly; **no semaphore was
+   needed for this *static* image** (uploaded once, then read). `glImportMemoryFdEXT`
+   takes ownership of the FD. Concurrent render→read still needs sync (step 3).
+2.5. **Render-into (next):** the proof used a CPU-uploaded gradient. For the live
+   path the *scene* must land in the shared persistent image — the RTT pass output
+   is transient, so either swap the pipeline to a template with an output slot and
+   use `CreateRenderPipelineForImage`, or add a copy/blit from the RTT output into
+   the persistent `AttachmentImage` each frame. Verify by reading the persistent
+   image back (existing tooling) and matching the readback frame.
+3. **Semaphore sync:** export Atom's frame semaphore (the `ExternalHandleRequirement`
+   semaphore collector is already wired), import to GL, add `glWaitSemaphoreEXT`/
+   `glSignalSemaphoreEXT` (with `srcLayouts`) around the sample. Required once the
+   image is written every frame concurrently with GL sampling.
 4. **Wire gz-gui:** flip `GraphicsAPI()`→`OPENGL`, return the texture from
    `RenderTextureGLId()`, verify the live viewer.
 
