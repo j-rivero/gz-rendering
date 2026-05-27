@@ -123,7 +123,7 @@ gz HFOV → vertical FOV via `vFov = 2*atan(tan(hFov/2)/aspect)`.
 | **M2** | Fuse M0+M1 — real bootstrap/readback behind `O3deRenderTarget::Copy`; one hardcoded AuxGeom box in gz-gui via O3DE | **Done** |
 | **M3** | Wire the scene graph — `Create{Box,Sphere,Cylinder}Impl` + transforms + material colour drive AuxGeom from real scene contents | **Done** |
 | **M3.5** | Live gz-gui display — dedicated O3DE thread fixes the cross-thread asset-load deadlock; dynamic resize to the window's true aspect; ~60 fps continuous | **Done** |
-| **M4** | (post-PoC) zero-copy Vulkan↔GL interop for performance | Future |
+| **M4** | (post-PoC) zero-copy Vulkan↔GL interop for performance — design & feasibility done ([M4_INTEROP_DESIGN.md](M4_INTEROP_DESIGN.md)), implementation pending | In progress |
 
 ## Risks & mitigations (outcomes)
 
@@ -141,6 +141,8 @@ gz HFOV → vertical FOV via `vFov = 2*atan(tan(hFov/2)/aspect)`.
 
 * Remove debug logging in `O3deBackend.cc` / `O3deRenderTarget.cc`.
 * Real meshes, textures, PBR materials, lights and shadows.
-* Zero-copy Vulkan↔GL interop (`RenderTextureGLId()`), M4.
+* Zero-copy Vulkan↔GL interop (`RenderTextureGLId()`), M4 — see
+  [M4_INTEROP_DESIGN.md](M4_INTEROP_DESIGN.md) (feasibility validated: achievable
+  without forking O3DE via the `ExternalHandleRequirementBus`).
 * Replace hard-coded `vendor/o3de` + `~/o3de-packages` build paths with cache
   variables; ship a minimal vendored asset bundle instead of a full project.
