@@ -24,8 +24,17 @@ existing `ogre` and `ogre2` engines.
   only self-pumps a synchronous (critical-shader) load when it runs on the
   thread that created the application. Driving ticks from gz-gui's render thread
   instead deadlocks on a blocking shader load during a pass-tree rebuild.
+* **Anti-aliasing:** the offscreen pipeline enables 4x MSAA (which benefits
+  future real meshes), but Atom draws AuxGeom as a *post-resolve* overlay at one
+  sample, so the PoC's primitives are not antialiased by MSAA. They are instead
+  smoothed by **2x supersampling (SSAA)**: the offscreen target is rendered at
+  twice the requested resolution and box-downsampled to the requested size on
+  readback, which antialiases the whole image, AuxGeom included.
 * The Atom runtime is brought up once and **never torn down** (tearing down a
-  live `RPISystem` crashes in Vulkan teardown); the OS reclaims it at exit.
+  live `RPISystem` crashes in Vulkan teardown). At process exit the render
+  thread is joined and an `atexit` handler `std::quick_exit()`s, skipping the
+  upstream O3DE/NVIDIA GPU-teardown destructors that crash whether the runtime
+  is torn down or leaked (see "Teardown" under Known limitations).
 
 Only `O3deBackend.cc` includes Atom/AzCore headers; it is compiled with O3DE's
 own compile model (clang, `-fno-exceptions`, C++20, O3DE defines) via
@@ -173,9 +182,15 @@ GZ_O3DE_DEMO_SHAPES=1 gz gui -c examples/config/scene3d.config   # <engine>o3de<
   path is future work.
 * **Primitives only:** box / sphere / cylinder / cone via AuxGeom with flat
   diffuse colour. No meshes, textures, PBR materials, lights or shadows yet.
-* **Teardown:** O3DE's static teardown of a live `RPISystem` can SIGSEGV at
-  process exit (after rendering has finished). The runtime is deliberately left
-  running for the life of the process; the render path is unaffected.
+* **Teardown:** the O3DE/Vulkan runtime cannot be cleanly torn down at process
+  exit — both tearing it down (O3DE's `RHISystem`/Vulkan teardown crashes) and
+  leaking it (the NVIDIA driver's own atexit handler crashes on a still-live
+  device) SIGSEGV, after all rendering is done. Neither crash is in this code.
+  The backend works around it by joining its render thread (removing the only
+  teardown race it owns) and then `std::quick_exit()`ing from an `atexit`
+  handler, skipping the upstream crashing destructors. Trade-off: the host
+  process (gz-gui / gz-sim) skips its remaining static-destructor cleanup at
+  exit. Verified: clean exit (code 0, no signals); the render path is unaffected.
 * **Hard-coded paths:** build-time O3DE paths (`vendor/o3de`, `~/o3de-packages`)
   are fixed in `src/CMakeLists.txt`; runtime paths are overridable via the
   `GZ_O3DE_*` environment variables above.

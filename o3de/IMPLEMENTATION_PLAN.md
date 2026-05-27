@@ -76,7 +76,11 @@ biggest risk-reducer.
 * The backend hosts an `AzGameFramework::GameApplication` in-process, which
   dlopens the Atom gems and builds an offscreen `MainPipelineRenderToTexture`
   pipeline + perspective `View`. It is brought up once and **never torn down**
-  (teardown of a live `RPISystem` crashes in Vulkan teardown).
+  (teardown of a live `RPISystem` crashes in Vulkan teardown). At process exit
+  the render thread is joined (removing the only teardown race we own) and an
+  `atexit` handler `std::quick_exit()`s to skip the upstream O3DE/NVIDIA
+  GPU-teardown destructors, which crash whether the runtime is torn down or
+  leaked. See `O3deBackend::Bootstrap()` for the full rationale.
 * **All O3DE work — bootstrap and every render tick — runs on a single
   dedicated thread.** This is mandatory: Atom's `AssetManager` only self-pumps a
   synchronous (critical-shader) load when it runs on the thread that created the
@@ -87,6 +91,10 @@ biggest risk-reducer.
 * Per frame: point the `View` at the gz camera pose/projection, submit AuxGeom
   draws for the scene primitives, render, and read the pipeline's `Output`
   attachment back to CPU via `FrameCaptureRequestBus` → fill the gz `Image`.
+* Anti-aliasing: the pipeline enables 4x MSAA (for future real meshes), but
+  AuxGeom is drawn post-resolve at 1 sample, so the PoC primitives are smoothed
+  by 2x **supersampling** instead — render at 2x the requested resolution and
+  box-downsample on readback (see `kSsaaScale` in `O3deBackend.cc`).
 
 ### Coordinate mapping (verified)
 
@@ -132,8 +140,6 @@ gz HFOV → vertical FOV via `vFov = 2*atan(tan(hFov/2)/aspect)`.
 ## Future work (beyond Phase 1)
 
 * Remove debug logging in `O3deBackend.cc` / `O3deRenderTarget.cc`.
-* Clean process-exit teardown (avoid the RPISystem SIGSEGV at exit).
-* MSAA / anti-aliasing.
 * Real meshes, textures, PBR materials, lights and shadows.
 * Zero-copy Vulkan↔GL interop (`RenderTextureGLId()`), M4.
 * Replace hard-coded `vendor/o3de` + `~/o3de-packages` build paths with cache

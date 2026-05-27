@@ -57,6 +57,7 @@
 #include <Atom/RPI.Public/AuxGeom/AuxGeomDraw.h>
 #include <Atom/RPI.Reflect/System/SceneDescriptor.h>
 #include <Atom/RPI.Reflect/System/RenderPipelineDescriptor.h>
+#include <Atom/RHI.Reflect/MultisampleState.h>
 #include <Atom/Feature/Utils/FrameCaptureBus.h>
 
 #include <AzFramework/Scene/Scene.h>
@@ -71,6 +72,14 @@ namespace rendering
 
 namespace
 {
+  // Supersampling factor for anti-aliasing. The offscreen target is rendered at
+  // kSsaaScale x the requested (logical) resolution in each dimension and
+  // box-downsampled on readback. Atom draws AuxGeom (our primitives) as a
+  // post-resolve overlay at 1 sample, so pipeline MSAA cannot antialias it;
+  // supersampling smooths it (and everything else) on the CPU-readback path.
+  // 2 => 4x the pixels rendered (acceptable for this readback PoC).
+  constexpr uint32_t kSsaaScale = 2u;
+
   // PoC paths. We reuse the vendored O3DE build and the GzAtomPoc cooked-asset
   // project that M1/M2.1 produced. A later milestone will vendor a minimal
   // asset bundle and derive these from the gz install layout. All are
@@ -156,6 +165,12 @@ class O3deBackend::Impl
   public: void ApplyCamera(uint32_t _width, uint32_t _height);
   /// \brief Submit the current frame's AuxGeom primitives.
   public: void SubmitPrimitives();
+  /// \brief Stop driving the offscreen pipeline when the render thread is told
+  /// to stop. Runs on the render thread itself (process exit). It deliberately
+  /// does NOT tear down the O3DE/Vulkan runtime -- that crashes in upstream GPU
+  /// teardown; the runtime is leaked and the process quick_exit()s instead (see
+  /// the Bootstrap() exit-handler note).
+  public: void TeardownOnThread();
 };
 
 namespace
@@ -257,21 +272,28 @@ bool O3deBackend::Impl::SetupScene(uint32_t _width, uint32_t _height)
   pipelineDesc.m_mainViewTagName = "MainCamera";
   pipelineDesc.m_name = this->pipelineName;
   pipelineDesc.m_rootPassTemplate = "MainPipelineRenderToTexture";
-  if (rpiSystem->GetNumScenes() > 0)
-  {
-    pipelineDesc.m_renderSettings.m_multisampleState =
-        rpiSystem->GetApplicationMultisampleState();
-  }
-  else
-  {
-    rpiSystem->SetApplicationMultisampleState(
-        pipelineDesc.m_renderSettings.m_multisampleState);
-  }
+
+  // Enable 4x MSAA. MainPipeline renders to multisampled targets and resolves
+  // to the single-sample "Output" attachment we read back, so anti-aliasing is
+  // applied transparently to the CPU-readback path. The sample count is set on
+  // the descriptor so the pipeline's render targets are created multisampled.
+  const AZ::RHI::MultisampleState msaaState(
+      /*samples*/ static_cast<uint16_t>(4), /*quality*/ static_cast<uint16_t>(0));
+  pipelineDesc.m_renderSettings.m_multisampleState = msaaState;
 
   this->pipeline = AZ::RPI::RenderPipeline::CreateRenderPipeline(pipelineDesc);
   this->scene->AddRenderPipeline(this->pipeline);
   this->scene->Activate();
   rpiSystem->RegisterScene(this->scene);
+
+  // Apply the multisample state at the application level *after* the scene is
+  // registered (mirrors BootstrapSystemComponent). This both selects the MSAA
+  // shader supervariant and walks the registered scenes' pipelines marking
+  // their passes for rebuild with that supervariant -- the step that actually
+  // makes the rasterization multisampled. Calling it before RegisterScene (when
+  // m_scenes is empty) is a no-op for the pipeline and leaves it at 1x.
+  rpiSystem->SetApplicationMultisampleState(
+      this->pipeline->GetRenderSettings().m_multisampleState);
 
   // Create the view; pose + projection are set per-frame by ApplyCamera().
   this->view = AZ::RPI::View::CreateView(
@@ -279,9 +301,27 @@ bool O3deBackend::Impl::SetupScene(uint32_t _width, uint32_t _height)
   this->pipeline->SetDefaultView(this->view);
   this->ApplyCamera(_width, _height);
 
-  // Size the target now and keep the pipeline out of the per-tick render loop
-  // until we explicitly request a frame (default RenderEveryTick would render
-  // an unsized RTT target and crash the RHI).
+  // Flush the one-time MSAA pass rebuild here, during setup. SetApplication-
+  // MultisampleState() above only *marks* the pipeline's passes for rebuild; the
+  // rebuild (which recreates the render-to-texture pass and resets its output
+  // size to the template default) actually runs on the next render ticks. If we
+  // let it happen later -- on the first RenderOneFrame() -- it clobbers the
+  // EnsureSize() that frame uses to size the target to the window, and we end up
+  // capturing at the template size. So tick a few times now to let the rebuild
+  // (and its MSAA shader-variant loads, which self-pump on this thread) settle,
+  // then size the target. All ticking is on this dedicated thread.
+  this->pipeline->AddToRenderTick();
+  this->EnsureSize(_width, _height);
+  for (int i = 0; i < 3; ++i)
+  {
+    this->app->PumpSystemEventLoopUntilEmpty();
+    this->app->TickSystem();
+    this->app->Tick();
+  }
+
+  // Re-assert the size after the rebuild, then keep the pipeline out of the
+  // per-tick render loop until we explicitly request a frame (default
+  // RenderEveryTick would render an unsized RTT target and crash the RHI).
   this->EnsureSize(_width, _height);
   this->pipeline->RemoveFromRenderTick();
   return true;
@@ -428,7 +468,73 @@ bool O3deBackend::Bootstrap()
   d.renderThread = std::thread([&d]() { d.RenderThreadMain(); });
   d.inputCv.notify_all();
   d.outputCv.wait(lock, [&d]() { return d.bootstrapDone; });
+
+  // Register an exit handler exactly once, after a successful bootstrap.
+  //
+  // Process exit with a live O3DE/Vulkan runtime crashes, and there is no clean
+  // path around it from here:
+  //
+  //   * Tearing the runtime down (app->Stop()) crashes inside O3DE's own
+  //     RHISystem/Vulkan teardown: the release-queue flush lazily re-inits the
+  //     AsyncUploadQueue against a null staging-buffer pool after the device is
+  //     already reported "Device lost" (SIGSEGV in DeviceBufferPool, deep in
+  //     RPISystem::Shutdown). This is the upstream bug the original design
+  //     avoided by never tearing down.
+  //   * Leaving the runtime leaked (our design) instead crashes in the NVIDIA
+  //     driver's *own* atexit handler (libnvidia-glcore / libGLX_nvidia) when it
+  //     tears down a still-live Vulkan device during C++ static destruction.
+  //
+  // Neither crash is in our code; both are GPU driver/engine teardown bugs that
+  // fire only at process exit, after all rendering is done. The robust, common
+  // mitigation for GPU apps is to skip the crashing destructors entirely with a
+  // fast process exit. So: join our render thread (removing the only race we
+  // own -- a foreign thread ticking the runtime during teardown -- which was
+  // the original SIGABRT), then std::quick_exit() to terminate *before* the
+  // buggy O3DE/NVIDIA static/atexit destructors run.
+  //
+  // Trade-off (acceptable for this experimental PoC): quick_exit() skips the
+  // remaining atexit handlers and static destructors of the *host* process
+  // (gz-gui / gz-sim), so e.g. Qt teardown does not run. This handler is
+  // registered LIFO and only after a successful bootstrap, so it runs before
+  // O3DE's destructors and never fires if the runtime never came up (letting
+  // the host recover / fall back to another engine on a failed load).
+  if (d.bootstrapOk)
+  {
+    static std::once_flag atexitFlag;
+    std::call_once(atexitFlag, []()
+    {
+      std::atexit([]()
+      {
+        // Stop + join the render thread (clean, on its owning thread), then
+        // bail out of the process before any GPU teardown destructor can crash.
+        O3deBackend::Instance().Shutdown();
+        std::fprintf(stderr,
+            "[gz-o3de] quick_exit: skipping O3DE/GPU teardown destructors\n");
+        std::quick_exit(0);
+      });
+    });
+  }
   return d.bootstrapOk;
+}
+
+//////////////////////////////////////////////////
+void O3deBackend::Shutdown()
+{
+  Impl &d = *this->dataPtr;
+
+  // Signal the render thread to leave its loop and tear the runtime down. The
+  // thread does all the O3DE work (it created the runtime); this thread only
+  // flips the flag and waits. Idempotent: after the join the thread is no
+  // longer joinable, so a second call is a no-op.
+  {
+    std::lock_guard<std::mutex> lock(d.mutex);
+    if (!d.renderThread.joinable())
+      return;
+    d.ready = false;  // reject any further RenderFrame() calls
+    d.stop.store(true);
+  }
+  d.inputCv.notify_all();
+  d.renderThread.join();
 }
 
 //////////////////////////////////////////////////
@@ -480,6 +586,30 @@ void O3deBackend::Impl::RenderThreadMain()
       this->app->Tick();
     }
   }
+
+  // Stop was signalled (process exit). Tear the runtime down here, on the
+  // thread that created it, before O3DE's static destructors run.
+  this->TeardownOnThread();
+}
+
+//////////////////////////////////////////////////
+void O3deBackend::Impl::TeardownOnThread()
+{
+  if (!this->app)
+    return;
+
+  // Stop driving the offscreen pipeline so no GPU work is queued from here on.
+  if (this->pipeline)
+    this->pipeline->RemoveFromRenderTick();
+
+  // The GameApplication / RPISystem is intentionally NOT stopped or destroyed:
+  // O3DE's Vulkan RHI teardown of a live RPISystem crashes (release-queue flush
+  // lazily re-inits the AsyncUploadQueue against a null staging pool after the
+  // device is already lost). The original race that the SIGABRT came from was a
+  // *foreign* thread (this one) ticking the runtime while the process tore down;
+  // joining this thread before static teardown removes that race. The runtime
+  // is leaked deliberately and the OS reclaims it at exit.
+  std::fprintf(stderr, "[gz-o3de] render thread stopped; runtime left alive\n");
 }
 
 //////////////////////////////////////////////////
@@ -663,9 +793,15 @@ bool O3deBackend::Impl::RenderOneFrame()
   // never completes). Resizing is safe here because all O3DE work runs on this
   // one thread: the synchronous shader loads a pass rebuild can trigger
   // self-pump and complete (from a foreign thread they would deadlock).
-  const uint32_t w = (this->reqWidth > 0u) ? this->reqWidth : this->outputWidth;
-  const uint32_t h =
-      (this->reqHeight > 0u) ? this->reqHeight : this->outputHeight;
+  // SSAA: outputWidth/outputHeight track the *supersampled* render-target size
+  // (kSsaaScale x the requested logical resolution). The capture is downsampled
+  // back to the logical size when the frame is published.
+  const uint32_t logicalW = (this->reqWidth > 0u)
+      ? this->reqWidth : (this->outputWidth / kSsaaScale);
+  const uint32_t logicalH = (this->reqHeight > 0u)
+      ? this->reqHeight : (this->outputHeight / kSsaaScale);
+  const uint32_t w = logicalW * kSsaaScale;
+  const uint32_t h = logicalH * kSsaaScale;
   if (w > 0u && (w != this->outputWidth || h != this->outputHeight))
   {
     this->EnsureSize(w, h);
@@ -769,13 +905,49 @@ bool O3deBackend::Impl::RenderOneFrame()
     return false;
   }
 
+  // SSAA resolve: box-downsample the supersampled capture (captureWidth x
+  // captureHeight) to the logical resolution -- each output pixel is the average
+  // of a kSsaaScale x kSsaaScale block. This is what applies anti-aliasing to
+  // the whole image, AuxGeom included. captureWidth/Height are exact multiples
+  // of kSsaaScale (we sized the target that way), so no source pixels are lost.
+  const uint32_t outW = this->captureWidth / kSsaaScale;
+  const uint32_t outH = this->captureHeight / kSsaaScale;
+  std::vector<uint8_t> resolved(static_cast<size_t>(outW) * outH * 4u);
+  const size_t srcStride = static_cast<size_t>(this->captureWidth) * 4u;
+  constexpr uint32_t kBlock = kSsaaScale * kSsaaScale;
+  for (uint32_t oy = 0u; oy < outH; ++oy)
+  {
+    for (uint32_t ox = 0u; ox < outW; ++ox)
+    {
+      uint32_t acc[4] = {0u, 0u, 0u, 0u};
+      for (uint32_t sy = 0u; sy < kSsaaScale; ++sy)
+      {
+        const uint8_t *src = this->captureBuffer.data() +
+            (static_cast<size_t>(oy) * kSsaaScale + sy) * srcStride +
+            static_cast<size_t>(ox) * kSsaaScale * 4u;
+        for (uint32_t sx = 0u; sx < kSsaaScale; ++sx)
+        {
+          acc[0] += src[sx * 4u + 0u];
+          acc[1] += src[sx * 4u + 1u];
+          acc[2] += src[sx * 4u + 2u];
+          acc[3] += src[sx * 4u + 3u];
+        }
+      }
+      uint8_t *dst = resolved.data() +
+          (static_cast<size_t>(oy) * outW + ox) * 4u;
+      dst[0] = static_cast<uint8_t>(acc[0] / kBlock);
+      dst[1] = static_cast<uint8_t>(acc[1] / kBlock);
+      dst[2] = static_cast<uint8_t>(acc[2] / kBlock);
+      dst[3] = static_cast<uint8_t>(acc[3] / kBlock);
+    }
+  }
+
   // Publish the completed frame for RenderFrame() to pick up.
   {
     std::lock_guard<std::mutex> lock(this->mutex);
-    this->latestFrame.assign(
-        this->captureBuffer.begin(), this->captureBuffer.end());
-    this->latestWidth = this->captureWidth;
-    this->latestHeight = this->captureHeight;
+    this->latestFrame.swap(resolved);
+    this->latestWidth = outW;
+    this->latestHeight = outH;
     ++this->frameSeq;
   }
   this->outputCv.notify_all();

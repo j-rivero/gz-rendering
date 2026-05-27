@@ -76,6 +76,17 @@ namespace gz
       /// \brief True if Bootstrap() has succeeded and rendering is possible.
       public: bool IsReady() const;
 
+      /// \brief Stop and join the dedicated render thread. Removes the only
+      /// teardown race we own: a foreign thread ticking the runtime while the
+      /// process tears down (the original exit-time SIGABRT). Idempotent.
+      ///
+      /// It deliberately does NOT tear down the O3DE/Vulkan runtime: both
+      /// tearing it down and leaking it crash in upstream GPU driver/engine
+      /// teardown at process exit. Bootstrap() registers an std::atexit handler
+      /// that calls this and then std::quick_exit()s to skip those crashing
+      /// destructors entirely (see the long note at the Bootstrap() call site).
+      public: void Shutdown();
+
       /// \brief Render one offscreen frame of the given camera + primitives
       /// and read it back into \p _outRgba as tightly packed RGBA8888.
       ///
