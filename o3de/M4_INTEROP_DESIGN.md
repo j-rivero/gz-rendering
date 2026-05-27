@@ -1,9 +1,15 @@
 # M4 — zero-copy Vulkan↔GL interop (design & feasibility)
 
-**Status: design / feasibility complete; implementation not started.** This is
-the post-PoC performance milestone from [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md).
-It records the validated design so the implementation can proceed (or be picked
-up) with the unknowns already resolved.
+**Status: step 1 (exportable-image foundation) DONE & verified; steps 2–4 not
+started.** This is the post-PoC performance milestone from
+[IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md). It records the validated design
+plus the implemented/verified foundation: with `GZ_O3DE_INTEROP=ON` (build,
+**now the default**) and `GZ_O3DE_INTEROP=1` (runtime) an Atom-created image
+exports a valid OS FD via `vkGetMemoryFdKHR`. Remaining work (GL import, semaphore
+sync, gz-gui wiring) is unblocked. Because interop is the default build,
+`vendor/o3de` must have the gem export patch in `o3de/patches/` applied; build with
+`-DGZ_O3DE_INTEROP=OFF` for a patch-free backend (the interop probe is then a
+logged no-op).
 
 ## Goal
 
@@ -30,7 +36,7 @@ purpose, to force the readback fallback; see `O3deRenderEngine::GraphicsAPI`.)
 |---|---|---|
 | GL external-memory/semaphore import | ✅ present | `GL_EXT_memory_object_fd`, `GL_EXT_semaphore_fd`, `GL_EXT_import_sync_object` (glxinfo, NVIDIA) |
 | Vulkan external-memory/semaphore export | ✅ present | `VK_KHR_external_memory_fd`, `VK_KHR_external_semaphore_fd` (vulkaninfo) |
-| Atom native handle access | ✅ exposed | `RHI.Interface/Vulkan/RHIVulkanInterface.h`: `GetDeviceNativeHandle`, `GetPhysicalDeviceNativeHandle`, `GetNativeImage`, `GetImageMemory`, `GetImageAllocation{Size,Offset}`, `GetFenceNativeHandle` (semaphore) |
+| Atom native handle access | ⚠️ declared, not linkably reachable | `RHI.Interface/Vulkan/RHIVulkanInterface.h` declares `GetDeviceNativeHandle` / `GetNativeImage` / `GetImageMemory` / `GetFenceNativeHandle`, but the definitions are local (`t`) in the gem `.so` and only `T` in a unity static archive — see Step 1b for why reaching them needs either a gem export patch (A) or a risky static-archive link (B) |
 | Exportable images **without patching O3DE** | ✅ via EBus | `Device::BuildImageCreateInfo` adds `VkExternalMemoryImageCreateInfo` when `ExternalHandleRequirementBus::CollectExternalMemoryRequirements` returns a flag (`Device.cpp:~1945`) |
 | Exportable **backing memory** (the subtle one) | ✅ via same EBus | VMA allocator is created with `pTypeExternalMemoryHandleTypes` populated from the *same* bus (`Device.cpp:1698-1707`). So all VMA memory becomes exportable. |
 | Exportable timeline semaphore for sync | ✅ via same EBus | `TimelineSemaphoreFence.cpp:59-65` adds `VkExportSemaphoreCreateInfoKHR` when `CollectSemaphoreExportHandleTypes` returns a flag; Linux `GetSemaphoreFdKHR` exists |
@@ -90,15 +96,23 @@ per frame:                                             (one-time, on the GL thre
 
 ## Recommended implementation order
 
-1. **Foundation (verifiable headlessly):** connect the `ExternalHandleRequirementBus`
-   handler before `Start()`; after a frame, fetch the RTT "Output" `DeviceImage`,
-   call `GetImageMemory` + `vkGetMemoryFdKHR`, and assert a valid FD is returned.
-   This proves the exportable-image foundation **without any GL or display** (FD
-   ≥ 0 is the pass/fail signal) — the right first PR.
-2. **GL import:** on the GL thread, import the FD to a GL texture
-   (`glImportMemoryFdEXT` + `glTextureStorageMem2DEXT`); sample it into a tiny
-   offscreen FBO and read back a few pixels to compare against the existing
-   readback path (still no gz-gui needed).
+1. **Foundation (verifiable headlessly) — DONE.** Connect the
+   `ExternalHandleRequirementBus` + `DeviceRequirementBus` handlers before
+   `Start()`; create a **persistent** exportable `AttachmentImage` (the RTT pass
+   "Output" attachment is *transient* — `AttachmentLifetimeType::Transient`,
+   allocated per-frame from the transient pool, so its `VkImage`/memory are not a
+   stable handle to share); fetch its per-device `DeviceImage`, call
+   `GetImageMemory` + `vkGetMemoryFdKHR`, assert a valid FD. Proves the foundation
+   **without any GL or display** (FD ≥ 0 is the pass/fail signal). ✅ verified.
+2. **GL import + render-into:** the shared image must be the **persistent**
+   `AttachmentImage` (step 1), not the transient RTT output — so either bind it as
+   the pipeline's output attachment or add a copy/blit pass that writes the RTT
+   result into it each frame. On the GL thread, import the FD to a GL texture
+   (`glImportMemoryFdEXT` with the **whole VMA block** size, then
+   `glTextureStorageMem2DEXT` at the image's `GetImageAllocationOffset`); sample it
+   into a tiny offscreen FBO and read back a few pixels to compare against the
+   existing readback path (still no gz-gui needed). Note: VMA sub-allocates, so the
+   FD is for the block and the image sits at a non-zero offset.
 3. **Semaphore sync:** export Atom's frame semaphore, import to GL, add the
    wait/signal around the sample.
 4. **Wire gz-gui:** flip `GraphicsAPI()`→`OPENGL`, return the texture from
@@ -119,31 +133,135 @@ run — the offscreen path appears to use binary fences, not timeline semaphores
 revisit when wiring sync in step 3, possibly creating our own exportable
 semaphore.)
 
-**Step 1b — BLOCKED on a linkage decision (the real M4 obstacle).** Proving the
-FD export (`vkGetMemoryFdKHR` on the RTT image) needs the native handles
-(`AZ::Vulkan::GetNativeImage` / `GetImageMemory` / `GetDeviceNativeHandle`).
-Those live in `RHIVulkanInterface.cpp`, compiled into the **static** library
-`Gem::Atom_RHI_Vulkan.Interface`, which PUBLIC-depends on the whole
-`.Private.Static`. Our plugin loads the Vulkan RHI as a **runtime gem `.so`**, so
-linking that static lib pulls a *second* copy of the Vulkan RHI into the plugin
-(duplicate AZ type registration / static state) — a real risk to the working
-PoC. The functions themselves are thin casts
-(`static_cast<Vulkan::Image&>(img).GetNativeImage()`), so the candidate
-approaches are:
-  1. **Reimplement the 2–3 accessors inline** in `O3deBackend.cc` by including the
-     Vulkan RHI *Source* internal headers (`RHI/Image.h`, `RHI/Device.h`,
-     `MemoryView.h`) and doing the cast ourselves — *if* `GetNativeImage()` /
-     `GetMemoryView().GetNativeDeviceMemory()` are inline (no extra link). Lowest
-     duplication risk; needs the internal include dirs (+ glad/vma) to compile.
-  2. **Link `Gem::Atom_RHI_Vulkan.Interface` whole-archive** and rely on AZ's
-     UUID-based `azrtti_cast` + identical layout (same source/flags) making the
-     cross-module cast valid. Simplest to wire; carries the duplicate-static-state
-     risk — must validate no double-registration asserts.
-  3. **Add a tiny exporter to the GzAtomPoc gem** (built inside the O3DE tree,
-     where linking `.Interface` is natural) that exposes the FD via a clean C ABI
-     / EBus the plugin calls. Cleanest separation; most plumbing.
+**Step 1b — DONE & verified (FD export proved).** With `GZ_O3DE_INTEROP=1` the
+backend now creates a persistent, exportable 256×256 `AttachmentImage`, pulls its
+`VkDeviceMemory` via the patched gem accessors, and `vkGetMemoryFdKHR` returns a
+valid FD (observed `fd=136`, image VMA-suballocated in a 32 MB block at
+`offset=9083904`). Exit clean, zero Vulkan/AZ errors, readback path untouched. The
+log line is `interop: PROVED FD export -- vkGetMemoryFdKHR returned fd=...`. This
+proves the full exportable-image foundation: bus-enabled exportable VMA memory +
+the device extension + cross-module access to the native handle. Two findings drove
+the final shape (the "inline the thin casts" plan, option 1 below, was disproven):
 
-Recommendation: try (1) first (least risk to the shipping PoC); fall back to (3).
+**Finding 1 — the accessors are only reachable by patching the gem (chose A).**
+Symbol audit of `vendor/o3de/build/linux` (NVIDIA profile build):
+
+* The leaf accessors `AZ::Vulkan::Image::GetNativeImage()`,
+  `Image::GetMemoryView()`, `Device::GetNativeDevice()` are **out-of-line** (only
+  `MemoryView::GetNativeDeviceMemory()` is inline). So a `static_cast` written in
+  `O3deBackend.cc` still needs those symbols at link time — inlining the *cast*
+  does not inline the *accessor*.
+* In the loaded runtime gem `libAtom_RHI_Vulkan.Private.so` those symbols are
+  **local** (`nm` shows `t`, lowercase) — the `.so` exports **zero** dynamic
+  `AZ::Vulkan` symbols (4 dynamic text symbols total: the gem entry points). They
+  are therefore **not resolvable at runtime** from another module.
+* They are defined (`T`) only in the **static** archive
+  `libAtom_RHI_Vulkan.Private.Static.a`. That archive is a **unity build** — 11
+  giant `unity_N_cxx.cxx.o` blobs. `GetNativeImage` lives in `unity_3_cxx.cxx.o`
+  (3.5 MB), which bundles **9+ Vulkan-RHI classes** (Image, ImagePool,
+  FrameGraphExecuter, …), carries **4 global constructors** (`.init_array`), and
+  references **`AZ::Environment::GetInstance()` / EnvironmentVariable registration**.
+  There is **no clean leaf object** to extract.
+* The public free functions (`RHIVulkanInterface.cpp`:
+  `AZ::Vulkan::GetNativeImage(RHI::DeviceImage&)`, `GetImageMemory`,
+  `GetDeviceNativeHandle`) live in the `.Interface` target, which **was not built**
+  (no `.Interface.a` exists) and PUBLIC-depends on `.Private.Static` anyway — same
+  wall.
+
+So the only way to call these accessors is to have the calling code compiled
+*into* the Vulkan-RHI module, or to link the unity static archive — and linking it
+runs registration-bearing global constructors that **double-register
+`AZ::Environment` variables** against the already-loaded gem `.so`. Option 1
+(inline casts) is therefore **not viable**. **Option A** was chosen and applied:
+`o3de/patches/0001-export-vulkan-native-handle-accessors.patch` adds
+`RHIVulkanInterface.cpp` to the **`.Private` gem MODULE** file list and wraps
+`RHIVulkanInterface.h`'s declarations in `#pragma GCC visibility push(default)`, so
+all 14 accessors export as dynamic `T` from the single loaded
+`libAtom_RHI_Vulkan.Private.so` (verified). The plugin links that `.so`
+(`DT_NEEDED`) to resolve them; AZ's own loader uses `RTLD_NOLOAD` and explicitly
+tolerates the gem being "already loaded as a dependency" (no double-init). No
+static archive, no duplicate state — verified `0` asserts at runtime.
+
+**Finding 2 — exportable memory is necessary but not sufficient; the device
+extension must also be enabled.** Even with the `ExternalHandleRequirementBus`
+handler making VMA memory exportable, `vkGetMemoryFdKHR` first returned *unresolved*
+because O3DE never enables the `VK_KHR_external_memory_fd` **device extension** (it
+only uses the semaphore-FD extension; `external_memory_fd` is not in its
+`OptionalDeviceExtension` enum). `vkGetDeviceProcAddr` returns null for an entry
+point of a non-enabled extension. Fix (no patch): `GzExternalHandleProvider` also
+handles the **`DeviceRequirementBus`** (same `VulkanBus.h`) and adds
+`VK_KHR_external_memory` + `VK_KHR_external_memory_fd` via
+`CollectAdditionalRequiredDeviceExtensions`, which `Device::GetRequiredExtensions()`
+broadcasts at device creation.
+
+**Build gating.** All of step 1b is behind the CMake option **`GZ_O3DE_INTEROP`**
+(default **`ON`**). When ON, `O3deBackend.cc` is compiled with
+`GZ_O3DE_INTEROP_BUILD`, links the gem `.so`, and requires the gem patch (else the
+plugin link fails with undefined `AZ::Vulkan::Get*`, a clear signal to apply the
+patch). Turn it **`OFF`** for a patch-free build: the plugin then compiles without
+the accessor calls and does **not** link the gem `.so` (verified: no `NEEDED`
+Vulkan entry, no accessor references), and the interop FD probe is a logged no-op.
+
+<details><summary>Original Finding-1 evidence (kept for the record)</summary>
+
+The chosen "inline the thin casts" approach (option 1 below) was investigated to
+ground and **disproven**; the linkage requirement is unavoidable. Hard evidence
+(symbol audit of `vendor/o3de/build/linux`, NVIDIA profile build):
+
+* The leaf accessors `AZ::Vulkan::Image::GetNativeImage()`,
+  `Image::GetMemoryView()`, `Device::GetNativeDevice()` are **out-of-line** (only
+  `MemoryView::GetNativeDeviceMemory()` is inline). So a `static_cast` written in
+  `O3deBackend.cc` still needs those symbols at link time — inlining the *cast*
+  does not inline the *accessor*.
+* In the loaded runtime gem `libAtom_RHI_Vulkan.Private.so` those symbols are
+  **local** (`nm` shows `t`, lowercase) — the `.so` exports **zero** dynamic
+  `AZ::Vulkan` symbols (4 dynamic text symbols total: the gem entry points). They
+  are therefore **not resolvable at runtime** from another module.
+* They are defined (`T`) only in the **static** archive
+  `libAtom_RHI_Vulkan.Private.Static.a`. That archive is a **unity build** — 11
+  giant `unity_N_cxx.cxx.o` blobs. `GetNativeImage` lives in `unity_3_cxx.cxx.o`
+  (3.5 MB), which bundles **9+ Vulkan-RHI classes** (Image, ImagePool,
+  FrameGraphExecuter, …), carries **4 global constructors** (`.init_array`), and
+  references **`AZ::Environment::GetInstance()` / EnvironmentVariable registration**.
+  There is **no clean leaf object** to extract.
+* The public free functions (`RHIVulkanInterface.cpp`:
+  `AZ::Vulkan::GetNativeImage(RHI::DeviceImage&)`, `GetImageMemory`,
+  `GetDeviceNativeHandle`) live in the `.Interface` target, which **was not built**
+  (no `.Interface.a` exists) and PUBLIC-depends on `.Private.Static` anyway — same
+  wall.
+
+**Conclusion:** the only way to call these accessors is to have the calling code
+compiled *into* the Vulkan-RHI module, or to link the unity static archive — and
+linking it pulls registration-bearing blobs whose 4 global constructors would run
+at plugin load and **double-register `AZ::Environment` variables** against the
+already-loaded gem `.so` (corrupt/duplicate cross-module singleton state). This is
+the "it gets gnarly" stop condition; option 1 is **not viable as specified**.
+
+Remaining candidate approaches (re-ranked by the evidence):
+  A. **Tiny export patch to the Vulkan-RHI gem (recommended).** Add
+     `Source/RHI.Interface/RHIVulkanInterface.cpp` to the **`.Private` gem MODULE**
+     file list (so it compiles into the *one* loaded `libAtom_RHI_Vulkan.Private.so`)
+     and give its 4 free functions **default visibility** (export attribute). The
+     plugin then declares the prototypes from `RHIVulkanInterface.h` and calls them
+     — resolved dynamically against the single loaded gem `.so`. No duplicate code,
+     no extra static initializers, one module. **Cost:** a minimal patch to the
+     vendored O3DE Vulkan gem + rebuild of that one gem — i.e. it **breaks the
+     "no O3DE fork" property** the rest of M4 relied on.
+  B. **Link `.Private.Static` into the plugin and verify empirically.** No O3DE
+     change, faithful to "do it in the plugin", but pulls ~the whole 39 MB unity
+     archive and runs its global constructors → confirmed double-registration
+     hazard. Would need a gated build + run of the verified demo to see whether AZ
+     asserts; high risk to the working PoC, and likely to fail.
+  C. **Pause M4 step 1b.** Step 1a already proved the *foundation* (Atom creates
+     the RTT image + VMA memory exportable once our bus handler is connected). Treat
+     the live FD-export proof as future work pending the A-vs-B linkage decision;
+     the PoC's verified readback path is unaffected.
+
+Recommendation: **A** (clean, ~10-line gem patch) if a small O3DE-side patch is
+acceptable; otherwise **C** until that constraint is revisited. **B** only as a
+throwaway experiment, never as the shipping path.
+
+</details>
 
 ## Risks / open questions
 

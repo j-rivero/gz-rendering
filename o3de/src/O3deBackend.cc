@@ -25,6 +25,11 @@
 #include <cstdlib>
 #include <cstring>
 
+// M4 interop (GZ_O3DE_INTEROP): runtime resolution of the Vulkan loader entry
+// points and FD ownership for the export proof.
+#include <dlfcn.h>
+#include <unistd.h>
+
 #include <AzGameFramework/Application/GameApplication.h>
 
 #include <AzCore/Settings/SettingsRegistry.h>
@@ -55,8 +60,14 @@
 #include <Atom/RPI.Public/Pass/Specific/RenderToTexturePass.h>
 #include <Atom/RPI.Public/AuxGeom/AuxGeomFeatureProcessorInterface.h>
 #include <Atom/RPI.Public/AuxGeom/AuxGeomDraw.h>
+#include <Atom/RPI.Public/Image/AttachmentImage.h>
+#include <Atom/RPI.Public/Image/AttachmentImagePool.h>
+#include <Atom/RPI.Public/Image/ImageSystemInterface.h>
 #include <Atom/RPI.Reflect/System/SceneDescriptor.h>
 #include <Atom/RPI.Reflect/System/RenderPipelineDescriptor.h>
+#include <Atom/RHI/RHISystemInterface.h>
+#include <Atom/RHI/Image.h>
+#include <Atom/RHI/DeviceImage.h>
 #include <Atom/RHI.Reflect/MultisampleState.h>
 #include <Atom/Feature/Utils/FrameCaptureBus.h>
 
@@ -69,6 +80,14 @@
 // supplies the Vk* flag types VulkanBus.h refers to but does not itself include.
 #include <vulkan/vulkan.h>
 #include <Atom/RHI.Reflect/Vulkan/VulkanBus.h>
+#if defined(GZ_O3DE_INTEROP_BUILD)
+// Native-handle accessors (VkDevice / VkImage / VkDeviceMemory) exported from the
+// loaded Vulkan RHI gem .so by the gz-rendering interop patch
+// (o3de/patches/0001-export-vulkan-native-handle-accessors.patch). Pulls only the
+// public Atom/RHI headers + <vulkan/vulkan.h>, no glad/internal Source headers.
+// Only included for interop builds (-DGZ_O3DE_INTEROP=ON), which require the patch.
+#include <Atom/RHI.Interface/Vulkan/RHIVulkanInterface.h>
+#endif
 
 #include "O3deBackend.hh"
 
@@ -111,8 +130,16 @@ namespace
   // The logs confirm Atom actually queried the bus (proving the resources are
   // created exportable). Gated by GZ_O3DE_INTEROP so the default readback path is
   // completely unaffected.
+  //
+  // It is also a DeviceRequirementBus handler: making memory *exportable* (above)
+  // is necessary but not sufficient to call vkGetMemoryFdKHR -- that entry point
+  // requires the VK_KHR_external_memory_fd *device extension* to be enabled at
+  // device creation, and O3DE does not enable it on its own (it only uses the
+  // semaphore-FD extension). Device::GetRequiredExtensions() broadcasts this bus,
+  // so we add the extension here. Required only when interop is on.
   class GzExternalHandleProvider
       : public AZ::Vulkan::ExternalHandleRequirementBus::Handler
+      , public AZ::Vulkan::DeviceRequirementBus::Handler
   {
     public: void CollectExternalMemoryRequirements(
         VkExternalMemoryHandleTypeFlagsKHR &_flags) override
@@ -140,8 +167,29 @@ namespace
       }
     }
 
+    // DeviceRequirementBus: enable the external-memory FD device extension so
+    // vkGetMemoryFdKHR is available. VK_KHR_external_memory is core since Vulkan
+    // 1.1 but NVIDIA still advertises it as a device extension; enabling it is
+    // harmless and satisfies the _fd extension's dependency on older drivers.
+    public: void CollectAdditionalRequiredDeviceExtensions(
+        AZStd::vector<AZStd::string> &_extensions) override
+    {
+      _extensions.emplace_back(VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME);
+      _extensions.emplace_back(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME);
+      if (!this->loggedExtensions)
+      {
+        std::fprintf(stderr,
+            "[gz-o3de] interop: requesting device extensions %s + %s "
+            "(needed for vkGetMemoryFdKHR)\n",
+            VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME,
+            VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME);
+        this->loggedExtensions = true;
+      }
+    }
+
     private: bool loggedMemory = false;
     private: bool loggedSemaphore = false;
+    private: bool loggedExtensions = false;
   };
 }
 
@@ -170,6 +218,15 @@ class O3deBackend::Impl
   // SSAA factor (>=1). Set once from GZ_O3DE_SSAA during bootstrap; 1 disables
   // supersampling. outputWidth/Height track the supersampled render size.
   public: uint32_t ssaaScale = kDefaultSsaaScale;
+
+  // M4 interop (experimental, GZ_O3DE_INTEROP): a persistent, exportable colour
+  // image we own. Persistent (unlike the pass's transient RTT output) so its
+  // VkImage/VkDeviceMemory are stable and shareable; created after the bus
+  // handler is connected so its VMA memory is allocated exportable. Kept alive
+  // here for reuse by later M4 steps (render-into + GL import). Null when interop
+  // is off.
+  public: AZ::Data::Instance<AZ::RPI::AttachmentImage> interopImage;
+  public: bool interopFdProven = false;
 
   // M4 interop (experimental, GZ_O3DE_INTEROP): when set, this handler is
   // connected before the RHI device is created so Atom makes images + semaphores
@@ -224,6 +281,15 @@ class O3deBackend::Impl
   public: bool RenderOneFrame();
   /// \brief Build the offscreen scene + render-to-texture pipeline + view.
   public: bool SetupScene(uint32_t _width, uint32_t _height);
+
+  /// \brief M4 step 1b: prove that an Atom-created image exports an OS handle.
+  /// Creates a persistent, exportable AttachmentImage, pulls its native
+  /// VkDeviceMemory via the patched Vulkan-RHI accessors, and calls
+  /// vkGetMemoryFdKHR. A returned FD >= 0 proves the GZ_O3DE_INTEROP bus handler
+  /// made Atom's VMA-backed image memory exportable -- the foundation for the
+  /// zero-copy Vulkan->GL path. Runs once, only when interop is enabled; never
+  /// touches the readback path. Must run on the render thread (all O3DE work).
+  public: void ProveFdExportOnce();
   /// \brief (Re)size the offscreen render target if needed.
   public: void EnsureSize(uint32_t _width, uint32_t _height);
   /// \brief Point the RPI view at the current gz camera pose + projection.
@@ -389,7 +455,132 @@ bool O3deBackend::Impl::SetupScene(uint32_t _width, uint32_t _height)
   // RenderEveryTick would render an unsized RTT target and crash the RHI).
   this->EnsureSize(_width, _height);
   this->pipeline->RemoveFromRenderTick();
+
+  // M4 step 1b: with the device + image system now up, prove the exportable-image
+  // foundation. No-op unless GZ_O3DE_INTEROP is set; the readback path is
+  // untouched either way.
+  if (this->interop)
+    this->ProveFdExportOnce();
+
   return true;
+}
+
+//////////////////////////////////////////////////
+void O3deBackend::Impl::ProveFdExportOnce()
+{
+  if (this->interopFdProven)
+    return;
+  this->interopFdProven = true;  // attempt once regardless of outcome
+
+#if !defined(GZ_O3DE_INTEROP_BUILD)
+  // GZ_O3DE_INTEROP was set at runtime, but this plugin was built without
+  // -DGZ_O3DE_INTEROP=ON, so the native-handle accessors (and the gem patch they
+  // need) are not compiled in. The bus handlers above still ran (images are
+  // exportable), but we cannot fetch the FD here.
+  std::fprintf(stderr,
+      "[gz-o3de] interop: GZ_O3DE_INTEROP set but plugin built without "
+      "-DGZ_O3DE_INTEROP=ON; FD-export probe skipped\n");
+  return;
+#else
+  // A small persistent colour image, created from the system attachment pool.
+  // Persistent (not transient) so its backing VkImage/VkDeviceMemory are stable;
+  // created now -- after GzExternalHandleProvider connected pre-device-creation --
+  // so its VMA allocation carries VkExportMemoryAllocateInfo (OPAQUE_FD).
+  const auto *imageSystem = AZ::RPI::ImageSystemInterface::Get();
+  if (!imageSystem || !imageSystem->GetSystemAttachmentPool())
+  {
+    std::fprintf(stderr,
+        "[gz-o3de] interop: no system attachment pool; cannot probe FD export\n");
+    return;
+  }
+  const AZ::RHI::ImageDescriptor desc = AZ::RHI::ImageDescriptor::Create2D(
+      AZ::RHI::ImageBindFlags::Color | AZ::RHI::ImageBindFlags::ShaderRead |
+          AZ::RHI::ImageBindFlags::CopyRead,
+      256u, 256u, AZ::RHI::Format::R8G8B8A8_UNORM);
+  this->interopImage = AZ::RPI::AttachmentImage::Create(
+      *imageSystem->GetSystemAttachmentPool(), desc,
+      AZ::Name("GzInteropProbeImage"), nullptr, nullptr);
+  if (!this->interopImage || !this->interopImage->GetRHIImage())
+  {
+    std::fprintf(stderr,
+        "[gz-o3de] interop: AttachmentImage::Create failed; cannot probe\n");
+    return;
+  }
+
+  // Atom RHI handles -> per-device objects -> native Vulkan handles (via the
+  // patched, now-exported gem accessors).
+  const int deviceIndex = AZ::RHI::MultiDevice::DefaultDeviceIndex;
+  AZ::RHI::Image *rhiImage = this->interopImage->GetRHIImage();
+  AZ::RHI::Ptr<AZ::RHI::DeviceImage> deviceImage =
+      rhiImage->GetDeviceImage(deviceIndex);
+  AZ::RHI::Device *device =
+      AZ::RHI::RHISystemInterface::Get()->GetDevice(deviceIndex);
+  if (!deviceImage || !device)
+  {
+    std::fprintf(stderr,
+        "[gz-o3de] interop: no device image/device at index %d\n", deviceIndex);
+    return;
+  }
+
+  const VkDevice vkDevice = AZ::Vulkan::GetDeviceNativeHandle(*device);
+  const VkDeviceMemory vkMemory = AZ::Vulkan::GetImageMemory(*deviceImage);
+  const VkImage vkImage = AZ::Vulkan::GetNativeImage(*deviceImage);
+  const size_t allocSize = AZ::Vulkan::GetImageAllocationSize(*deviceImage);
+  const size_t allocOffset = AZ::Vulkan::GetImageAllocationOffset(*deviceImage);
+  if (vkDevice == VK_NULL_HANDLE || vkMemory == VK_NULL_HANDLE)
+  {
+    std::fprintf(stderr,
+        "[gz-o3de] interop: null VkDevice/VkDeviceMemory from gem accessors\n");
+    return;
+  }
+
+  // vkGetMemoryFdKHR is a device extension entry point. O3DE already dlopen'd the
+  // Vulkan loader (via glad), so resolve it through the loaded loader's
+  // vkGetDeviceProcAddr rather than linking libvulkan into the plugin.
+  void *loader = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_NOLOAD);
+  auto getDeviceProcAddr = loader
+      ? reinterpret_cast<PFN_vkGetDeviceProcAddr>(
+            dlsym(loader, "vkGetDeviceProcAddr"))
+      : nullptr;
+  auto getMemoryFd = getDeviceProcAddr
+      ? reinterpret_cast<PFN_vkGetMemoryFdKHR>(
+            getDeviceProcAddr(vkDevice, "vkGetMemoryFdKHR"))
+      : nullptr;
+  if (!getMemoryFd)
+  {
+    std::fprintf(stderr,
+        "[gz-o3de] interop: could not resolve vkGetMemoryFdKHR (loader=%p)\n",
+        loader);
+    return;
+  }
+
+  VkMemoryGetFdInfoKHR getFdInfo{};
+  getFdInfo.sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR;
+  getFdInfo.memory = vkMemory;
+  getFdInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT_KHR;
+  int fd = -1;
+  const VkResult res = getMemoryFd(vkDevice, &getFdInfo, &fd);
+
+  if (res == VK_SUCCESS && fd >= 0)
+  {
+    std::fprintf(stderr,
+        "[gz-o3de] interop: PROVED FD export -- vkGetMemoryFdKHR returned fd=%d "
+        "for the 256x256 image (VkImage=%p, VkDeviceMemory=%p, alloc size=%zu "
+        "offset=%zu). The exportable-image foundation works.\n",
+        fd, reinterpret_cast<void *>(vkImage),
+        reinterpret_cast<void *>(vkMemory), allocSize, allocOffset);
+    // The FD is a dup'd OS handle we own; close it (this proof does not import
+    // it). Steps 2-4 will instead hand the FD to GL and keep it until import.
+    close(fd);
+  }
+  else
+  {
+    std::fprintf(stderr,
+        "[gz-o3de] interop: vkGetMemoryFdKHR FAILED (VkResult=%d, fd=%d) -- the "
+        "image memory is not exportable; check the bus handler / device ext\n",
+        static_cast<int>(res), fd);
+  }
+#endif  // GZ_O3DE_INTEROP_BUILD
 }
 
 //////////////////////////////////////////////////
@@ -762,10 +953,14 @@ bool O3deBackend::Impl::BootstrapOnThread()
   // to the Vulkan RHI gem when it broadcasts during device creation.
   if (this->interop)
   {
-    this->externalHandleProvider.BusConnect();
+    // The class handles two buses; BusConnect() is ambiguous, so qualify each.
+    this->externalHandleProvider
+        .AZ::Vulkan::ExternalHandleRequirementBus::Handler::BusConnect();
+    this->externalHandleProvider
+        .AZ::Vulkan::DeviceRequirementBus::Handler::BusConnect();
     std::fprintf(stderr,
-        "[gz-o3de] interop: ExternalHandleRequirementBus handler connected "
-        "(GZ_O3DE_INTEROP)\n");
+        "[gz-o3de] interop: ExternalHandleRequirementBus + DeviceRequirementBus "
+        "handlers connected (GZ_O3DE_INTEROP)\n");
   }
 
   AzGameFramework::GameApplication::StartupParameters startupParams;

@@ -145,6 +145,29 @@ cmake --build build_o3de --target gz-rendering-o3de -j5
 
 `BUILD_O3DE` defaults to `OFF`; without it the backend is not built or required.
 
+> **The default build now includes the M4 interop path** (`GZ_O3DE_INTEROP=ON`).
+> It **requires** the O3DE gem patch in `o3de/patches/` (see its `README.md`) to be
+> applied to `vendor/o3de` and that gem rebuilt first — the patch exports the Vulkan
+> native-handle accessors the interop path links against. Without it the plugin
+> link fails with undefined `AZ::Vulkan::Get*` references. Apply it once with:
+>
+> ```bash
+> git -C vendor/o3de apply o3de/patches/0001-export-vulkan-native-handle-accessors.patch
+> cmake --build vendor/o3de/build/linux --config profile -j5 \
+>   --target Atom_RHI_Vulkan.Private
+> ```
+
+### Patch-free build (`-DGZ_O3DE_INTEROP=OFF`)
+
+To build the backend without any O3DE source changes (no interop; the FD-export
+probe becomes a logged no-op), turn the option off:
+
+```bash
+cmake -S . -B build_o3de -DBUILD_O3DE=ON -DGZ_O3DE_INTEROP=OFF \
+  -DCMAKE_C_COMPILER=clang-18 -DCMAKE_CXX_COMPILER=clang++-18
+cmake --build build_o3de --target gz-rendering-o3de -j5
+```
+
 ## Running
 
 The plugin loads the O3DE runtime in-process. Point the dynamic loader at both
@@ -173,10 +196,16 @@ export DISPLAY=:1
 #                          N x the requested resolution and box-downsamples on
 #                          readback; N>1 antialiases the AuxGeom primitives that
 #                          pipeline MSAA cannot (they are drawn post-resolve).
-#   GZ_O3DE_INTEROP=1      (experimental, M4) request that Atom create exportable
-#                          images + semaphores (OPAQUE_FD), the foundation for the
-#                          future zero-copy Vulkan->GL display path. Off by
-#                          default; see o3de/M4_INTEROP_DESIGN.md.
+#   GZ_O3DE_INTEROP=1      (experimental, M4) enable the exportable-image path:
+#                          request exportable images/semaphores (OPAQUE_FD) + the
+#                          external-memory-fd device extension, then prove a real
+#                          OS FD can be exported from an Atom image via
+#                          vkGetMemoryFdKHR (logged "interop: PROVED FD export").
+#                          The foundation for the future zero-copy Vulkan->GL
+#                          display path. Only effective if the plugin was built
+#                          with -DGZ_O3DE_INTEROP=ON (which needs the O3DE gem
+#                          patch); otherwise it is a logged no-op. The default
+#                          readback path is unaffected. See o3de/M4_INTEROP_DESIGN.md.
 
 GZ_O3DE_DEMO_SHAPES=1 gz gui -c examples/config/scene3d.config   # <engine>o3de</engine>
 ```

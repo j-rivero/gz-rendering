@@ -1,0 +1,43 @@
+diff --git a/Gems/Atom/RHI/Vulkan/Code/Include/Atom/RHI.Interface/Vulkan/RHIVulkanInterface.h b/Gems/Atom/RHI/Vulkan/Code/Include/Atom/RHI.Interface/Vulkan/RHIVulkanInterface.h
+index 5d39c931d4..0376d97b09 100644
+--- a/Gems/Atom/RHI/Vulkan/Code/Include/Atom/RHI.Interface/Vulkan/RHIVulkanInterface.h
++++ b/Gems/Atom/RHI/Vulkan/Code/Include/Atom/RHI.Interface/Vulkan/RHIVulkanInterface.h
+@@ -15,6 +15,17 @@
+ 
+ #include <vulkan/vulkan.h>
+ 
++// gz-rendering M4 zero-copy interop patch (not upstream).
++// The Vulkan RHI gem is compiled with -fvisibility=hidden, which keeps these
++// native-handle accessors LOCAL to the gem .so and unreachable from another
++// loaded module. Giving the declarations default visibility places them in the
++// .so's dynamic symbol table so the gz-rendering O3DE plugin (a separate module)
++// can resolve them at runtime, instead of linking the gem's static archive
++// (which would duplicate Vulkan-RHI state). See gz-rendering: o3de/patches/.
++#if defined(__GNUC__) || defined(__clang__)
++#  pragma GCC visibility push(default)
++#endif
++
+ namespace AZ
+ {
+     namespace Vulkan
+@@ -49,3 +60,7 @@ namespace AZ
+         size_t GetImageAllocationOffset(RHI::DeviceImage& image);
+     } // namespace Vulkan
+ } // namespace AZ
++
++#if defined(__GNUC__) || defined(__clang__)
++#  pragma GCC visibility pop
++#endif
+diff --git a/Gems/Atom/RHI/Vulkan/Code/atom_rhi_vulkan_private_common_shared_files.cmake b/Gems/Atom/RHI/Vulkan/Code/atom_rhi_vulkan_private_common_shared_files.cmake
+index ec49ed05f5..e395a4062f 100644
+--- a/Gems/Atom/RHI/Vulkan/Code/atom_rhi_vulkan_private_common_shared_files.cmake
++++ b/Gems/Atom/RHI/Vulkan/Code/atom_rhi_vulkan_private_common_shared_files.cmake
+@@ -8,4 +8,8 @@
+ 
+ set(FILES
+     Source/RHI/Module.cpp
++    # gz-rendering M4 interop patch (not upstream): compile the native-handle
++    # accessors INTO the loaded gem .so (paired with default visibility in
++    # RHIVulkanInterface.h) so an external module can resolve them at runtime.
++    Source/RHI.Interface/RHIVulkanInterface.cpp
+ )

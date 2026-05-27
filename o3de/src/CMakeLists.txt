@@ -33,6 +33,18 @@ set(O3DE_BIN   "${O3DE_BUILD}/bin/profile")
 set(O3DE_LIB   "${O3DE_BUILD}/lib/profile")
 set(O3DE_3P    "$ENV{HOME}/o3de-packages/packages")
 
+# Experimental M4 zero-copy Vulkan->GL interop (post-PoC perf work). ON by
+# default: the standard BUILD_O3DE build now compiles the interop path, so the
+# O3DE gem export patch in o3de/patches/0001-export-vulkan-native-handle-accessors.patch
+# MUST be applied to vendor/o3de and that gem rebuilt -- O3deBackend.cc calls the
+# Vulkan-RHI native-handle accessors it exports, and without it the plugin link
+# fails with undefined AZ::Vulkan::Get* references. Turn OFF to build the backend
+# without any O3DE source changes (the interop FD probe then becomes a logged
+# no-op). See o3de/M4_INTEROP_DESIGN.md and o3de/patches/README.md.
+option(GZ_O3DE_INTEROP
+  "Build the M4 Vulkan->GL interop path (requires the O3DE gem patch in o3de/patches/; turn OFF for a patch-free build)"
+  ON)
+
 # Include surface needed by O3deBackend.cc (Atom RPI/RHI/Feature + AzCore/
 # Framework/GameFramework + generated + 3rdParty headers reached transitively).
 set(O3DE_BACKEND_INCLUDES
@@ -107,10 +119,25 @@ target_link_libraries(${o3de_target}
       ${O3DE_BIN}/libAtom_Feature_Common.Public.so
       ${O3DE_BIN}/libAtom_RHI.Public.so
       ${O3DE_BIN}/libAtom_RHI.Reflect.so
+      # M4 interop (only when GZ_O3DE_INTEROP): the Vulkan RHI gem .so. We link it
+      # (DT_NEEDED) only to resolve the native-handle accessors exported by the
+      # interop patch (AZ::Vulkan::GetNativeImage / GetImageMemory /
+      # GetDeviceNativeHandle). The gem is also dlopen'd by AZ at runtime; AZ's
+      # loader uses RTLD_NOLOAD and explicitly handles "already loaded as a
+      # dependency" (no double-init). The runpath already includes ${O3DE_BIN}.
+      $<$<BOOL:${GZ_O3DE_INTEROP}>:${O3DE_BIN}/libAtom_RHI_Vulkan.Private.so>
       ${O3DE_BIN}/libAzFramework.so
       ${O3DE_BIN}/libAzFramework.NativeUI.so
       ${O3DE_BIN}/libAzCore.so
     -Wl,--end-group)
+
+# When interop is enabled, define GZ_O3DE_INTEROP_BUILD so O3deBackend.cc compiles
+# the native-handle accessor calls (which require the patched gem above). Without
+# it the file builds patch-free and the interop probe is a logged no-op.
+if (GZ_O3DE_INTEROP)
+  set_property(SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/O3deBackend.cc
+    APPEND PROPERTY COMPILE_DEFINITIONS GZ_O3DE_INTEROP_BUILD=1)
+endif()
 
 # Find the O3DE shared libs at runtime (PoC: point straight at the build tree).
 set_target_properties(${o3de_target} PROPERTIES
