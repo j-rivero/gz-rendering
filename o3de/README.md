@@ -168,6 +168,11 @@ export DISPLAY=:1
 #   GZ_O3DE_DEMO_SHAPES=1  inject a red box / green sphere / blue cylinder when
 #                          the scene has no primitives (e.g. an empty MinimalScene)
 #   GZ_O3DE_DUMP_FRAME=1   dump the first rendered frame to /tmp/gz_gui_frame.ppm
+#   GZ_O3DE_SSAA=N         supersampling factor for anti-aliasing (1 = off,
+#                          2 = default, up to 4). Renders the offscreen target at
+#                          N x the requested resolution and box-downsamples on
+#                          readback; N>1 antialiases the AuxGeom primitives that
+#                          pipeline MSAA cannot (they are drawn post-resolve).
 
 GZ_O3DE_DEMO_SHAPES=1 gz gui -c examples/config/scene3d.config   # <engine>o3de</engine>
 ```

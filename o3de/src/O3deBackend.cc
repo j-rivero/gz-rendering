@@ -72,13 +72,16 @@ namespace rendering
 
 namespace
 {
-  // Supersampling factor for anti-aliasing. The offscreen target is rendered at
-  // kSsaaScale x the requested (logical) resolution in each dimension and
-  // box-downsampled on readback. Atom draws AuxGeom (our primitives) as a
-  // post-resolve overlay at 1 sample, so pipeline MSAA cannot antialias it;
-  // supersampling smooths it (and everything else) on the CPU-readback path.
-  // 2 => 4x the pixels rendered (acceptable for this readback PoC).
-  constexpr uint32_t kSsaaScale = 2u;
+  // Default supersampling factor for anti-aliasing. The offscreen target is
+  // rendered at this multiple of the requested (logical) resolution in each
+  // dimension and box-downsampled on readback. Atom draws AuxGeom (our
+  // primitives) as a post-resolve overlay at 1 sample, so pipeline MSAA cannot
+  // antialias it; supersampling smooths it (and everything else) on the
+  // CPU-readback path. 2 => 4x the pixels rendered (acceptable for this readback
+  // PoC). Overridable at runtime via GZ_O3DE_SSAA (1 = off ... 4); see
+  // Impl::ssaaScale.
+  constexpr uint32_t kDefaultSsaaScale = 2u;
+  constexpr uint32_t kMaxSsaaScale = 4u;
 
   // PoC paths. We reuse the vendored O3DE build and the GzAtomPoc cooked-asset
   // project that M1/M2.1 produced. A later milestone will vendor a minimal
@@ -112,6 +115,10 @@ class O3deBackend::Impl
   public: const AZStd::string pipelineName = "GzO3deProbePipeline";
   public: uint32_t outputWidth = 0u;
   public: uint32_t outputHeight = 0u;
+
+  // SSAA factor (>=1). Set once from GZ_O3DE_SSAA during bootstrap; 1 disables
+  // supersampling. outputWidth/Height track the supersampled render size.
+  public: uint32_t ssaaScale = kDefaultSsaaScale;
 
   // ---- Cross-thread state (guarded by mutex) ------------------------------
   public: std::thread renderThread;
@@ -617,6 +624,16 @@ bool O3deBackend::Impl::BootstrapOnThread()
 {
   using FixedValueString = AZ::SettingsRegistryInterface::FixedValueString;
 
+  // SSAA factor: GZ_O3DE_SSAA overrides the default (1 disables anti-aliasing,
+  // up to kMaxSsaaScale). Read once here so the whole render loop is consistent.
+  if (const char *ssaaEnv = std::getenv("GZ_O3DE_SSAA"))
+  {
+    const long v = std::strtol(ssaaEnv, nullptr, 10);
+    if (v >= 1 && v <= static_cast<long>(kMaxSsaaScale))
+      this->ssaaScale = static_cast<uint32_t>(v);
+  }
+  std::fprintf(stderr, "[gz-o3de] SSAA scale = %u\n", this->ssaaScale);
+
   const char *enginePath = EnvOr("GZ_O3DE_ENGINE_PATH",
       "/home/jrivero/code/gz/gz-rendering/vendor/o3de");
   const char *projectPath = EnvOr("GZ_O3DE_PROJECT_PATH",
@@ -794,14 +811,15 @@ bool O3deBackend::Impl::RenderOneFrame()
   // one thread: the synchronous shader loads a pass rebuild can trigger
   // self-pump and complete (from a foreign thread they would deadlock).
   // SSAA: outputWidth/outputHeight track the *supersampled* render-target size
-  // (kSsaaScale x the requested logical resolution). The capture is downsampled
+  // (ssaaScale x the requested logical resolution). The capture is downsampled
   // back to the logical size when the frame is published.
+  const uint32_t scale = this->ssaaScale;
   const uint32_t logicalW = (this->reqWidth > 0u)
-      ? this->reqWidth : (this->outputWidth / kSsaaScale);
+      ? this->reqWidth : (this->outputWidth / scale);
   const uint32_t logicalH = (this->reqHeight > 0u)
-      ? this->reqHeight : (this->outputHeight / kSsaaScale);
-  const uint32_t w = logicalW * kSsaaScale;
-  const uint32_t h = logicalH * kSsaaScale;
+      ? this->reqHeight : (this->outputHeight / scale);
+  const uint32_t w = logicalW * scale;
+  const uint32_t h = logicalH * scale;
   if (w > 0u && (w != this->outputWidth || h != this->outputHeight))
   {
     this->EnsureSize(w, h);
@@ -907,25 +925,26 @@ bool O3deBackend::Impl::RenderOneFrame()
 
   // SSAA resolve: box-downsample the supersampled capture (captureWidth x
   // captureHeight) to the logical resolution -- each output pixel is the average
-  // of a kSsaaScale x kSsaaScale block. This is what applies anti-aliasing to
-  // the whole image, AuxGeom included. captureWidth/Height are exact multiples
-  // of kSsaaScale (we sized the target that way), so no source pixels are lost.
-  const uint32_t outW = this->captureWidth / kSsaaScale;
-  const uint32_t outH = this->captureHeight / kSsaaScale;
+  // of a scale x scale block. This is what applies anti-aliasing to the whole
+  // image, AuxGeom included. captureWidth/Height are exact multiples of scale
+  // (we sized the target that way), so no source pixels are lost. With scale==1
+  // this is a straight copy (no anti-aliasing).
+  const uint32_t outW = this->captureWidth / scale;
+  const uint32_t outH = this->captureHeight / scale;
   std::vector<uint8_t> resolved(static_cast<size_t>(outW) * outH * 4u);
   const size_t srcStride = static_cast<size_t>(this->captureWidth) * 4u;
-  constexpr uint32_t kBlock = kSsaaScale * kSsaaScale;
+  const uint32_t block = scale * scale;
   for (uint32_t oy = 0u; oy < outH; ++oy)
   {
     for (uint32_t ox = 0u; ox < outW; ++ox)
     {
       uint32_t acc[4] = {0u, 0u, 0u, 0u};
-      for (uint32_t sy = 0u; sy < kSsaaScale; ++sy)
+      for (uint32_t sy = 0u; sy < scale; ++sy)
       {
         const uint8_t *src = this->captureBuffer.data() +
-            (static_cast<size_t>(oy) * kSsaaScale + sy) * srcStride +
-            static_cast<size_t>(ox) * kSsaaScale * 4u;
-        for (uint32_t sx = 0u; sx < kSsaaScale; ++sx)
+            (static_cast<size_t>(oy) * scale + sy) * srcStride +
+            static_cast<size_t>(ox) * scale * 4u;
+        for (uint32_t sx = 0u; sx < scale; ++sx)
         {
           acc[0] += src[sx * 4u + 0u];
           acc[1] += src[sx * 4u + 1u];
@@ -935,10 +954,10 @@ bool O3deBackend::Impl::RenderOneFrame()
       }
       uint8_t *dst = resolved.data() +
           (static_cast<size_t>(oy) * outW + ox) * 4u;
-      dst[0] = static_cast<uint8_t>(acc[0] / kBlock);
-      dst[1] = static_cast<uint8_t>(acc[1] / kBlock);
-      dst[2] = static_cast<uint8_t>(acc[2] / kBlock);
-      dst[3] = static_cast<uint8_t>(acc[3] / kBlock);
+      dst[0] = static_cast<uint8_t>(acc[0] / block);
+      dst[1] = static_cast<uint8_t>(acc[1] / block);
+      dst[2] = static_cast<uint8_t>(acc[2] / block);
+      dst[3] = static_cast<uint8_t>(acc[3] / block);
     }
   }
 
