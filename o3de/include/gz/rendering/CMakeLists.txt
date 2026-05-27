@@ -1,0 +1,1 @@
+gz_install_all_headers(COMPONENT o3de)

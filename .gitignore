@@ -8,3 +8,10 @@ build_*
 
 # Bazel generated files
 bazel-*
+
+# Experimental O3DE/Atom backend (see o3de/README.md): the vendored upstream
+# O3DE engine tree and scratch build dirs are external and must not be tracked.
+vendor/
+test_build*/
+imgui.ini
+

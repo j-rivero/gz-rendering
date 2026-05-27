@@ -32,6 +32,11 @@ else()
   add_definitions("-DGZ_PROFILER_ENABLE=0")
 endif()
 
+# Experimental O3DE/Atom render engine plugin. Off by default: the vendored
+# O3DE engine under vendor/o3de is large and slow to build. For the M0 stub
+# this only builds the gz-rendering plugin scaffolding (no O3DE sources).
+option(BUILD_O3DE "Build the experimental O3DE/Atom render engine plugin" OFF)
+
 #============================================================================
 # Search for project-specific dependencies
 #============================================================================
@@ -154,6 +159,15 @@ if (UNIX AND NOT APPLE)
   endif()
 endif()
 
+#--------------------------------------
+# Configure the experimental O3DE/Atom engine plugin
+# M0: the stub component has no O3DE dependencies, so it is gated only on
+# the BUILD_O3DE option. A later milestone will additionally require the
+# Vulkan SDK and add_subdirectory(vendor/o3de) for the vendored engine.
+if (BUILD_O3DE)
+  set(GZ_RENDERING_HAVE_O3DE TRUE)
+endif()
+
 # Plugin install dirs
 set(GZ_RENDERING_ENGINE_RELATIVE_INSTALL_DIR
   ${GZ_LIB_INSTALL_DIR}/gz-${GZ_DESIGNATION}/engine-plugins
@@ -187,6 +201,10 @@ endif()
 
 if (GZ_RENDERING_HAVE_OGRE2)
   list(APPEND RENDERING_COMPONENTS ogre2)
+endif()
+
+if (GZ_RENDERING_HAVE_O3DE)
+  list(APPEND RENDERING_COMPONENTS o3de)
 endif()
 
 configure_file("${PROJECT_SOURCE_DIR}/cppcheck.suppress.in"

@@ -492,6 +492,18 @@ void RenderEngineManagerPrivate::RegisterDefaultEngines()
   registerStaticOrSolibPlugin(ogre2EngineName, ogre2StaticFilename,
       /*_solibFilename=*/"");
 #endif
+
+  // Register O3DE
+  const std::string o3deEngineName = "o3de";
+  const std::string o3deStaticFilename =
+      "static://gz::rendering::o3de::Plugin";
+#if GZ_RENDERING_HAVE_O3DE
+  registerStaticOrSolibPlugin(o3deEngineName, o3deStaticFilename,
+      libNamePrefix + o3deEngineName);
+#else
+  registerStaticOrSolibPlugin(o3deEngineName, o3deStaticFilename,
+      /*_solibFilename=*/"");
+#endif
 }
 
 //////////////////////////////////////////////////
