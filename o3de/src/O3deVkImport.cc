@@ -23,6 +23,7 @@
 #include "O3deVkImport.hh"
 
 #include <cstdio>
+#include <cstdlib>
 
 #include <unistd.h>
 
@@ -198,6 +199,14 @@ bool O3deVkAcquireFromProducer(const O3deVkDeviceContext &_ctx,
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(cmd, &begin);
 
+    // DIAGNOSTIC (interop bring-up): a queue-family ownership ACQUIRE
+    // (srcQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL) is only valid when the
+    // producer issued the matching RELEASE (dst = EXTERNAL). Atom never does, so
+    // this acquire is unmatched -- spec-invalid and a candidate for a delayed GPU
+    // fault. With GZ_O3DE_NO_QFOT set we drop the ownership transfer and issue a
+    // plain layout barrier (IGNORED -> IGNORED) to A/B test whether the unmatched
+    // EXTERNAL transfer is what loses the device.
+    const bool noQfot = (std::getenv("GZ_O3DE_NO_QFOT") != nullptr);
     VkImageMemoryBarrier acquire{};
     acquire.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
     acquire.srcAccessMask = 0;
@@ -205,8 +214,10 @@ bool O3deVkAcquireFromProducer(const O3deVkDeviceContext &_ctx,
         VK_ACCESS_SHADER_READ_BIT;
     acquire.oldLayout = _producerLayout;
     acquire.newLayout = _targetLayout;
-    acquire.srcQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
-    acquire.dstQueueFamilyIndex = _ctx.queueFamily;
+    acquire.srcQueueFamilyIndex =
+        noQfot ? VK_QUEUE_FAMILY_IGNORED : VK_QUEUE_FAMILY_EXTERNAL;
+    acquire.dstQueueFamilyIndex =
+        noQfot ? VK_QUEUE_FAMILY_IGNORED : _ctx.queueFamily;
     acquire.image = _img.image;
     acquire.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 0u, 1u};
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,

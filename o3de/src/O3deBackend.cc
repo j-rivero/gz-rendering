@@ -63,12 +63,15 @@
 #include <Atom/RPI.Public/Image/AttachmentImage.h>
 #include <Atom/RPI.Public/Image/AttachmentImagePool.h>
 #include <Atom/RPI.Public/Image/ImageSystemInterface.h>
+#include <Atom/RPI.Reflect/Image/AttachmentImageAssetCreator.h>
 #include <Atom/RPI.Reflect/System/SceneDescriptor.h>
 #include <Atom/RPI.Reflect/System/RenderPipelineDescriptor.h>
 #include <Atom/RHI/RHISystemInterface.h>
 #include <Atom/RHI/Image.h>
 #include <Atom/RHI/ImagePool.h>
 #include <Atom/RHI/DeviceImage.h>
+#include <Atom/RHI/Fence.h>
+#include <Atom/RHI/DeviceFence.h>
 #include <Atom/RHI.Reflect/ImageSubresource.h>
 #include <Atom/RHI.Reflect/MultisampleState.h>
 #include <Atom/Feature/Utils/FrameCaptureBus.h>
@@ -230,6 +233,10 @@ class O3deBackend::Impl
   // here for reuse by later M4 steps (render-into + GL import). Null when interop
   // is off.
   public: AZ::Data::Instance<AZ::RPI::AttachmentImage> interopImage;
+  // The AttachmentImageAsset backing interopImage. Kept so the Stage B live
+  // pipeline (CreateRenderPipelineForImage) can bind the image as its output;
+  // built by EnsureInteropImage via AttachmentImageAssetCreator.
+  public: AZ::Data::Asset<AZ::RPI::AttachmentImageAsset> interopImageAsset;
   public: bool interopFdProven = false;
   // Stored import handles for the exportable interop image (M4 step 2). The FD
   // is kept open (dup'd to callers via GetInteropImport) so a GL-context thread
@@ -240,12 +247,39 @@ class O3deBackend::Impl
   public: uint32_t interopHeight = 0u;
   public: uint64_t interopAllocSize = 0u;
   public: uint64_t interopAllocOffset = 0u;
+  // Bumped on each (re)creation of the exportable image (probe -> camera size,
+  // resize). Consumers compare it (via O3deInteropImport::generation) to decide
+  // when to re-import. Retired images are kept alive (not freed) so any FD a
+  // consumer already imported from a previous generation stays backed.
+  public: uint64_t interopGeneration = 0u;
+  public: std::vector<AZ::Data::Instance<AZ::RPI::AttachmentImage>>
+      retiredInteropImages;
+
+  // M4 interop, Stage B (#26): render-finished synchronisation. interopSemaphoreFd
+  // is the exported OPAQUE_FD of a render-finished timeline semaphore (-1 until a
+  // signal path exists); interopSemaphoreValue is the per-frame value the consumer
+  // waits on. Plumbed through GetInteropImport(); the producer-side signal
+  // injection is pending a custom RPI::Pass (Atom marks the natural scope hooks
+  // final/friend-only). -1 -> consumer falls back to no cross-device wait.
+  public: AZ::RHI::Ptr<AZ::RHI::Fence> renderFinishedFence;
+  public: int interopSemaphoreFd = -1;
+  public: uint64_t interopSemaphoreValue = 0u;
 
   // M4 interop (experimental, GZ_O3DE_INTEROP): when set, this handler is
   // connected before the RHI device is created so Atom makes images + semaphores
   // exportable. Member of the (leaked) Impl so it stays connected for the life of
   // the runtime. Off by default -> zero effect on the readback path.
   public: bool interop = false;
+
+  // M4 interop, Phase 2a (experimental, GZ_O3DE_INTEROP_LIVE): when set *and*
+  // interop is on, RenderOneFrame() (re)creates the exportable image at the live
+  // camera size each frame and uploads the freshly rendered scene into it, so a
+  // native Vulkan consumer samples the live scene instead of the static probe.
+  // Off by default: the live path needs cross-device render-finished-semaphore
+  // sync (task #26) to be safe; without it the producer's per-frame writes race
+  // the consumer's unmatched EXTERNAL ownership acquire and the GPU device is
+  // lost. The default interop run therefore stays on the stable static probe.
+  public: bool interopLive = false;
   public: GzExternalHandleProvider externalHandleProvider;
 
   // ---- Cross-thread state (guarded by mutex) ------------------------------
@@ -303,6 +337,27 @@ class O3deBackend::Impl
   /// zero-copy Vulkan->GL path. Runs once, only when interop is enabled; never
   /// touches the readback path. Must run on the render thread (all O3DE work).
   public: void ProveFdExportOnce();
+  /// \brief (Re)create the persistent, exportable colour image at the given
+  /// size and export its OPAQUE_FD. Idempotent when the size is unchanged;
+  /// otherwise bumps interopGeneration and retires the old image. Render thread
+  /// only. \return True on a ready exportable image.
+  public: bool EnsureInteropImage(uint32_t _w, uint32_t _h);
+  /// \brief Upload a tightly packed RGBA8888 frame into the current exportable
+  /// image (caller must EnsureInteropImage() first). Render thread only.
+  public: void UploadToInteropImage(const uint8_t *_rgba, uint32_t _w,
+              uint32_t _h);
+  /// \brief Stage B (#26) groundwork: create the render-finished timeline fence
+  /// once and export its native VkSemaphore as an OPAQUE_FD. Idempotent. Render
+  /// thread only. \return True once the fence + exported semaphore FD are ready.
+  /// NOTE: not yet wired to a per-frame GPU signal (pending a custom RPI::Pass);
+  /// do not advertise the semaphore until a signal path exists, or a consumer
+  /// waiting on it will hang.
+  public: bool EnsureInteropSemaphore();
+  /// \brief Stage B live path: (re)create the exportable image at \p _w x \p _h
+  /// and a render pipeline (CreateRenderPipelineForImage) that renders the scene
+  /// directly into it -- zero-copy, no CPU readback. Swaps out the previous
+  /// pipeline on a size change. Render thread only. \return True on success.
+  public: bool RecreateInteropPipeline(uint32_t _w, uint32_t _h);
   /// \brief (Re)size the offscreen render target if needed.
   public: void EnsureSize(uint32_t _width, uint32_t _height);
   /// \brief Point the RPI view at the current gz camera pose + projection.
@@ -408,6 +463,37 @@ bool O3deBackend::Impl::SetupScene(uint32_t _width, uint32_t _height)
   this->frameworkScene = createSceneOutcome.TakeValue();
   this->frameworkScene->SetSubsystem(this->scene);
 
+#if defined(GZ_O3DE_INTEROP_BUILD)
+  if (this->interopLive)
+  {
+    // Stage B: render the scene DIRECTLY into the exportable image (zero-copy).
+    // Create the view + register the scene, then a pipeline whose output IS the
+    // exportable image (CreateRenderPipelineForImage). No MainPipelineRenderTo-
+    // Texture pipeline and no CPU capture/readback on this path -- the consumer
+    // samples the image the scene rendered into.
+    this->view = AZ::RPI::View::CreateView(
+        AZ::Name("MainCamera"), AZ::RPI::View::UsageCamera);
+    this->scene->Activate();
+    AZ::RPI::RPISystemInterface::Get()->RegisterScene(this->scene);
+    if (!this->RecreateInteropPipeline(_width, _height))
+      return false;
+    this->ApplyCamera(_width, _height);
+    // Settle the pipeline's pass + shader-variant builds (they self-pump on this
+    // thread). AuxGeom is submitted so the forward pass has something to draw.
+    this->pipeline->AddToRenderTick();
+    for (int i = 0; i < 5; ++i)
+    {
+      this->SubmitPrimitives();
+      this->app->PumpSystemEventLoopUntilEmpty();
+      this->app->TickSystem();
+      this->app->Tick();
+    }
+    this->pipeline->RemoveFromRenderTick();
+    std::fprintf(stderr, "[gz-o3de] interop: Stage B scene setup complete\n");
+    return true;
+  }
+#endif
+
   // Offscreen render-to-texture pipeline (no window/swapchain).
   // MainPipelineRenderToTexture is the game pipeline's offscreen variant;
   // ToolsPipelineRenderToTexture pulls in editor-only passes whose templates
@@ -496,6 +582,347 @@ bool O3deBackend::Impl::SetupScene(uint32_t _width, uint32_t _height)
 }
 
 //////////////////////////////////////////////////
+bool O3deBackend::Impl::EnsureInteropImage(uint32_t _w, uint32_t _h)
+{
+#if !defined(GZ_O3DE_INTEROP_BUILD)
+  (void)_w; (void)_h;
+  return false;
+#else
+  if (_w == 0u || _h == 0u)
+    return false;
+  if (this->interopImage && this->interopImageReady &&
+      this->interopWidth == _w && this->interopHeight == _h)
+    return true;  // already the right size; reuse
+
+  // A persistent colour image from the system attachment pool. Persistent (not
+  // transient) so its backing VkImage/VkDeviceMemory are stable; created after
+  // GzExternalHandleProvider connected pre-device-creation, so its VMA
+  // allocation carries VkExportMemoryAllocateInfo (OPAQUE_FD).
+  const auto *imageSystem = AZ::RPI::ImageSystemInterface::Get();
+  if (!imageSystem || !imageSystem->GetSystemAttachmentPool())
+  {
+    std::fprintf(stderr,
+        "[gz-o3de] interop: no system attachment pool; cannot create image\n");
+    return false;
+  }
+  // Color (render-into) + ShaderRead (consumer sampling) + CopyRead (readback) +
+  // CopyWrite (UpdateImageContents upload).
+  const AZ::RHI::ImageDescriptor desc = AZ::RHI::ImageDescriptor::Create2D(
+      AZ::RHI::ImageBindFlags::Color | AZ::RHI::ImageBindFlags::ShaderRead |
+          AZ::RHI::ImageBindFlags::CopyRead | AZ::RHI::ImageBindFlags::CopyWrite,
+      _w, _h, AZ::RHI::Format::R8G8B8A8_UNORM);
+  // AttachmentImage names must be unique per live instance; suffix the next
+  // generation so a recreate (resize) does not collide with the retired one.
+  const AZStd::string imgName = AZStd::string::format(
+      "GzInteropImage_%llu",
+      static_cast<unsigned long long>(this->interopGeneration + 1u));
+
+  // Build the image through an AttachmentImageAsset (mirrors what
+  // AttachmentImage::Create does internally) so we keep the asset handle: the
+  // Stage B live pipeline binds the image as its render output by asset id via
+  // CreateRenderPipelineForImage. A random asset id keys a fresh instance each
+  // generation; End() registers it with the AssetManager and defaults to the
+  // system attachment pool.
+  const AZ::Data::AssetId assetId(AZ::Uuid::CreateRandom());
+  AZ::RPI::AttachmentImageAssetCreator creator;
+  creator.Begin(assetId);
+  creator.SetImageDescriptor(desc);
+  creator.SetName(AZ::Name(imgName), /*isUniqueName*/ true);
+  AZ::Data::Asset<AZ::RPI::AttachmentImageAsset> imageAsset;
+  if (!creator.End(imageAsset) || !imageAsset.IsReady())
+  {
+    std::fprintf(stderr,
+        "[gz-o3de] interop: AttachmentImageAsset build failed (%ux%u)\n", _w, _h);
+    return false;
+  }
+  AZ::Data::Instance<AZ::RPI::AttachmentImage> newImage =
+      AZ::RPI::AttachmentImage::FindOrCreate(imageAsset);
+  if (!newImage || !newImage->GetRHIImage())
+  {
+    std::fprintf(stderr,
+        "[gz-o3de] interop: AttachmentImage::FindOrCreate failed (%ux%u)\n",
+        _w, _h);
+    return false;
+  }
+
+  // Atom RHI handles -> per-device objects -> native Vulkan handles (via the
+  // patched, now-exported gem accessors).
+  const int deviceIndex = AZ::RHI::MultiDevice::DefaultDeviceIndex;
+  AZ::RHI::Image *rhiImage = newImage->GetRHIImage();
+  AZ::RHI::Ptr<AZ::RHI::DeviceImage> deviceImage =
+      rhiImage->GetDeviceImage(deviceIndex);
+  AZ::RHI::Device *device =
+      AZ::RHI::RHISystemInterface::Get()->GetDevice(deviceIndex);
+  if (!deviceImage || !device)
+  {
+    std::fprintf(stderr,
+        "[gz-o3de] interop: no device image/device at index %d\n", deviceIndex);
+    return false;
+  }
+  const VkDevice vkDevice = AZ::Vulkan::GetDeviceNativeHandle(*device);
+  const VkDeviceMemory vkMemory = AZ::Vulkan::GetImageMemory(*deviceImage);
+  const VkImage vkImage = AZ::Vulkan::GetNativeImage(*deviceImage);
+  const size_t allocSize = AZ::Vulkan::GetImageAllocationSize(*deviceImage);
+  const size_t allocOffset = AZ::Vulkan::GetImageAllocationOffset(*deviceImage);
+  if (vkDevice == VK_NULL_HANDLE || vkMemory == VK_NULL_HANDLE)
+  {
+    std::fprintf(stderr,
+        "[gz-o3de] interop: null VkDevice/VkDeviceMemory from gem accessors\n");
+    return false;
+  }
+
+  // vkGetMemoryFdKHR is a device extension entry point. O3DE already dlopen'd
+  // the Vulkan loader (via glad), so resolve it through the loaded loader.
+  void *loader = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_NOLOAD);
+  auto getDeviceProcAddr = loader
+      ? reinterpret_cast<PFN_vkGetDeviceProcAddr>(
+            dlsym(loader, "vkGetDeviceProcAddr"))
+      : nullptr;
+  auto getMemoryFd = getDeviceProcAddr
+      ? reinterpret_cast<PFN_vkGetMemoryFdKHR>(
+            getDeviceProcAddr(vkDevice, "vkGetMemoryFdKHR"))
+      : nullptr;
+  if (!getMemoryFd)
+  {
+    std::fprintf(stderr,
+        "[gz-o3de] interop: could not resolve vkGetMemoryFdKHR (loader=%p)\n",
+        loader);
+    return false;
+  }
+  VkMemoryGetFdInfoKHR getFdInfo{};
+  getFdInfo.sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR;
+  getFdInfo.memory = vkMemory;
+  getFdInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT_KHR;
+  int fd = -1;
+  const VkResult res = getMemoryFd(vkDevice, &getFdInfo, &fd);
+  if (res != VK_SUCCESS || fd < 0)
+  {
+    std::fprintf(stderr,
+        "[gz-o3de] interop: vkGetMemoryFdKHR FAILED (VkResult=%d, fd=%d) -- the "
+        "image memory is not exportable; check the bus handler / device ext\n",
+        static_cast<int>(res), fd);
+    return false;
+  }
+
+  // Publish the new image atomically for GetInteropImport() (gz-gui thread).
+  // Retire (keep alive, do not free) the previous image so any FD a consumer
+  // already imported from it stays backed; the bumped generation makes the
+  // consumer re-import the new one.
+  {
+    std::lock_guard<std::mutex> lock(this->mutex);
+    if (this->interopImage)
+      this->retiredInteropImages.push_back(this->interopImage);
+    if (this->interopFd >= 0)
+      ::close(this->interopFd);
+    this->interopImage = newImage;
+    this->interopImageAsset = imageAsset;
+    this->interopFd = fd;
+    this->interopWidth = _w;
+    this->interopHeight = _h;
+    this->interopAllocSize = static_cast<uint64_t>(allocSize);
+    this->interopAllocOffset = static_cast<uint64_t>(allocOffset);
+    this->interopImageReady = true;
+    ++this->interopGeneration;
+  }
+  std::fprintf(stderr,
+      "[gz-o3de] interop: exportable image ready gen=%llu %ux%u fd=%d "
+      "VkImage=%p (alloc size=%zu offset=%zu)\n",
+      static_cast<unsigned long long>(this->interopGeneration), _w, _h, fd,
+      reinterpret_cast<void *>(vkImage), allocSize, allocOffset);
+  return true;
+#endif  // GZ_O3DE_INTEROP_BUILD
+}
+
+//////////////////////////////////////////////////
+void O3deBackend::Impl::UploadToInteropImage(
+    const uint8_t *_rgba, uint32_t _w, uint32_t _h)
+{
+#if defined(GZ_O3DE_INTEROP_BUILD)
+  if (!this->interopImage || !_rgba || _w == 0u || _h == 0u ||
+      this->interopWidth != _w || this->interopHeight != _h)
+    return;
+  AZ::RHI::Image *uploadImage = this->interopImage->GetRHIImage();
+  AZ::RHI::DeviceImageSubresourceLayout devLayout =
+      AZ::RHI::GetImageSubresourceLayout(AZ::RHI::Size(_w, _h, 1u),
+          AZ::RHI::Format::R8G8B8A8_UNORM);
+  AZ::RHI::ImageSubresourceLayout srcLayout;
+  srcLayout.Init(uploadImage->GetDeviceMask(), devLayout);
+  AZ::RHI::ImageUpdateRequest update;
+  update.m_image = uploadImage;
+  update.m_sourceData = _rgba;
+  update.m_sourceSubresourceLayout = srcLayout;
+  this->interopImage->UpdateImageContents(update);
+#else
+  (void)_rgba; (void)_w; (void)_h;
+#endif
+}
+
+//////////////////////////////////////////////////
+bool O3deBackend::Impl::EnsureInteropSemaphore()
+{
+#if !defined(GZ_O3DE_INTEROP_BUILD)
+  return false;
+#else
+  if (this->renderFinishedFence && this->interopSemaphoreFd >= 0)
+    return true;
+
+  if (!this->renderFinishedFence)
+  {
+    // A timeline-semaphore fence. The external-handle bus (connected pre-device-
+    // creation) made Atom's timeline semaphores exportable, so its native
+    // VkSemaphore can be exported as an OPAQUE_FD below.
+    this->renderFinishedFence = aznew AZ::RHI::Fence;
+    const AZ::RHI::ResultCode rc = this->renderFinishedFence->Init(
+        AZ::RHI::MultiDevice::AllDevices, AZ::RHI::FenceState::Reset);
+    if (rc != AZ::RHI::ResultCode::Success)
+    {
+      std::fprintf(stderr,
+          "[gz-o3de] interop: render-finished Fence::Init failed (%d)\n",
+          static_cast<int>(rc));
+      this->renderFinishedFence = nullptr;
+      return false;
+    }
+  }
+
+  const int deviceIndex = AZ::RHI::MultiDevice::DefaultDeviceIndex;
+  AZ::RHI::Ptr<AZ::RHI::DeviceFence> devFence =
+      this->renderFinishedFence->GetDeviceFence(deviceIndex);
+  AZ::RHI::Device *device =
+      AZ::RHI::RHISystemInterface::Get()->GetDevice(deviceIndex);
+  if (!devFence || !device)
+  {
+    std::fprintf(stderr,
+        "[gz-o3de] interop: no device fence/device for the semaphore\n");
+    return false;
+  }
+  const VkDevice vkDevice = AZ::Vulkan::GetDeviceNativeHandle(*device);
+  const VkSemaphore sem = AZ::Vulkan::GetFenceNativeHandle(*devFence);
+  if (vkDevice == VK_NULL_HANDLE || sem == VK_NULL_HANDLE)
+  {
+    std::fprintf(stderr,
+        "[gz-o3de] interop: null VkDevice/VkSemaphore from fence accessors "
+        "(a timeline-semaphore fence is required)\n");
+    return false;
+  }
+
+  // vkGetSemaphoreFdKHR is a device extension entry point; resolve it through the
+  // already-loaded Vulkan loader (mirrors the vkGetMemoryFdKHR resolution).
+  void *loader = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_NOLOAD);
+  auto getDeviceProcAddr = loader
+      ? reinterpret_cast<PFN_vkGetDeviceProcAddr>(
+            dlsym(loader, "vkGetDeviceProcAddr"))
+      : nullptr;
+  auto getSemaphoreFd = getDeviceProcAddr
+      ? reinterpret_cast<PFN_vkGetSemaphoreFdKHR>(
+            getDeviceProcAddr(vkDevice, "vkGetSemaphoreFdKHR"))
+      : nullptr;
+  if (!getSemaphoreFd)
+  {
+    std::fprintf(stderr,
+        "[gz-o3de] interop: could not resolve vkGetSemaphoreFdKHR\n");
+    return false;
+  }
+  VkSemaphoreGetFdInfoKHR getFdInfo{};
+  getFdInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR;
+  getFdInfo.semaphore = sem;
+  getFdInfo.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT;
+  int fd = -1;
+  const VkResult res = getSemaphoreFd(vkDevice, &getFdInfo, &fd);
+  if (res != VK_SUCCESS || fd < 0)
+  {
+    std::fprintf(stderr,
+        "[gz-o3de] interop: vkGetSemaphoreFdKHR FAILED (VkResult=%d, fd=%d) -- "
+        "the timeline semaphore is not exportable; check the bus handler\n",
+        static_cast<int>(res), fd);
+    return false;
+  }
+  this->interopSemaphoreFd = fd;
+  std::fprintf(stderr,
+      "[gz-o3de] interop: render-finished timeline semaphore exported "
+      "(VkSemaphore=%p, fd=%d)\n", reinterpret_cast<void *>(sem), fd);
+  return true;
+#endif
+}
+
+//////////////////////////////////////////////////
+bool O3deBackend::Impl::RecreateInteropPipeline(uint32_t _w, uint32_t _h)
+{
+#if !defined(GZ_O3DE_INTEROP_BUILD)
+  (void)_w; (void)_h;
+  return false;
+#else
+  // (Re)create the exportable image (+ its asset) at the requested size; reuses
+  // the existing one when the size is unchanged. Bumps the generation + exports a
+  // fresh FD on a real (re)create, which the consumer notices and re-imports.
+  const bool sameSize =
+      this->interopImage && this->interopImageReady &&
+      this->interopWidth == _w && this->interopHeight == _h;
+  if (!this->EnsureInteropImage(_w, _h) || !this->interopImageAsset.IsReady())
+    return false;
+  if (sameSize && this->pipeline)
+    return true;  // image + pipeline already at this size
+
+  auto *rpiSystem = AZ::RPI::RPISystemInterface::Get();
+
+  // Swap out the previous interop pipeline (the image -- and thus the pipeline
+  // output it was built around -- changed size).
+  if (this->pipeline)
+  {
+    this->scene->RemoveRenderPipeline(this->pipeline->GetId());
+    this->pipeline = nullptr;
+  }
+
+  // MainPipeline as the root template renders the full scene (incl. AuxGeom)
+  // straight into its PipelineOutput slot, which CreateRenderPipelineForImage
+  // binds to our exportable image. MainPipeline is Atom's deferred pipeline: its
+  // G-buffer/lighting shaders REQUIRE multisampled inputs (they Load() the depth/
+  // albedo/normal/specular targets per sample), so the pipeline must run at >1x
+  // MSAA. At 1x those image bindings fail SRG validation, the draws sample unbound
+  // descriptors, and the GPU faults -- losing the *shared physical device* (seen
+  // as a Qt-side "Device loss detected in vkQueueSubmit"). 4x matches the proven
+  // CPU-readback path (MainPipelineRenderToTexture wraps this same MainPipeline):
+  // MainPipeline resolves its multisampled targets down to the single-sample
+  // PipelineOutput, so the single-sample image we bind there is the right resolve
+  // target -- no extra resolve step to manage.
+  AZ::RPI::RenderPipelineDescriptor pipelineDesc;
+  pipelineDesc.m_mainViewTagName = "MainCamera";
+  pipelineDesc.m_name = AZStd::string::format(
+      "GzO3deInteropPipeline_%llu",
+      static_cast<unsigned long long>(this->interopGeneration));
+  pipelineDesc.m_rootPassTemplate = "MainPipeline";
+  pipelineDesc.m_renderSettings.m_multisampleState = AZ::RHI::MultisampleState(
+      /*samples*/ static_cast<uint16_t>(4), /*quality*/ static_cast<uint16_t>(0));
+
+  this->pipeline = AZ::RPI::RenderPipeline::CreateRenderPipelineForImage(
+      pipelineDesc, this->interopImageAsset);
+  if (!this->pipeline)
+  {
+    std::fprintf(stderr,
+        "[gz-o3de] interop: CreateRenderPipelineForImage failed (%ux%u)\n",
+        _w, _h);
+    return false;
+  }
+  this->scene->AddRenderPipeline(this->pipeline);
+  if (this->view)
+    this->pipeline->SetDefaultView(this->view);
+
+  // Select the MSAA shader supervariant and mark the new pipeline's passes for
+  // the multisampled rebuild. Must run after AddRenderPipeline (it walks the
+  // registered scenes' pipelines); the caller's settle ticks flush the rebuild.
+  // Re-applied on every (re)create so a resize-driven pipeline is multisampled
+  // too. Mirrors the CPU-readback SetupScene step.
+  rpiSystem->SetApplicationMultisampleState(
+      this->pipeline->GetRenderSettings().m_multisampleState);
+
+  std::fprintf(stderr,
+      "[gz-o3de] interop: Stage B pipeline rendering into exportable image "
+      "(%ux%u, gen=%llu, 4x MSAA)\n", _w, _h,
+      static_cast<unsigned long long>(this->interopGeneration));
+  return true;
+#endif
+}
+
+//////////////////////////////////////////////////
 void O3deBackend::Impl::ProveFdExportOnce()
 {
   if (this->interopFdProven)
@@ -512,151 +939,38 @@ void O3deBackend::Impl::ProveFdExportOnce()
       "-DGZ_O3DE_INTEROP=ON; FD-export probe skipped\n");
   return;
 #else
-  // A small persistent colour image, created from the system attachment pool.
-  // Persistent (not transient) so its backing VkImage/VkDeviceMemory are stable;
-  // created now -- after GzExternalHandleProvider connected pre-device-creation --
-  // so its VMA allocation carries VkExportMemoryAllocateInfo (OPAQUE_FD).
-  const auto *imageSystem = AZ::RPI::ImageSystemInterface::Get();
-  if (!imageSystem || !imageSystem->GetSystemAttachmentPool())
-  {
-    std::fprintf(stderr,
-        "[gz-o3de] interop: no system attachment pool; cannot probe FD export\n");
-    return;
-  }
+  // Create the initial exportable image at probe size and fill it with a
+  // deterministic gradient (R=x, G=y, B=128). This proves FD export works and
+  // gives the GL/Vulkan self-tests a known pattern to round-trip before any live
+  // frame arrives; the first live frame recreates the image at camera size.
   const uint32_t kW = 256u;
   const uint32_t kH = 256u;
-  // Color (future render-into) + ShaderRead (GL/Atom sampling) + CopyWrite (so we
-  // can upload the verification pattern) + CopyRead.
-  const AZ::RHI::ImageDescriptor desc = AZ::RHI::ImageDescriptor::Create2D(
-      AZ::RHI::ImageBindFlags::Color | AZ::RHI::ImageBindFlags::ShaderRead |
-          AZ::RHI::ImageBindFlags::CopyRead | AZ::RHI::ImageBindFlags::CopyWrite,
-      kW, kH, AZ::RHI::Format::R8G8B8A8_UNORM);
-  this->interopImage = AZ::RPI::AttachmentImage::Create(
-      *imageSystem->GetSystemAttachmentPool(), desc,
-      AZ::Name("GzInteropProbeImage"), nullptr, nullptr);
-  if (!this->interopImage || !this->interopImage->GetRHIImage())
+  if (!this->EnsureInteropImage(kW, kH))
   {
-    std::fprintf(stderr,
-        "[gz-o3de] interop: AttachmentImage::Create failed; cannot probe\n");
+    std::fprintf(stderr, "[gz-o3de] interop: probe image creation failed\n");
     return;
   }
-
-  // Upload a deterministic gradient (R=x, G=y, B=128) so a GL importer can verify
-  // a correct memory/layout round-trip. Atom stages + copies this on a later tick.
+  std::vector<uint8_t> pattern(static_cast<size_t>(kW) * kH * 4u);
+  for (uint32_t y = 0u; y < kH; ++y)
   {
-    std::vector<uint8_t> pattern(static_cast<size_t>(kW) * kH * 4u);
-    for (uint32_t y = 0u; y < kH; ++y)
+    for (uint32_t x = 0u; x < kW; ++x)
     {
-      for (uint32_t x = 0u; x < kW; ++x)
-      {
-        uint8_t *px = &pattern[(static_cast<size_t>(y) * kW + x) * 4u];
-        px[0] = static_cast<uint8_t>(x);
-        px[1] = static_cast<uint8_t>(y);
-        px[2] = 128u;
-        px[3] = 255u;
-      }
-    }
-    AZ::RHI::Image *uploadImage = this->interopImage->GetRHIImage();
-    AZ::RHI::DeviceImageSubresourceLayout devLayout =
-        AZ::RHI::GetImageSubresourceLayout(AZ::RHI::Size(kW, kH, 1u),
-            AZ::RHI::Format::R8G8B8A8_UNORM);
-    AZ::RHI::ImageSubresourceLayout srcLayout;
-    srcLayout.Init(uploadImage->GetDeviceMask(), devLayout);
-    AZ::RHI::ImageUpdateRequest update;
-    update.m_image = uploadImage;
-    update.m_sourceData = pattern.data();
-    update.m_sourceSubresourceLayout = srcLayout;
-    const AZ::RHI::ResultCode rc =
-        this->interopImage->UpdateImageContents(update);
-    std::fprintf(stderr,
-        "[gz-o3de] interop: gradient upload result=%d (%ux%u)\n",
-        static_cast<int>(rc), kW, kH);
-    // Tick so the async upload copy runs before the FD is handed to a GL thread.
-    for (int i = 0; i < 5; ++i)
-    {
-      this->app->PumpSystemEventLoopUntilEmpty();
-      this->app->TickSystem();
-      this->app->Tick();
+      uint8_t *px = &pattern[(static_cast<size_t>(y) * kW + x) * 4u];
+      px[0] = static_cast<uint8_t>(x);
+      px[1] = static_cast<uint8_t>(y);
+      px[2] = 128u;
+      px[3] = 255u;
     }
   }
-
-  // Atom RHI handles -> per-device objects -> native Vulkan handles (via the
-  // patched, now-exported gem accessors).
-  const int deviceIndex = AZ::RHI::MultiDevice::DefaultDeviceIndex;
-  AZ::RHI::Image *rhiImage = this->interopImage->GetRHIImage();
-  AZ::RHI::Ptr<AZ::RHI::DeviceImage> deviceImage =
-      rhiImage->GetDeviceImage(deviceIndex);
-  AZ::RHI::Device *device =
-      AZ::RHI::RHISystemInterface::Get()->GetDevice(deviceIndex);
-  if (!deviceImage || !device)
+  this->UploadToInteropImage(pattern.data(), kW, kH);
+  std::fprintf(stderr,
+      "[gz-o3de] interop: probe gradient upload requested (%ux%u)\n", kW, kH);
+  // Tick so the async upload copy runs before the FD is handed to a consumer.
+  for (int i = 0; i < 5; ++i)
   {
-    std::fprintf(stderr,
-        "[gz-o3de] interop: no device image/device at index %d\n", deviceIndex);
-    return;
-  }
-
-  const VkDevice vkDevice = AZ::Vulkan::GetDeviceNativeHandle(*device);
-  const VkDeviceMemory vkMemory = AZ::Vulkan::GetImageMemory(*deviceImage);
-  const VkImage vkImage = AZ::Vulkan::GetNativeImage(*deviceImage);
-  const size_t allocSize = AZ::Vulkan::GetImageAllocationSize(*deviceImage);
-  const size_t allocOffset = AZ::Vulkan::GetImageAllocationOffset(*deviceImage);
-  if (vkDevice == VK_NULL_HANDLE || vkMemory == VK_NULL_HANDLE)
-  {
-    std::fprintf(stderr,
-        "[gz-o3de] interop: null VkDevice/VkDeviceMemory from gem accessors\n");
-    return;
-  }
-
-  // vkGetMemoryFdKHR is a device extension entry point. O3DE already dlopen'd the
-  // Vulkan loader (via glad), so resolve it through the loaded loader's
-  // vkGetDeviceProcAddr rather than linking libvulkan into the plugin.
-  void *loader = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_NOLOAD);
-  auto getDeviceProcAddr = loader
-      ? reinterpret_cast<PFN_vkGetDeviceProcAddr>(
-            dlsym(loader, "vkGetDeviceProcAddr"))
-      : nullptr;
-  auto getMemoryFd = getDeviceProcAddr
-      ? reinterpret_cast<PFN_vkGetMemoryFdKHR>(
-            getDeviceProcAddr(vkDevice, "vkGetMemoryFdKHR"))
-      : nullptr;
-  if (!getMemoryFd)
-  {
-    std::fprintf(stderr,
-        "[gz-o3de] interop: could not resolve vkGetMemoryFdKHR (loader=%p)\n",
-        loader);
-    return;
-  }
-
-  VkMemoryGetFdInfoKHR getFdInfo{};
-  getFdInfo.sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR;
-  getFdInfo.memory = vkMemory;
-  getFdInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT_KHR;
-  int fd = -1;
-  const VkResult res = getMemoryFd(vkDevice, &getFdInfo, &fd);
-
-  if (res == VK_SUCCESS && fd >= 0)
-  {
-    std::fprintf(stderr,
-        "[gz-o3de] interop: PROVED FD export -- vkGetMemoryFdKHR returned fd=%d "
-        "for the %ux%u image (VkImage=%p, VkDeviceMemory=%p, alloc size=%zu "
-        "offset=%zu). The exportable-image foundation works.\n",
-        fd, kW, kH, reinterpret_cast<void *>(vkImage),
-        reinterpret_cast<void *>(vkMemory), allocSize, allocOffset);
-    // Keep this FD open as the canonical export; GetInteropImport() hands callers
-    // their own dup. Record the geometry a GL importer needs.
-    this->interopFd = fd;
-    this->interopWidth = kW;
-    this->interopHeight = kH;
-    this->interopAllocSize = static_cast<uint64_t>(allocSize);
-    this->interopAllocOffset = static_cast<uint64_t>(allocOffset);
-    this->interopImageReady = true;
-  }
-  else
-  {
-    std::fprintf(stderr,
-        "[gz-o3de] interop: vkGetMemoryFdKHR FAILED (VkResult=%d, fd=%d) -- the "
-        "image memory is not exportable; check the bus handler / device ext\n",
-        static_cast<int>(res), fd);
+    this->app->PumpSystemEventLoopUntilEmpty();
+    this->app->TickSystem();
+    this->app->Tick();
   }
 #endif  // GZ_O3DE_INTEROP_BUILD
 }
@@ -805,6 +1119,17 @@ bool O3deBackend::GetInteropImport(O3deInteropImport &_out)
   _out.height = d.interopHeight;
   _out.allocationSize = d.interopAllocSize;
   _out.allocationOffset = d.interopAllocOffset;
+  _out.generation = d.interopGeneration;
+  _out.live = d.interopLive;
+
+  // Stage B render-finished sync: hand the caller a dup of the exported timeline
+  // semaphore FD (it owns and closes it) plus the value the GPU will signal for
+  // the latest frame. The consumer imports the FD once (the handle is stable) and
+  // waits on the per-frame value before sampling. -1 when no semaphore (e.g. the
+  // static probe path) -> the consumer falls back to no cross-device wait.
+  _out.semaphoreFd = (d.interopSemaphoreFd >= 0) ? ::dup(d.interopSemaphoreFd)
+                                                 : -1;
+  _out.semaphoreWaitValue = d.interopSemaphoreValue;
   return true;
 }
 
@@ -934,13 +1259,21 @@ void O3deBackend::Impl::RenderThreadMain()
     {
       this->RenderOneFrame();
     }
-    else
+    else if (!(this->interopLive && std::getenv("GZ_O3DE_NO_IDLE_TICK")))
     {
       // Idle: keep the engine ticking so async loads/streaming progress.
       this->app->PumpSystemEventLoopUntilEmpty();
       this->app->TickSystem();
       this->app->Tick();
     }
+    // DIAGNOSTIC (interop bring-up): with GZ_O3DE_NO_IDLE_TICK set on the live
+    // path we do NOT tick the app while idle. app->Tick() runs Atom's RHI frame
+    // scheduler, which submits GPU work on Atom's device every ~16ms -- including
+    // touching the live pipeline's imported output attachment -- while the
+    // consumer (Qt, a separate VkDevice) is concurrently sampling that same shared
+    // image. This A/B-tests whether that unsynchronized concurrent cross-device
+    // access is what hangs the GPU (~5s TDR) rather than a missing consumer-side
+    // semaphore. The 16ms inputCv wait above still throttles the loop.
   }
 
   // Stop was signalled (process exit). Tear the runtime down here, on the
@@ -985,6 +1318,21 @@ bool O3deBackend::Impl::BootstrapOnThread()
 
   // M4 interop: opt-in request that Atom create exportable images + semaphores.
   this->interop = (std::getenv("GZ_O3DE_INTEROP") != nullptr);
+  // Phase 2a live-scene-into-shared-image path (needs #26 sync; see member doc).
+  this->interopLive =
+      this->interop && (std::getenv("GZ_O3DE_INTEROP_LIVE") != nullptr);
+  // Stage B copies the resolved single-sample "Output" attachment straight into
+  // the exportable image with a plain (non-scaling) Vulkan copy, so the source
+  // and destination must be the same size. SSAA renders "Output" at scale x the
+  // logical size; force 1x on the live path so the copy stays 1:1 (4x MSAA still
+  // applies inside the pipeline, so anti-aliasing is preserved).
+  if (this->interopLive && this->ssaaScale != 1u)
+  {
+    std::fprintf(stderr,
+        "[gz-o3de] interop: forcing SSAA 1x for the live render-into-image path "
+        "(was %u)\n", this->ssaaScale);
+    this->ssaaScale = 1u;
+  }
 
   const char *enginePath = EnvOr("GZ_O3DE_ENGINE_PATH",
       "/home/jrivero/code/gz/gz-rendering/vendor/o3de");
@@ -1088,6 +1436,36 @@ bool O3deBackend::Impl::BootstrapOnThread()
 }
 
 //////////////////////////////////////////////////
+// Demo aid: gz-gui's MinimalScene starts with an empty scene (primitives
+// normally come from gz-sim); when GZ_O3DE_DEMO_SHAPES is set and there are no
+// primitives, inject a box/sphere/cylinder trio so the live viewer has
+// something to show. Shared by the readback (RenderFrame) and native-interop
+// (RenderFrameForInterop) paths.
+static void MaybeInjectDemoShapes(std::vector<O3deShapeData> &_shapes)
+{
+  if (!_shapes.empty() || !std::getenv("GZ_O3DE_DEMO_SHAPES"))
+    return;
+  O3deShapeData box;
+  box.type = O3deShapeData::Type::BOX;
+  box.pos[0] = 0.0; box.pos[1] = 1.5; box.pos[2] = 0.5;
+  box.color[0] = 1.0f; box.color[1] = 0.0f; box.color[2] = 0.0f;
+  _shapes.push_back(box);
+
+  O3deShapeData sphere;
+  sphere.type = O3deShapeData::Type::SPHERE;
+  sphere.pos[0] = 0.0; sphere.pos[1] = 0.0; sphere.pos[2] = 0.5;
+  sphere.color[0] = 0.0f; sphere.color[1] = 1.0f; sphere.color[2] = 0.0f;
+  _shapes.push_back(sphere);
+
+  O3deShapeData cylinder;
+  cylinder.type = O3deShapeData::Type::CYLINDER;
+  cylinder.pos[0] = 0.0; cylinder.pos[1] = -1.5; cylinder.pos[2] = 0.5;
+  cylinder.scale[2] = 1.5;
+  cylinder.color[0] = 0.0f; cylinder.color[1] = 0.0f; cylinder.color[2] = 1.0f;
+  _shapes.push_back(cylinder);
+}
+
+//////////////////////////////////////////////////
 bool O3deBackend::RenderFrame(const O3deCameraData &_camera,
     const std::vector<O3deShapeData> &_shapes,
     uint32_t _width, uint32_t _height, uint8_t *_outRgba)
@@ -1097,32 +1475,9 @@ bool O3deBackend::RenderFrame(const O3deCameraData &_camera,
     return false;
 
   // Assemble the shape list on the caller's thread (only plain data crosses to
-  // the render thread). Demo aid: gz-gui's MinimalScene starts with an empty
-  // scene (primitives normally come from gz-sim); when GZ_O3DE_DEMO_SHAPES is
-  // set and there are no primitives, inject a box/sphere/cylinder trio so the
-  // live viewer has something to show.
+  // the render thread).
   std::vector<O3deShapeData> shapes = _shapes;
-  if (shapes.empty() && std::getenv("GZ_O3DE_DEMO_SHAPES"))
-  {
-    O3deShapeData box;
-    box.type = O3deShapeData::Type::BOX;
-    box.pos[0] = 0.0; box.pos[1] = 1.5; box.pos[2] = 0.5;
-    box.color[0] = 1.0f; box.color[1] = 0.0f; box.color[2] = 0.0f;
-    shapes.push_back(box);
-
-    O3deShapeData sphere;
-    sphere.type = O3deShapeData::Type::SPHERE;
-    sphere.pos[0] = 0.0; sphere.pos[1] = 0.0; sphere.pos[2] = 0.5;
-    sphere.color[0] = 0.0f; sphere.color[1] = 1.0f; sphere.color[2] = 0.0f;
-    shapes.push_back(sphere);
-
-    O3deShapeData cylinder;
-    cylinder.type = O3deShapeData::Type::CYLINDER;
-    cylinder.pos[0] = 0.0; cylinder.pos[1] = -1.5; cylinder.pos[2] = 0.5;
-    cylinder.scale[2] = 1.5;
-    cylinder.color[0] = 0.0f; cylinder.color[1] = 0.0f; cylinder.color[2] = 1.0f;
-    shapes.push_back(cylinder);
-  }
+  MaybeInjectDemoShapes(shapes);
 
   // Post the input to the render thread and wait for a frame rendered after it.
   uint64_t startSeq = 0u;
@@ -1163,6 +1518,49 @@ bool O3deBackend::RenderFrame(const O3deCameraData &_camera,
 }
 
 //////////////////////////////////////////////////
+bool O3deBackend::RenderFrameForInterop(const O3deCameraData &_camera,
+    const std::vector<O3deShapeData> &_shapes,
+    uint32_t _width, uint32_t _height)
+{
+  Impl &d = *this->dataPtr;
+  // Only meaningful when the live path is enabled; the render thread then
+  // publishes each frame into the exportable image (see RenderOneFrame). No CPU
+  // readout. With only GZ_O3DE_INTEROP (no _LIVE) the consumer samples the
+  // stable static probe and this is a no-op (avoids the #26 device-loss race).
+  if (!d.ready || !d.interopLive || _width == 0u || _height == 0u)
+    return false;
+
+  std::vector<O3deShapeData> shapes = _shapes;
+  MaybeInjectDemoShapes(shapes);
+
+  // Post the input to the render thread and wait for a frame rendered after it
+  // (the frame is published into the shared image by RenderOneFrame()).
+  uint64_t startSeq = 0u;
+  {
+    std::lock_guard<std::mutex> lock(d.mutex);
+    d.pendingCamera = _camera;
+    d.pendingShapes = std::move(shapes);
+    d.pendingWidth = _width;
+    d.pendingHeight = _height;
+    d.haveInput = true;
+    startSeq = d.frameSeq;
+  }
+  d.inputCv.notify_all();
+
+  std::unique_lock<std::mutex> lock(d.mutex);
+  // Bounded wait so we never hang gz-gui's render thread if a frame stalls.
+  const bool got = d.outputCv.wait_for(lock, std::chrono::seconds(5),
+      [&d, startSeq]() { return d.frameSeq > startSeq; });
+  if (!got)
+    std::fprintf(stderr,
+        "[gz-o3de] interop: RenderFrameForInterop TIMED OUT after 5s waiting "
+        "for frame > %llu (frameSeq=%llu)\n",
+        static_cast<unsigned long long>(startSeq),
+        static_cast<unsigned long long>(d.frameSeq));
+  return got;
+}
+
+//////////////////////////////////////////////////
 bool O3deBackend::Impl::RenderOneFrame()
 {
   static int frameNum = 0;
@@ -1171,6 +1569,81 @@ bool O3deBackend::Impl::RenderOneFrame()
   // live frame rate without spamming.
   const bool logThis = (frameNum <= 3) || (frameNum % 20 == 0);
   const auto frameStart = std::chrono::steady_clock::now();
+
+#if defined(GZ_O3DE_INTEROP_BUILD)
+  if (this->interopLive)
+  {
+    std::fprintf(stderr, "[gz-o3de] interop live frame %d: START\n", frameNum);
+    // Stage B live render: (re)size the exportable image + its pipeline to the
+    // requested logical resolution (SSAA is forced 1x on this path), render the
+    // scene straight into the image, then host-sync so the consumer samples a
+    // complete frame. No SSAA downsample, no CPU readback.
+    const uint32_t lw =
+        (this->reqWidth > 0u) ? this->reqWidth : this->interopWidth;
+    const uint32_t lh =
+        (this->reqHeight > 0u) ? this->reqHeight : this->interopHeight;
+    if (lw == 0u || lh == 0u)
+      return false;
+    if (lw != this->interopWidth || lh != this->interopHeight || !this->pipeline)
+    {
+      if (!this->RecreateInteropPipeline(lw, lh))
+        return false;
+      this->outputWidth = lw;
+      this->outputHeight = lh;
+    }
+    this->ApplyCamera(lw, lh);
+
+    // Render the scene into the exportable image. AuxGeom is re-submitted each
+    // tick (the draw queue is consumed per rendered frame).
+    this->pipeline->AddToRenderTick();
+    for (int k = 0; k < 3; ++k)
+    {
+      this->SubmitPrimitives();
+      this->app->PumpSystemEventLoopUntilEmpty();
+      this->app->TickSystem();
+      this->app->Tick();
+    }
+    this->pipeline->RemoveFromRenderTick();
+
+    // Host-sync (interim, until the render-finished semaphore #26 is wired via a
+    // custom RPI::Pass): block until the GPU has finished rendering into the
+    // exportable image before the consumer -- which unblocks when frameSeq bumps
+    // -- samples it. Removes the cross-device write/read race that lost the
+    // device; the consumer's EXTERNAL ownership acquire then settles the layout.
+    VkResult waitResult = VK_SUCCESS;
+    if (AZ::RHI::Device *device = AZ::RHI::RHISystemInterface::Get()->GetDevice(
+            AZ::RHI::MultiDevice::DefaultDeviceIndex))
+    {
+      const VkDevice vkDevice = AZ::Vulkan::GetDeviceNativeHandle(*device);
+      if (vkDevice != VK_NULL_HANDLE)
+        waitResult = vkDeviceWaitIdle(vkDevice);
+    }
+
+    {
+      // DEBUG (interop bring-up): log EVERY live frame + the host-sync result so
+      // we can see whether the producer keeps rendering past frame 3 and whether
+      // vkDeviceWaitIdle ever returns VK_ERROR_DEVICE_LOST (-4) -- the smoking gun
+      // for a GPU TDR vs. a consumer-side timeout. Trim back to logThis later.
+      const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - frameStart).count();
+      std::fprintf(stderr,
+          "[gz-o3de] interop live frame %d: %ux%u gen=%llu %lld ms waitIdle=%d\n",
+          frameNum, lw, lh,
+          static_cast<unsigned long long>(this->interopGeneration),
+          static_cast<long long>(ms), static_cast<int>(waitResult));
+    }
+    (void)logThis;
+
+    {
+      std::lock_guard<std::mutex> lock(this->mutex);
+      this->latestWidth = lw;
+      this->latestHeight = lh;
+      ++this->frameSeq;
+    }
+    this->outputCv.notify_all();
+    return true;
+  }
+#endif
 
   // Size the offscreen target to the requested resolution whenever it changes
   // (e.g. gz-gui's window is resized). A resize recreates the pass attachments,
@@ -1329,6 +1802,10 @@ bool O3deBackend::Impl::RenderOneFrame()
       dst[3] = static_cast<uint8_t>(acc[3] / block);
     }
   }
+
+  // Note: the GZ_O3DE_INTEROP_LIVE path returns earlier (Stage B renders the
+  // scene directly into the exportable image, zero-copy); this tail is the
+  // CPU-readback path for RenderFrame()/the static probe only.
 
   // Publish the completed frame for RenderFrame() to pick up.
   {
