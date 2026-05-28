@@ -27,13 +27,14 @@ fine-grained breakdown of **M4's** native-Vulkan display path.
 | 22 | gz-rendering: O3deRenderEngine reads injected Qt Vulkan device | ✅ done | The engine picks up Qt's injected `VkInstance`/`VkPhysicalDevice`/`VkDevice`/queue so the consumer-side import targets Qt's device. |
 | 23 | gz-rendering: O3deCamera RenderTextureMetalId + PrepareForExternalSampling | ✅ done | Consumer hooks: hand the imported `VkImage` to gz-gui (`RenderTextureMetalId`) and transition it for sampling each frame (`PrepareForExternalSampling`). |
 | 24 | Verify static probe image displays in gz-gui via native V→V (Phase 1) | ✅ done | Atom uploads a gradient into the export image once; Qt imports + samples it. Verified displaying via native Vulkan→Vulkan. |
-| 25 | Stage B: render live scene directly into the exportable image (Phase 2) | 🔶 in progress, **blocked by #26** | Atom renders the scene into the export image every frame via `CreateRenderPipelineForImage`. The render-into works (fixed the single-sample `MainPipeline` MSAA crash → 4× MSAA); blocked on #26 for cross-device stability. |
-| 26 | Export render-finished timeline semaphore (RHI::Fence) + consumer wait | ⏳ pending (next) | The producer→consumer GPU semaphore needed so Qt safely samples the live shared image. Confirmed **required** (host-sync is spec-insufficient → GPU TDR) and confirmed **feasible** via public RHI API. See the findings doc. |
+| 25 | Stage B: render live scene directly into the exportable image (Phase 2) | 🔶 in progress, **blocked** (not by #26) | Atom renders the scene into the export image every frame via `CreateRenderPipelineForImage`. The render-into works (fixed the single-sample `MainPipeline` MSAA crash → 4× MSAA). Now blocked on a **cross-device render-target/compression handoff**: Qt's separate `VkDevice` faults the first time it samples the producer's compressed colour-attachment image (the plain static-probe write samples fine). See the findings doc, hypothesis 12. |
+| 26 | Export render-finished timeline semaphore (RHI::Fence) + consumer wait | ✅ **done — implemented & proven**, but NOT the live-path fix | Producer signals a timeline `RHI::Fence` each frame (`RHISystemNotificationBus::OnFramePrepare` + `ImportScopeProducer` + `FrameGraphInterface::SignalFence`; `usedForWaitingOnDevice=true` makes it a `TimelineSemaphoreFence`); consumer imports it as a timeline semaphore and waits on the per-frame value. Verified: the shared timeline counter advances across both `VkDevice`s and waits are satisfiable. The earlier belief that this missing semaphore *was* the device-loss cause is **disproven** — the loss persists with #26 working (see hypothesis 8). Gated by `GZ_O3DE_INTEROP_SEM`. |
 
-**Dependency direction:** #25 depends on #26 (the live path needs the semaphore to be
-stable). The tracker may also show a stale reverse link (#26 blocked-by #25) left over
-from the original "render-into first, then add sync" framing — ignore it; #26 is the
-next actionable task.
+**Dependency direction (corrected):** #26 (sync) is done and proven, but it did **not**
+unblock #25. The earlier "host-sync is spec-insufficient → #25 needs #26" framing was
+wrong: the live device loss is a render-target/compression handoff problem, orthogonal
+to synchronization. #25 now depends on a producer-side decompress / plain GPU-copy
+handoff, not on the semaphore. See the findings doc's "Candidate fixes" section.
 
 ## See also
 

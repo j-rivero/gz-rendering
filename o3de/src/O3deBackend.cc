@@ -72,6 +72,11 @@
 #include <Atom/RHI/DeviceImage.h>
 #include <Atom/RHI/Fence.h>
 #include <Atom/RHI/DeviceFence.h>
+#include <Atom/RHI/ScopeProducerFunction.h>
+#include <Atom/RHI/FrameGraphInterface.h>
+#include <Atom/RHI/FrameGraphBuilder.h>
+#include <Atom/RHI/FrameGraphCompileContext.h>
+#include <Atom/RHI/FrameGraphExecuteContext.h>
 #include <Atom/RHI.Reflect/ImageSubresource.h>
 #include <Atom/RHI.Reflect/MultisampleState.h>
 #include <Atom/Feature/Utils/FrameCaptureBus.h>
@@ -210,7 +215,14 @@ namespace
 /// shader load during a pass-tree rebuild. RenderFrame() (called on gz-gui's
 /// thread) just hands the camera + shapes across a mutex and waits for the
 /// latest readback.
+///
+/// Inherits RHISystemNotificationBus::Handler for the #26 producer-side render-
+/// finished signal: OnFramePrepare() fires every RHI frame (after RPI pass
+/// registration) and imports a fence-signal scope on the flagged render tick.
+/// The handler is connected only on the interop-live path; off it, the bus is
+/// never connected, so the base class is inert.
 class O3deBackend::Impl
+    : public AZ::RHI::RHISystemNotificationBus::Handler
 {
   public: AzGameFramework::GameApplication *app = nullptr;
   public: AZ::RPI::ScenePtr scene;
@@ -256,14 +268,30 @@ class O3deBackend::Impl
       retiredInteropImages;
 
   // M4 interop, Stage B (#26): render-finished synchronisation. interopSemaphoreFd
-  // is the exported OPAQUE_FD of a render-finished timeline semaphore (-1 until a
-  // signal path exists); interopSemaphoreValue is the per-frame value the consumer
-  // waits on. Plumbed through GetInteropImport(); the producer-side signal
-  // injection is pending a custom RPI::Pass (Atom marks the natural scope hooks
-  // final/friend-only). -1 -> consumer falls back to no cross-device wait.
+  // is the exported OPAQUE_FD of a render-finished TIMELINE semaphore (Atom's
+  // TimelineSemaphoreFence); interopSemaphoreValue is the per-frame value the
+  // consumer waits on. The producer signals it each frame via the fence-signal
+  // scope below (no custom RPI::Pass needed -- RHISystemNotificationBus +
+  // ImportScopeProducer + FrameGraphInterface::SignalFence). Plumbed through
+  // GetInteropImport(), gated by interopSemaphoreReady (GZ_O3DE_INTEROP_SEM).
+  // VERIFIED working (monotonic shared counter), but it does NOT fix the live
+  // device loss: that is a separate cross-device render-target/compression handoff
+  // problem (see o3de/docs/zero-copy-interop-findings.md).
   public: AZ::RHI::Ptr<AZ::RHI::Fence> renderFinishedFence;
   public: int interopSemaphoreFd = -1;
   public: uint64_t interopSemaphoreValue = 0u;
+  // #26 producer signal path. fenceSignalScope is a standalone scope, imported
+  // via OnFramePrepare() on the one render tick per frame flagged by
+  // signalFenceThisTick, that copy-reads the interop image (read-after-write, so
+  // the scheduler orders it after the pipeline's write) and signals
+  // renderFinishedFence -- the fence therefore signals only once the frame's
+  // render into the shared image is GPU-complete. interopSemaphoreReady gates
+  // advertising the exported FD to the consumer (env GZ_O3DE_INTEROP_SEM): off ->
+  // the producer signals + the per-frame value is logged but the consumer does
+  // not yet wait on it (Step A bring-up); on -> the consumer waits (Step B).
+  public: AZStd::shared_ptr<AZ::RHI::ScopeProducer> fenceSignalScope;
+  public: bool signalFenceThisTick = false;
+  public: bool interopSemaphoreReady = false;
 
   // M4 interop (experimental, GZ_O3DE_INTEROP): when set, this handler is
   // connected before the RHI device is created so Atom makes images + semaphores
@@ -346,13 +374,26 @@ class O3deBackend::Impl
   /// image (caller must EnsureInteropImage() first). Render thread only.
   public: void UploadToInteropImage(const uint8_t *_rgba, uint32_t _w,
               uint32_t _h);
-  /// \brief Stage B (#26) groundwork: create the render-finished timeline fence
-  /// once and export its native VkSemaphore as an OPAQUE_FD. Idempotent. Render
-  /// thread only. \return True once the fence + exported semaphore FD are ready.
-  /// NOTE: not yet wired to a per-frame GPU signal (pending a custom RPI::Pass);
-  /// do not advertise the semaphore until a signal path exists, or a consumer
-  /// waiting on it will hang.
+  /// \brief Stage B (#26): create the render-finished TIMELINE fence once
+  /// (usedForWaitingOnDevice=true selects TimelineSemaphoreFence) and export its
+  /// native VkSemaphore as an OPAQUE_FD. Idempotent. Render thread only. \return
+  /// True once the fence + exported semaphore FD are ready. The per-frame GPU
+  /// signal is wired via EnsureFenceSignalScope() + the RHISystemNotificationBus
+  /// handler; the FD is advertised to the consumer only when interopSemaphoreReady
+  /// (GZ_O3DE_INTEROP_SEM) is set.
   public: bool EnsureInteropSemaphore();
+  /// \brief #26 producer signal: build the fence-signal scope once (idempotent).
+  /// Needs renderFinishedFence + the interop image to exist. Render thread only.
+  /// \return True once fenceSignalScope is ready.
+  public: bool EnsureFenceSignalScope();
+  /// \brief #26 scope Prepare callback: copy-read the interop image (so the
+  /// scheduler orders this scope read-after-write of the pipeline's render) and
+  /// signal renderFinishedFence. Bound into the ScopeProducerFunctionNoData.
+  public: void FenceSignalPrepare(AZ::RHI::FrameGraphInterface _frameGraph);
+  /// \brief RHISystemNotificationBus: import the fence-signal scope on the render
+  /// tick flagged by signalFenceThisTick. Fires every app Tick (after RPI passes
+  /// register), so the flag keeps the import to exactly one tick per frame.
+  public: void OnFramePrepare(AZ::RHI::FrameGraphBuilder &_builder) override;
   /// \brief Stage B live path: (re)create the exportable image at \p _w x \p _h
   /// and a render pipeline (CreateRenderPipelineForImage) that renders the scene
   /// directly into it -- zero-copy, no CPU readback. Swaps out the previous
@@ -477,6 +518,28 @@ bool O3deBackend::Impl::SetupScene(uint32_t _width, uint32_t _height)
     AZ::RPI::RPISystemInterface::Get()->RegisterScene(this->scene);
     if (!this->RecreateInteropPipeline(_width, _height))
       return false;
+    // #26: create the render-finished fence + the scope that signals it after the
+    // per-frame render-into, then connect the RHISystem bus so the scope is
+    // imported each rendered frame (OnFramePrepare). interopSemaphoreReady --
+    // env-gated by GZ_O3DE_INTEROP_SEM -- decides whether the exported semaphore
+    // FD is advertised to the consumer yet (Step B) or only signalled+logged
+    // (Step A bring-up). Failure here is non-fatal: the live path still renders
+    // (host-sync), just without the cross-device fence.
+    if (this->EnsureInteropSemaphore() && this->EnsureFenceSignalScope())
+    {
+      this->interopSemaphoreReady =
+          (std::getenv("GZ_O3DE_INTEROP_SEM") != nullptr);
+      AZ::RHI::RHISystemNotificationBus::Handler::BusConnect();
+      std::fprintf(stderr,
+          "[gz-o3de] interop #26: fence-signal scope wired (consumer wait %s)\n",
+          this->interopSemaphoreReady ? "ON" : "OFF (set GZ_O3DE_INTEROP_SEM)");
+    }
+    else
+    {
+      std::fprintf(stderr,
+          "[gz-o3de] interop #26: fence-signal scope NOT wired (fence/scope "
+          "setup failed); live path runs without cross-device sync\n");
+    }
     this->ApplyCamera(_width, _height);
     // Settle the pipeline's pass + shader-variant builds (they self-pump on this
     // thread). AuxGeom is submitted so the forward pass has something to draw.
@@ -770,10 +833,15 @@ bool O3deBackend::Impl::EnsureInteropSemaphore()
   {
     // A timeline-semaphore fence. The external-handle bus (connected pre-device-
     // creation) made Atom's timeline semaphores exportable, so its native
-    // VkSemaphore can be exported as an OPAQUE_FD below.
+    // VkSemaphore can be exported as an OPAQUE_FD below. usedForWaitingOnDevice
+    // = true is REQUIRED: it selects Atom's TimelineSemaphoreFence impl (the
+    // default false gives a BinaryFence, whose native handle is a VkFence, not a
+    // VkSemaphore -- GetFenceNativeHandle asserts on it). The consumer (Qt's GPU)
+    // waits on the exported timeline semaphore, so "waited for on the device" fits.
     this->renderFinishedFence = aznew AZ::RHI::Fence;
     const AZ::RHI::ResultCode rc = this->renderFinishedFence->Init(
-        AZ::RHI::MultiDevice::AllDevices, AZ::RHI::FenceState::Reset);
+        AZ::RHI::MultiDevice::AllDevices, AZ::RHI::FenceState::Reset,
+        /*usedForWaitingOnDevice*/ true);
     if (rc != AZ::RHI::ResultCode::Success)
     {
       std::fprintf(stderr,
@@ -841,6 +909,66 @@ bool O3deBackend::Impl::EnsureInteropSemaphore()
       "[gz-o3de] interop: render-finished timeline semaphore exported "
       "(VkSemaphore=%p, fd=%d)\n", reinterpret_cast<void *>(sem), fd);
   return true;
+#endif
+}
+
+//////////////////////////////////////////////////
+bool O3deBackend::Impl::EnsureFenceSignalScope()
+{
+#if !defined(GZ_O3DE_INTEROP_BUILD)
+  return false;
+#else
+  if (this->fenceSignalScope)
+    return true;
+  if (!this->renderFinishedFence)
+    return false;
+  // A no-data scope: its only work is to copy-read the interop image and signal
+  // the fence (see FenceSignalPrepare). Compile/Execute are empty -- we record no
+  // GPU commands; the copy-read attachment exists purely to anchor the scope in
+  // the frame graph (so it is scheduled + submitted, not culled) and to force the
+  // read-after-write ordering against the pipeline's render into the same image.
+  this->fenceSignalScope =
+      AZStd::make_shared<AZ::RHI::ScopeProducerFunctionNoData>(
+          AZ::RHI::ScopeId("GzO3deFenceSignal"),
+          AZStd::bind(&O3deBackend::Impl::FenceSignalPrepare, this,
+              AZStd::placeholders::_1),
+          [](const AZ::RHI::FrameGraphCompileContext &) {},
+          [](const AZ::RHI::FrameGraphExecuteContext &) {});
+  return this->fenceSignalScope != nullptr;
+#endif
+}
+
+//////////////////////////////////////////////////
+void O3deBackend::Impl::FenceSignalPrepare(
+    [[maybe_unused]] AZ::RHI::FrameGraphInterface _frameGraph)
+{
+#if defined(GZ_O3DE_INTEROP_BUILD)
+  if (!this->interopImage || !this->renderFinishedFence)
+    return;
+  // Copy-read the interop image: a read of the attachment the pipeline writes
+  // this frame, so the scheduler places this scope after the render (RAW), and
+  // the fence -- signalled at the end of this scope -- is therefore signalled
+  // only once the scene has been rendered into the shared image.
+  AZ::RHI::ImageScopeAttachmentDescriptor desc{
+      this->interopImage->GetAttachmentId() };
+  _frameGraph.UseCopyAttachment(desc, AZ::RHI::ScopeAttachmentAccess::Read);
+  _frameGraph.SignalFence(*this->renderFinishedFence);
+#endif
+}
+
+//////////////////////////////////////////////////
+void O3deBackend::Impl::OnFramePrepare(
+    [[maybe_unused]] AZ::RHI::FrameGraphBuilder &_builder)
+{
+#if defined(GZ_O3DE_INTEROP_BUILD)
+  // Fires every RHI frame after RPI passes register. Import the fence-signal
+  // scope only on the flagged tick (one per rendered frame) so the timeline value
+  // advances exactly once per frame; the interop image must already exist.
+  if (this->signalFenceThisTick && this->fenceSignalScope &&
+      this->interopImageReady)
+  {
+    _builder.ImportScopeProducer(*this->fenceSignalScope);
+  }
 #endif
 }
 
@@ -1125,10 +1253,14 @@ bool O3deBackend::GetInteropImport(O3deInteropImport &_out)
   // Stage B render-finished sync: hand the caller a dup of the exported timeline
   // semaphore FD (it owns and closes it) plus the value the GPU will signal for
   // the latest frame. The consumer imports the FD once (the handle is stable) and
-  // waits on the per-frame value before sampling. -1 when no semaphore (e.g. the
-  // static probe path) -> the consumer falls back to no cross-device wait.
-  _out.semaphoreFd = (d.interopSemaphoreFd >= 0) ? ::dup(d.interopSemaphoreFd)
-                                                 : -1;
+  // waits on the per-frame value before sampling. interopSemaphoreReady gates the
+  // advertisement (env GZ_O3DE_INTEROP_SEM): until the producer signal path is
+  // verified (Step A), or on the static-probe path, we advertise -1 so the
+  // consumer falls back to no cross-device wait (cannot hang on the semaphore).
+  _out.semaphoreFd =
+      (d.interopSemaphoreReady && d.interopSemaphoreFd >= 0)
+          ? ::dup(d.interopSemaphoreFd)
+          : -1;
   _out.semaphoreWaitValue = d.interopSemaphoreValue;
   return true;
 }
@@ -1599,10 +1731,16 @@ bool O3deBackend::Impl::RenderOneFrame()
     for (int k = 0; k < 3; ++k)
     {
       this->SubmitPrimitives();
+      // #26: import the fence-signal scope on exactly the last render tick, so
+      // its SignalFence runs once per frame after the scene is drawn into the
+      // shared image. OnFramePrepare (fired during app->Tick) checks this flag.
+      this->signalFenceThisTick =
+          (k == 2) && this->fenceSignalScope && this->renderFinishedFence;
       this->app->PumpSystemEventLoopUntilEmpty();
       this->app->TickSystem();
       this->app->Tick();
     }
+    this->signalFenceThisTick = false;
     this->pipeline->RemoveFromRenderTick();
 
     // Host-sync (interim, until the render-finished semaphore #26 is wired via a
@@ -1619,6 +1757,27 @@ bool O3deBackend::Impl::RenderOneFrame()
         waitResult = vkDeviceWaitIdle(vkDevice);
     }
 
+    // #26: after host-sync the frame is GPU-complete, so read the value the
+    // render-finished fence reached this frame and confirm it actually signalled.
+    // signaledValue is advertised to the consumer (semaphoreWaitValue); fenceState
+    // == Signaled is the Step-A proof that the GPU signal path works. Reset()
+    // below arms the next monotonic value -- but only when we actually signalled,
+    // so a stalled signal never advances the value past what the GPU reaches.
+    uint64_t signaledValue = this->interopSemaphoreValue;
+    bool fenceSignalled = false;
+    if (this->renderFinishedFence)
+    {
+      AZ::RHI::Ptr<AZ::RHI::DeviceFence> devFence =
+          this->renderFinishedFence->GetDeviceFence(
+              AZ::RHI::MultiDevice::DefaultDeviceIndex);
+      if (devFence)
+      {
+        signaledValue = AZ::Vulkan::GetFencePendingValue(*devFence);
+        fenceSignalled =
+            (devFence->GetFenceState() == AZ::RHI::FenceState::Signaled);
+      }
+    }
+
     {
       // DEBUG (interop bring-up): log EVERY live frame + the host-sync result so
       // we can see whether the producer keeps rendering past frame 3 and whether
@@ -1627,10 +1786,13 @@ bool O3deBackend::Impl::RenderOneFrame()
       const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
           std::chrono::steady_clock::now() - frameStart).count();
       std::fprintf(stderr,
-          "[gz-o3de] interop live frame %d: %ux%u gen=%llu %lld ms waitIdle=%d\n",
+          "[gz-o3de] interop live frame %d: %ux%u gen=%llu %lld ms waitIdle=%d "
+          "fence=%s value=%llu\n",
           frameNum, lw, lh,
           static_cast<unsigned long long>(this->interopGeneration),
-          static_cast<long long>(ms), static_cast<int>(waitResult));
+          static_cast<long long>(ms), static_cast<int>(waitResult),
+          fenceSignalled ? "Signaled" : "Reset",
+          static_cast<unsigned long long>(signaledValue));
     }
     (void)logThis;
 
@@ -1638,9 +1800,20 @@ bool O3deBackend::Impl::RenderOneFrame()
       std::lock_guard<std::mutex> lock(this->mutex);
       this->latestWidth = lw;
       this->latestHeight = lh;
+      // Only publish a value the GPU actually reached, so a consumer waiting on
+      // it (Step B) cannot block on an unreachable timeline value.
+      if (fenceSignalled)
+        this->interopSemaphoreValue = signaledValue;
       ++this->frameSeq;
     }
     this->outputCv.notify_all();
+
+    // Advance the timeline fence to the next (strictly greater) value for the
+    // next frame. Reset() is host-side bookkeeping (m_pendingValue++) -- safe
+    // after the host-sync above -- and only valid once this frame's value was
+    // reached, hence gated on fenceSignalled.
+    if (fenceSignalled && this->renderFinishedFence)
+      this->renderFinishedFence->Reset();
     return true;
   }
 #endif

@@ -141,11 +141,22 @@ bool O3deVkImportImage(const O3deVkDeviceContext &_ctx,
     return false;
   }
 
-  // Import the render-finished semaphore if the producer exported one.
+  // Import the render-finished semaphore if the producer exported one. The
+  // producer's fence is a TIMELINE semaphore (Atom's TimelineSemaphoreFence), so
+  // the consumer-side handle MUST also be created as VK_SEMAPHORE_TYPE_TIMELINE --
+  // the imported OPAQUE_FD payload is a timeline, and a binary handle cannot wait
+  // on it. The import is PERMANENT (flags = 0): the shared timeline payload must
+  // persist so we can wait on the producer's strictly increasing per-frame values
+  // (TEMPORARY import reverts after a single wait, breaking subsequent frames).
   if (_import.semaphoreFd >= 0 && importSemFd)
   {
+    VkSemaphoreTypeCreateInfo semType{};
+    semType.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
+    semType.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+    semType.initialValue = 0u;
     VkSemaphoreCreateInfo semInfo{};
     semInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+    semInfo.pNext = &semType;
     if (VkOk(vkCreateSemaphore(_ctx.device, &semInfo, nullptr, &_out->semaphore),
             "vkCreateSemaphore"))
     {
@@ -154,7 +165,7 @@ bool O3deVkImportImage(const O3deVkDeviceContext &_ctx,
       impSem.semaphore = _out->semaphore;
       impSem.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT;
       impSem.fd = _import.semaphoreFd;
-      impSem.flags = VK_SEMAPHORE_IMPORT_TEMPORARY_BIT;
+      impSem.flags = 0;
       if (!VkOk(importSemFd(_ctx.device, &impSem), "vkImportSemaphoreFdKHR"))
       {
         vkDestroySemaphore(_ctx.device, _out->semaphore, nullptr);
@@ -169,7 +180,8 @@ bool O3deVkImportImage(const O3deVkDeviceContext &_ctx,
 //////////////////////////////////////////////////
 bool O3deVkAcquireFromProducer(const O3deVkDeviceContext &_ctx,
     const O3deVkImportedImage &_img,
-    VkImageLayout _producerLayout, VkImageLayout _targetLayout)
+    VkImageLayout _producerLayout, VkImageLayout _targetLayout,
+    uint64_t _waitValue)
 {
   if (_ctx.device == VK_NULL_HANDLE || _img.image == VK_NULL_HANDLE)
     return false;
@@ -236,15 +248,42 @@ bool O3deVkAcquireFromProducer(const O3deVkDeviceContext &_ctx,
     submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submit.commandBufferCount = 1u;
     submit.pCommandBuffers = &cmd;
+    // Wait on the producer's render-finished TIMELINE semaphore at the value the
+    // producer signalled for this frame (_waitValue). This is the cross-device
+    // synchronisation that establishes visibility of the producer's render into
+    // the shared image before this consumer queue reads it: without it the read
+    // races the (separate-device) write and the GPU is lost (~5s TDR). A timeline
+    // wait needs its value passed via VkTimelineSemaphoreSubmitInfo chained onto
+    // the submit; a value of 0 (no semaphore advertised) skips the wait.
+    VkTimelineSemaphoreSubmitInfo timelineInfo{};
+    timelineInfo.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
+    timelineInfo.waitSemaphoreValueCount = 1u;
+    timelineInfo.pWaitSemaphoreValues = &_waitValue;
+    uint64_t counter = ~0ull;
     if (_img.semaphore != VK_NULL_HANDLE)
     {
+      submit.pNext = &timelineInfo;
       submit.waitSemaphoreCount = 1u;
       submit.pWaitSemaphores = &_img.semaphore;
       submit.pWaitDstStageMask = &waitStage;
+      // The shared timeline counter's current value. Logged below as evidence the
+      // import shares the producer's payload (counter advances with the producer)
+      // and that the wait cannot hang (counter >= _waitValue after host-sync). It
+      // was a value mismatch / non-shared payload we needed to rule out for #26.
+      auto getCounter = reinterpret_cast<PFN_vkGetSemaphoreCounterValue>(
+          vkGetDeviceProcAddr(_ctx.device, "vkGetSemaphoreCounterValue"));
+      if (getCounter)
+        getCounter(_ctx.device, _img.semaphore, &counter);
     }
-    ok = VkOk(vkQueueSubmit(_ctx.queue, 1u, &submit, fence), "vkQueueSubmit");
+    const VkResult subRes = vkQueueSubmit(_ctx.queue, 1u, &submit, fence);
+    ok = VkOk(subRes, "vkQueueSubmit");
     if (ok)
       vkWaitForFences(_ctx.device, 1u, &fence, VK_TRUE, UINT64_MAX);
+    if (_img.semaphore != VK_NULL_HANDLE)
+      std::fprintf(stderr,
+          "[gz-o3de] vkimport: acquire wait=%llu shared-counter=%llu submit=%d\n",
+          static_cast<unsigned long long>(_waitValue),
+          static_cast<unsigned long long>(counter), static_cast<int>(subRes));
     vkDestroyFence(_ctx.device, fence, nullptr);
   }
 

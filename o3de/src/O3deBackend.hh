@@ -63,12 +63,32 @@ namespace gz
       uint64_t allocationOffset = 0u; //!< Byte offset of the image in that block.
 
       /// \brief dup'd OPAQUE_FD for the render-finished semaphore, or -1 if the
-      /// producer does not export one yet. A static, uploaded-once image needs
-      /// no synchronisation (the GL self-test confirmed this); a live
-      /// render-into-shared-image target does -- exporting this semaphore is the
-      /// M4 producer-side "semaphore sync" work that remains. A Vulkan importer
-      /// waits on it (VkImportSemaphoreFdInfoKHR) before sampling.
+      /// producer does not export one (e.g. the static probe path needs no
+      /// synchronisation). For the Stage B live render-into-image path this is a
+      /// TIMELINE semaphore Atom signals when the per-frame copy into this image
+      /// completes. The handle is stable across frames; a Vulkan importer imports
+      /// it (VkImportSemaphoreFdInfoKHR) once and waits on \ref semaphoreWaitValue
+      /// before sampling.
       int semaphoreFd = -1;
+
+      /// \brief Timeline value the producer's GPU will signal \ref semaphoreFd to
+      /// for the latest frame. The consumer waits for this value (it advances each
+      /// frame). Meaningful only when \ref semaphoreFd >= 0.
+      uint64_t semaphoreWaitValue = 0u;
+
+      /// \brief Bumped by the producer whenever it (re)creates the exportable
+      /// image (e.g. the initial probe -> the camera-sized live target, or a
+      /// window resize). \ref fd and the geometry above refer to that
+      /// generation's image; a consumer re-imports when this value changes.
+      uint64_t generation = 0u;
+
+      /// \brief True when the producer renders the live scene directly into this
+      /// image every frame (Stage B). The image's contents AND its
+      /// producer-side layout change per frame, so the consumer must re-acquire
+      /// ownership + transition the layout each frame (from a colour-attachment
+      /// layout). False for the static, uploaded-once probe (acquire once, from a
+      /// shader-read layout).
+      bool live = false;
     };
 
     /// \brief Camera pose + projection for one frame, in gz world coordinates.
@@ -128,6 +148,20 @@ namespace gz
       public: bool RenderFrame(const O3deCameraData &_camera,
                   const std::vector<O3deShapeData> &_shapes,
                   uint32_t _width, uint32_t _height, uint8_t *_outRgba);
+
+      /// \brief Drive one offscreen frame of the given camera + primitives and
+      /// publish it into the exportable interop colour image (M4 native
+      /// Vulkan->Vulkan path), recreating that image at \p _width x \p _height
+      /// if needed. Unlike RenderFrame() the pixels are NOT read back to the
+      /// CPU; the rendered frame lands in the shared image that
+      /// GetInteropImport() exposes, for a consumer to sample zero-copy.
+      /// No-op (returns false) unless the plugin was built with
+      /// -DGZ_O3DE_INTEROP=ON and the runtime was started with GZ_O3DE_INTEROP.
+      /// Call once per displayed frame from the consumer's render path.
+      /// \return True if a frame was rendered into the shared image.
+      public: bool RenderFrameForInterop(const O3deCameraData &_camera,
+                  const std::vector<O3deShapeData> &_shapes,
+                  uint32_t _width, uint32_t _height);
 
       /// \brief Get import handles for the exportable interop colour image
       /// (M4 zero-copy path). Only valid when the plugin was built with

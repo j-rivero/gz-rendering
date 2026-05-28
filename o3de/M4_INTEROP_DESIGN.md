@@ -4,11 +4,14 @@
 > design below targets Vulkan→**GL** (sharing Atom's image with Qt's *GL* context).
 > The actual path realized runs Qt on its **Vulkan** RHI and imports Atom's image
 > onto Qt's `VkDevice` (`QSGVulkanTexture::fromNative`) — no GL. The foundation
-> (FD export, import-onto-another-VkDevice) and the static-probe display are done
-> and verified; the **live** scene now renders into the shared image (4× MSAA), but
-> the live path is blocked on a cross-device render-finished semaphore. See
+> (FD export, import-onto-another-VkDevice), the static-probe display, and the
+> render-finished timeline semaphore (#26) are done and verified; the **live** scene
+> renders into the shared image (4× MSAA). The live path is still blocked — but
+> **not** on the semaphore (#26 is proven working): it is a cross-device
+> render-target/compression handoff (Qt's `VkDevice` can't sample Atom's compressed
+> live colour attachment; the plain static-probe write samples fine). See
 > **[docs/zero-copy-interop-findings.md](docs/zero-copy-interop-findings.md)** for
-> the Phase-2 root-cause analysis + the confirmed-feasible semaphore design, and
+> the corrected root-cause analysis + full elimination table + candidate fixes, and
 > **[docs/task-tracker.md](docs/task-tracker.md)** for the #20–#26 task breakdown.
 > The Vulkan↔GL design is retained below for reference.
 

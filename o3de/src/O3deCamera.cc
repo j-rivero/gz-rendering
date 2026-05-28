@@ -18,6 +18,8 @@
 #include "gz/rendering/o3de/O3deRenderTarget.hh"
 
 #if defined(GZ_O3DE_INTEROP_BUILD)
+#include <unistd.h>  // close()
+
 #include <vector>
 
 #include <gz/common/Console.hh>
@@ -61,6 +63,9 @@ class O3deCamera::O3deCameraInterop
   public: O3deVkImportedImage img;     //!< The VkImage aliasing Atom's memory.
   public: bool imported = false;       //!< Import succeeded (latched).
   public: bool acquired = false;       //!< Ownership/layout acquired (once).
+  public: bool live = false;           //!< Producer renders into it each frame.
+  public: uint64_t importedGeneration = 0u;  //!< Producer image gen we imported.
+  public: uint64_t semaphoreWaitValue = 0u;  //!< Timeline value to wait on (#26).
   public: int warnCount = 0;           //!< Not-ready warnings emitted (rate cap).
 #endif
 };
@@ -74,8 +79,16 @@ O3deCamera::O3deCamera()
 O3deCamera::~O3deCamera()
 {
 #if defined(GZ_O3DE_INTEROP_BUILD)
+  // Only destroy the import if Qt's device is still alive and unchanged from the
+  // one we imported on; otherwise the VkImage already died with that device and
+  // vkDestroyImage on the stale handle would abort (see RenderTextureMetalId).
   if (this->interop && this->interop->imported)
-    O3deVkDestroyImported(this->interop->ctx, &this->interop->img);
+  {
+    auto *eng = O3deRenderEngine::Instance();
+    auto dev = eng ? static_cast<VkDevice>(eng->QtVulkanDevice()) : nullptr;
+    if (dev && dev == this->interop->ctx.device)
+      O3deVkDestroyImported(this->interop->ctx, &this->interop->img);
+  }
 #endif
 }
 
@@ -96,53 +109,84 @@ void O3deCamera::RenderTextureMetalId(void *_textureIdPtr) const
     this->interop = std::make_unique<O3deCameraInterop>();
   O3deCameraInterop &st = *this->interop;
 
-  // Import Atom's exported colour image onto Qt's injected VkDevice. Retried
-  // until it succeeds (the injected device and the exportable image may not be
-  // ready on the first call from gz-gui); latched once imported. The warning is
-  // rate-limited so a not-yet-ready state does not spam per frame.
-  if (!st.imported)
+  // Import Atom's exported colour image onto Qt's injected VkDevice, and
+  // re-import whenever the producer (re)creates it (probe -> camera size, or a
+  // resize), signalled by a changed generation. Retried until the device + image
+  // are ready; the warning is rate-limited so a not-yet-ready state does not
+  // spam per frame. GetInteropImport() dups a fresh OS FD on each success: a
+  // successful O3deVkImportImage() transfers ownership of that FD to the device;
+  // otherwise we must close it here.
+  auto *eng = O3deRenderEngine::Instance();
+  auto dev = static_cast<VkDevice>(eng->QtVulkanDevice());
+  auto phys = static_cast<VkPhysicalDevice>(eng->QtVulkanPhysicalDevice());
+  auto queue = static_cast<VkQueue>(eng->QtVulkanGraphicsQueue());
+  auto inst = static_cast<VkInstance>(eng->QtVulkanInstance());
+  const bool haveDevice = dev && phys && queue;
+
+  O3deInteropImport import;
+  const bool haveImage =
+      haveDevice && O3deBackend::Instance().GetInteropImport(import);
+  if (haveImage)
   {
-    auto *eng = O3deRenderEngine::Instance();
-    auto dev = static_cast<VkDevice>(eng->QtVulkanDevice());
-    auto phys = static_cast<VkPhysicalDevice>(eng->QtVulkanPhysicalDevice());
-    auto queue = static_cast<VkQueue>(eng->QtVulkanGraphicsQueue());
-    auto inst = static_cast<VkInstance>(eng->QtVulkanInstance());
-    O3deInteropImport import;
-    const bool haveDevice = dev && phys && queue;
-    const bool haveImage =
-        haveDevice && O3deBackend::Instance().GetInteropImport(import);
-    if (!haveImage)
+    st.live = import.live;  // refresh each frame (static probe -> live switch)
+    // Latch the per-frame timeline value the producer signalled for the latest
+    // frame; PrepareForExternalSampling waits on it before sampling (#26).
+    st.semaphoreWaitValue = import.semaphoreWaitValue;
+  }
+
+  if (haveImage &&
+      (!st.imported || import.generation != st.importedGeneration))
+  {
+    if (st.imported)
     {
-      if (st.warnCount++ < 3)
-      {
-        gzwarn << "[gz-o3de] RenderTextureMetalId: "
-               << (!haveDevice ? "Qt did not inject a Vulkan device (is the "
-                                 "Vulkan GUI backend active?)"
-                               : "backend has no exportable image yet "
-                                 "(interop not ready)")
-               << " -- will retry" << std::endl;
-      }
-      return;  // no handle this frame; try again next call
+      // Destroy the old import only if Qt's device is still the one we imported
+      // on. If Qt lost/recreated its device (e.g. after a device-loss), st.ctx
+      // is stale and the old VkImage died with that device; calling
+      // vkDestroyImage on the dead handle aborts ("Invalid device"). Drop it.
+      if (st.ctx.device == dev)
+        O3deVkDestroyImported(st.ctx, &st.img);
+      else
+        st.img = O3deVkImportedImage{};
+      st.imported = false;
     }
     st.ctx.instance = inst;
     st.ctx.physicalDevice = phys;
     st.ctx.device = dev;
     st.ctx.queue = queue;
     st.ctx.queueFamily = FirstGraphicsFamily(phys);
-    if (O3deVkImportImage(st.ctx, import, &st.img))
+    if (O3deVkImportImage(st.ctx, import, &st.img))  // consumes import.fd
     {
       st.imported = true;
+      st.importedGeneration = import.generation;
+      st.acquired = false;  // re-acquire layout/ownership for the new image
       gzmsg << "[gz-o3de] imported Atom image onto Qt's VkDevice (VkImage="
-            << reinterpret_cast<void *>(st.img.image) << ", " << st.img.width
-            << "x" << st.img.height << ") -- native Vulkan->Vulkan display"
-            << std::endl;
+            << reinterpret_cast<void *>(st.img.image) << ", gen="
+            << import.generation << ", " << st.img.width << "x" << st.img.height
+            << ") -- native Vulkan->Vulkan display" << std::endl;
     }
     else
     {
+      if (import.fd >= 0)
+        ::close(import.fd);  // import failed: we still own the dup'd FD
       gzerr << "[gz-o3de] failed to import Atom image onto Qt's VkDevice"
             << std::endl;
-      return;
     }
+  }
+  else if (haveImage)
+  {
+    // Generation unchanged: close the FD GetInteropImport() dup'd but we did
+    // not hand to a successful import (avoids leaking one FD per frame).
+    if (import.fd >= 0)
+      ::close(import.fd);
+  }
+  else if (st.warnCount++ < 3)
+  {
+    gzwarn << "[gz-o3de] RenderTextureMetalId: "
+           << (!haveDevice ? "Qt did not inject a Vulkan device (is the "
+                             "Vulkan GUI backend active?)"
+                           : "backend has no exportable image yet "
+                             "(interop not ready)")
+           << " -- will retry" << std::endl;
   }
 
   if (st.imported)
@@ -159,11 +203,36 @@ void O3deCamera::PrepareForExternalSampling()
   if (!this->interop || !this->interop->imported)
     return;
   O3deCameraInterop &st = *this->interop;
-  // Static probe image: acquire ownership from the producer and settle the
-  // layout once. A live render-into target (Phase 2) must do this every frame,
-  // gated on the exported render-finished semaphore.
-  if (!st.acquired)
+  if (st.live)
   {
+    // Stage B: the producer renders the live scene into the image every frame.
+    // Its render-finished fence-signal scope copy-reads the image last, so the
+    // producer leaves it in TRANSFER_SRC_OPTIMAL (Atom maps a copy-read to that
+    // layout). Acquire ownership + transition to shader-read EACH frame, waiting
+    // on the producer's render-finished TIMELINE semaphore at this frame's value
+    // (#26) so the cross-device write is visible before we read -- the producer
+    // also host-syncs, but the semaphore wait is what makes the writes visible to
+    // Qt's separate device (host-sync alone is spec-insufficient). When no
+    // semaphore is advertised (GZ_O3DE_INTEROP_SEM off) the wait is a no-op.
+    // Acquire each frame, waiting on the producer's render-finished timeline
+    // semaphore at this frame's value (#26) for cross-device write visibility.
+    // The layout barrier is a no-op SHADER_READ -> SHADER_READ (old == new),
+    // matching the proven static-probe acquire: tested both this and a real
+    // transition from the producer's layout, and the layout barrier is NOT what
+    // loses the device. The live path still loses Qt's device the first time Qt
+    // samples the producer's COLOUR-ATTACHMENT render-target image in its own
+    // render pass (the plain static-probe write samples fine) -- a cross-device
+    // render-target/compression handoff problem, orthogonal to the (now working)
+    // semaphore sync. See o3de/docs/zero-copy-interop-findings.md (#26 section).
+    O3deVkAcquireFromProducer(st.ctx, st.img,
+        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        st.semaphoreWaitValue);
+  }
+  else if (!st.acquired)
+  {
+    // Static probe image (uploaded once): acquire ownership and settle the layout
+    // a single time from the shader-read layout UpdateImageContents leaves.
     if (O3deVkAcquireFromProducer(st.ctx, st.img,
             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL))

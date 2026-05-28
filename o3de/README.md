@@ -252,9 +252,13 @@ gz gui -c <config-with-engine-o3de>
 Success shows `imported Atom image onto Qt's VkDevice ... native Vulkan->Vulkan
 display` in the log. The **static probe** image displays correctly (Phase 1). With
 `GZ_O3DE_INTEROP_LIVE=1` the **live scene** also renders into the shared image (4×
-MSAA), but that path is **not yet stable**: it lacks a cross-device render-finished
-semaphore, so the GPU is lost (TDR) a few seconds in. Root cause and the
-confirmed-feasible fix are in
+MSAA), but that path is **not yet stable**: Qt's separate `VkDevice` loses the device
+the first time it samples Atom's per-frame colour-attachment image. The
+render-finished timeline semaphore (#26, `GZ_O3DE_INTEROP_SEM=1`) is implemented and
+proven working, but it is **not** the cause — the remaining blocker is a cross-device
+render-target/compression handoff (the plain static-probe write samples fine; the
+compressed live render target does not). Root cause, the full elimination table and
+candidate fixes are in
 [docs/zero-copy-interop-findings.md](docs/zero-copy-interop-findings.md); the task
 breakdown is in [docs/task-tracker.md](docs/task-tracker.md).
 
@@ -264,8 +268,9 @@ breakdown is in [docs/task-tracker.md](docs/task-tracker.md).
   fallback, which gz-gui itself warns is slow. An experimental zero-copy
   Vulkan→Vulkan path now exists (see *Native Vulkan→Vulkan display* above and
   prerequisite 5). The static-probe image displays; the live-scene render-into
-  works but is blocked on a cross-device render-finished semaphore (the GPU is
-  lost a few seconds in without it) — see
+  works and the cross-device render-finished semaphore (#26) is implemented and
+  proven, but the live path is still blocked on a cross-device render-target/
+  compression handoff (Qt can't sample Atom's compressed live render target) — see
   [docs/zero-copy-interop-findings.md](docs/zero-copy-interop-findings.md).
 * **Primitives only:** box / sphere / cylinder / cone via AuxGeom with flat
   diffuse colour. No meshes, textures, PBR materials, lights or shadows yet.

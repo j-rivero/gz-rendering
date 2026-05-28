@@ -74,13 +74,16 @@ namespace gz
 
     /// \brief Acquire \p _img from the producer (queue-family ownership transfer
     /// from VK_QUEUE_FAMILY_EXTERNAL) and transition it from \p _producerLayout
-    /// to \p _targetLayout, waiting on its imported semaphore if present. Submits
-    /// on \p _ctx.queue and blocks on a fence. \p _producerLayout is the layout
-    /// the producer left the image in (SHADER_READ_ONLY_OPTIMAL by the M4
-    /// contract). \return True on success.
+    /// to \p _targetLayout, waiting on its imported render-finished TIMELINE
+    /// semaphore at value \p _waitValue if a semaphore was imported. Submits on
+    /// \p _ctx.queue and blocks on a fence. \p _producerLayout is the layout the
+    /// producer left the image in. \p _waitValue is the per-frame timeline value
+    /// the producer signalled (from O3deInteropImport::semaphoreWaitValue); pass 0
+    /// when no semaphore is in play. \return True on success.
     bool O3deVkAcquireFromProducer(const O3deVkDeviceContext &_ctx,
         const O3deVkImportedImage &_img,
-        VkImageLayout _producerLayout, VkImageLayout _targetLayout);
+        VkImageLayout _producerLayout, VkImageLayout _targetLayout,
+        uint64_t _waitValue = 0u);
 
     /// \brief Destroy the image, free the imported memory (closing the memory
     /// FD) and destroy the semaphore (closing its FD). Safe on partial handles.

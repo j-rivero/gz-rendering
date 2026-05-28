@@ -56,73 +56,32 @@ namespace
         return false;
     }
   }
-}
 
-//////////////////////////////////////////////////
-O3deRenderTarget::O3deRenderTarget()
-{
-}
-
-//////////////////////////////////////////////////
-O3deRenderTarget::~O3deRenderTarget()
-{
-}
-
-//////////////////////////////////////////////////
-void O3deRenderTarget::Render()
-{
-  // M0 stub: no Atom frame is rendered yet. A later milestone will drive
-  // an Atom render-to-texture frame here.
-}
-
-//////////////////////////////////////////////////
-void O3deRenderTarget::Copy(Image &_image) const
-{
-  // Drive a real O3DE/Atom offscreen frame and read it back into the gz Image
-  // (already sized by the caller to the camera resolution). This is the
-  // CPU-readback bridge gz-gui's MinimalScene fallback relies on.
-  const unsigned int w = _image.Width();
-  const unsigned int h = _image.Height();
-  unsigned char *data = static_cast<unsigned char *>(_image.Data());
-
+  /// \brief Collect the camera pose/projection + drawable primitives (world
+  /// pose, scale, diffuse colour) from the camera's scene, in gz world frame.
+  /// Shared by Copy() (CPU readback) and Render() (native interop).
+  void GatherFrame(O3deCamera *_camera, O3deCameraData &_camData,
+      std::vector<O3deShapeData> &_shapes)
   {
-    static int n = 0;
-    if (n++ < 5)
-      std::fprintf(stderr,
-          "[gz-o3de] Copy() call %d: w=%u h=%u data=%p camera=%p fmt=%d\n",
-          n, w, h, static_cast<void *>(data),
-          static_cast<void *>(this->camera),
-          static_cast<int>(_image.Format()));
-  }
+    const math::Pose3d camPose = _camera->WorldPose();
+    _camData.pos[0] = camPose.Pos().X();
+    _camData.pos[1] = camPose.Pos().Y();
+    _camData.pos[2] = camPose.Pos().Z();
+    _camData.quat[0] = camPose.Rot().W();
+    _camData.quat[1] = camPose.Rot().X();
+    _camData.quat[2] = camPose.Rot().Y();
+    _camData.quat[3] = camPose.Rot().Z();
+    _camData.hfov = _camera->HFOV().Radian();
+    _camData.nearClip = _camera->NearClipPlane();
+    _camData.farClip = _camera->FarClipPlane();
 
-  if (nullptr == data || w == 0u || h == 0u || nullptr == this->camera)
-    return;
-
-  // Gather the camera pose + projection (gz world frame).
-  O3deCameraData camData;
-  const math::Pose3d camPose = this->camera->WorldPose();
-  camData.pos[0] = camPose.Pos().X();
-  camData.pos[1] = camPose.Pos().Y();
-  camData.pos[2] = camPose.Pos().Z();
-  camData.quat[0] = camPose.Rot().W();
-  camData.quat[1] = camPose.Rot().X();
-  camData.quat[2] = camPose.Rot().Y();
-  camData.quat[3] = camPose.Rot().Z();
-  camData.hfov = this->camera->HFOV().Radian();
-  camData.nearClip = this->camera->NearClipPlane();
-  camData.farClip = this->camera->FarClipPlane();
-
-  // Walk the scene's visuals and collect the drawable primitives with their
-  // world pose, scale and diffuse color.
-  std::vector<O3deShapeData> shapes;
-  ScenePtr scene = this->camera->Scene();
-  if (scene)
-  {
+    ScenePtr scene = _camera->Scene();
+    if (!scene)
+      return;
     for (unsigned int i = 0u; i < scene->VisualCount(); ++i)
     {
-      VisualPtr visual = scene->VisualByIndex(i);
       O3deVisualPtr o3deVisual =
-          std::dynamic_pointer_cast<O3deVisual>(visual);
+          std::dynamic_pointer_cast<O3deVisual>(scene->VisualByIndex(i));
       if (!o3deVisual)
         continue;
 
@@ -159,10 +118,70 @@ void O3deRenderTarget::Copy(Image &_image) const
           shape.color[2] = c.B();
           shape.color[3] = c.A();
         }
-        shapes.push_back(shape);
+        _shapes.push_back(shape);
       }
     }
   }
+}
+
+//////////////////////////////////////////////////
+O3deRenderTarget::O3deRenderTarget()
+{
+}
+
+//////////////////////////////////////////////////
+O3deRenderTarget::~O3deRenderTarget()
+{
+}
+
+//////////////////////////////////////////////////
+void O3deRenderTarget::Render()
+{
+  // Native Vulkan->Vulkan path: gz-gui drives Camera::Update() -> Render() each
+  // frame (Copy() is the separate OpenGL CPU-readback path it does NOT call
+  // here). Render an offscreen Atom frame into the exportable shared image so the
+  // consumer samples the live scene zero-copy. No-op unless the backend was
+  // built with -DGZ_O3DE_INTEROP=ON and started with GZ_O3DE_INTEROP set.
+  if (nullptr == this->camera)
+    return;
+  const uint32_t w = this->camera->ImageWidth();
+  const uint32_t h = this->camera->ImageHeight();
+  if (w == 0u || h == 0u)
+    return;
+
+  O3deCameraData camData;
+  std::vector<O3deShapeData> shapes;
+  GatherFrame(this->camera, camData, shapes);
+  O3deBackend::Instance().RenderFrameForInterop(camData, shapes, w, h);
+}
+
+//////////////////////////////////////////////////
+void O3deRenderTarget::Copy(Image &_image) const
+{
+  // Drive a real O3DE/Atom offscreen frame and read it back into the gz Image
+  // (already sized by the caller to the camera resolution). This is the
+  // CPU-readback bridge gz-gui's MinimalScene fallback relies on.
+  const unsigned int w = _image.Width();
+  const unsigned int h = _image.Height();
+  unsigned char *data = static_cast<unsigned char *>(_image.Data());
+
+  {
+    static int n = 0;
+    if (n++ < 5)
+      std::fprintf(stderr,
+          "[gz-o3de] Copy() call %d: w=%u h=%u data=%p camera=%p fmt=%d\n",
+          n, w, h, static_cast<void *>(data),
+          static_cast<void *>(this->camera),
+          static_cast<int>(_image.Format()));
+  }
+
+  if (nullptr == data || w == 0u || h == 0u || nullptr == this->camera)
+    return;
+
+  // Gather the camera pose + projection and drawable primitives (gz world frame).
+  O3deCameraData camData;
+  std::vector<O3deShapeData> shapes;
+  GatherFrame(this->camera, camData, shapes);
 
   const unsigned int channels = (_image.Format() == PF_R8G8B8) ? 3u : 4u;
 
