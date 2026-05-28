@@ -4,14 +4,14 @@
 > design below targets Vulkan→**GL** (sharing Atom's image with Qt's *GL* context).
 > The actual path realized runs Qt on its **Vulkan** RHI and imports Atom's image
 > onto Qt's `VkDevice` (`QSGVulkanTexture::fromNative`) — no GL. The foundation
-> (FD export, import-onto-another-VkDevice), the static-probe display, and the
-> render-finished timeline semaphore (#26) are done and verified; the **live** scene
-> renders into the shared image (4× MSAA). The live path is still blocked — but
-> **not** on the semaphore (#26 is proven working): it is a cross-device
-> render-target/compression handoff (Qt's `VkDevice` can't sample Atom's compressed
-> live colour attachment; the plain static-probe write samples fine). See
-> **[docs/zero-copy-interop-findings.md](docs/zero-copy-interop-findings.md)** for
-> the corrected root-cause analysis + full elimination table + candidate fixes, and
+> (FD export, import-onto-another-VkDevice), the static-probe display, the
+> render-finished timeline semaphore (#26), and the **live zero-copy display** (#25)
+> are done and verified — the live scene renders into the shared image (4× MSAA) and
+> Qt samples it zero-copy, ~2000 frames across multiple resizes with zero device loss.
+> The live device loss en route turned out to be a consumer-side resize/re-import
+> use-after-free (fixed by retiring old imports), not the semaphore or compression.
+> See **[docs/zero-copy-interop-findings.md](docs/zero-copy-interop-findings.md)** for
+> the full debugging journey + elimination table + the fix, and
 > **[docs/task-tracker.md](docs/task-tracker.md)** for the #20–#26 task breakdown.
 > The Vulkan↔GL design is retained below for reference.
 

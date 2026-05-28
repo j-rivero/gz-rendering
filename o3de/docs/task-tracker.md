@@ -27,14 +27,15 @@ fine-grained breakdown of **M4's** native-Vulkan display path.
 | 22 | gz-rendering: O3deRenderEngine reads injected Qt Vulkan device | ✅ done | The engine picks up Qt's injected `VkInstance`/`VkPhysicalDevice`/`VkDevice`/queue so the consumer-side import targets Qt's device. |
 | 23 | gz-rendering: O3deCamera RenderTextureMetalId + PrepareForExternalSampling | ✅ done | Consumer hooks: hand the imported `VkImage` to gz-gui (`RenderTextureMetalId`) and transition it for sampling each frame (`PrepareForExternalSampling`). |
 | 24 | Verify static probe image displays in gz-gui via native V→V (Phase 1) | ✅ done | Atom uploads a gradient into the export image once; Qt imports + samples it. Verified displaying via native Vulkan→Vulkan. |
-| 25 | Stage B: render live scene directly into the exportable image (Phase 2) | 🔶 in progress, **blocked** (not by #26) | Atom renders the scene into the export image every frame via `CreateRenderPipelineForImage`. The render-into works (fixed the single-sample `MainPipeline` MSAA crash → 4× MSAA). Now blocked on a **cross-device render-target/compression handoff**: Qt's separate `VkDevice` faults the first time it samples the producer's compressed colour-attachment image (the plain static-probe write samples fine). See the findings doc, hypothesis 12. |
-| 26 | Export render-finished timeline semaphore (RHI::Fence) + consumer wait | ✅ **done — implemented & proven**, but NOT the live-path fix | Producer signals a timeline `RHI::Fence` each frame (`RHISystemNotificationBus::OnFramePrepare` + `ImportScopeProducer` + `FrameGraphInterface::SignalFence`; `usedForWaitingOnDevice=true` makes it a `TimelineSemaphoreFence`); consumer imports it as a timeline semaphore and waits on the per-frame value. Verified: the shared timeline counter advances across both `VkDevice`s and waits are satisfiable. The earlier belief that this missing semaphore *was* the device-loss cause is **disproven** — the loss persists with #26 working (see hypothesis 8). Gated by `GZ_O3DE_INTEROP_SEM`. |
+| 25 | Stage B: render live scene directly into the exportable image (Phase 2) | ✅ **done — WORKING** | Atom renders the scene into the export image every frame via `CreateRenderPipelineForImage`; Qt samples it zero-copy. Verified ~2000 frames at ~60-100 fps across multiple window resizes (gen 1→2→3), zero device loss. Took three fixes: the 4× MSAA crash fix; the **consumer retiring old imports** (the real device-loss fix — freeing an import under Qt's in-flight frame was the bug); and #26 for per-frame cross-device sync. The render-target/compression theory was disproven by `GZ_O3DE_NO_RESIZE` (a fixed-size live image samples fine for 2000 frames). See the findings doc, hypotheses 12-15. |
+| 26 | Export render-finished timeline semaphore (RHI::Fence) + consumer wait | ✅ **done — implemented & proven** | Producer signals a timeline `RHI::Fence` each frame (`RHISystemNotificationBus::OnFramePrepare` + `ImportScopeProducer` + `FrameGraphInterface::SignalFence`; `usedForWaitingOnDevice=true` makes it a `TimelineSemaphoreFence`); consumer imports it as a timeline semaphore and waits on the per-frame value. Verified: the shared timeline counter advances across both `VkDevice`s in lockstep every frame. Required infrastructure for the working live path — though NOT the device-loss trigger (that was #25's resize/re-import; see hypothesis 8). Gated by `GZ_O3DE_INTEROP_SEM`. |
 
-**Dependency direction (corrected):** #26 (sync) is done and proven, but it did **not**
-unblock #25. The earlier "host-sync is spec-insufficient → #25 needs #26" framing was
-wrong: the live device loss is a render-target/compression handoff problem, orthogonal
-to synchronization. #25 now depends on a producer-side decompress / plain GPU-copy
-handoff, not on the semaphore. See the findings doc's "Candidate fixes" section.
+**Dependency direction (final):** #26 (sync) and #25 (live render + the resize/re-import
+fix) are both done and the live zero-copy path works. The earlier framings — "#25 needs
+#26 for sync", then "#25 blocked on a compression handoff" — were both wrong; the actual
+device-loss cause was a consumer-side use-after-free on resize (freeing an imported
+VkImage under Qt's in-flight frame), fixed by retiring old imports. See the findings
+doc's "Actual root cause" + "The fix" sections.
 
 ## See also
 

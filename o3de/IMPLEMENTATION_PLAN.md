@@ -123,7 +123,7 @@ gz HFOV → vertical FOV via `vFov = 2*atan(tan(hFov/2)/aspect)`.
 | **M2** | Fuse M0+M1 — real bootstrap/readback behind `O3deRenderTarget::Copy`; one hardcoded AuxGeom box in gz-gui via O3DE | **Done** |
 | **M3** | Wire the scene graph — `Create{Box,Sphere,Cylinder}Impl` + transforms + material colour drive AuxGeom from real scene contents | **Done** |
 | **M3.5** | Live gz-gui display — dedicated O3DE thread fixes the cross-thread asset-load deadlock; dynamic resize to the window's true aspect; ~60 fps continuous | **Done** |
-| **M4** | (post-PoC) zero-copy interop for performance. Realized as **native Vulkan→Vulkan** (Qt on its Vulkan RHI imports Atom's image onto its `VkDevice`), not Vulkan↔GL. **Done & verified:** FD export (`vkGetMemoryFdKHR`), import onto another `VkDevice`, the **static-probe display** in gz-gui (Phase 1, task #24), and the **render-finished timeline semaphore** (task #26 — producer signals + consumer waits; the shared timeline counter advances across both `VkDevice`s). **Still blocked:** the **live** scene renders into the shared image (task #25 — 4× MSAA fix) but loses Qt's device the first time Qt samples it. Root cause is **not** the semaphore (#26 is proven working) — it is a **cross-device render-target/compression handoff** (Qt's `VkDevice` can't sample Atom's compressed colour-attachment image; the plain static-probe write samples fine). See [M4_INTEROP_DESIGN.md](M4_INTEROP_DESIGN.md), [docs/zero-copy-interop-findings.md](docs/zero-copy-interop-findings.md), [docs/task-tracker.md](docs/task-tracker.md) | In progress |
+| **M4** | (post-PoC) zero-copy interop for performance. Realized as **native Vulkan→Vulkan** (Qt on its Vulkan RHI imports Atom's image onto its `VkDevice`), not Vulkan↔GL. **Done & verified:** FD export (`vkGetMemoryFdKHR`), import onto another `VkDevice`, the static-probe display (#24), the render-finished timeline semaphore (#26), and the **live zero-copy display** (#25) — the scene renders into the shared image and Qt samples it zero-copy, verified ~2000 frames at ~60-100 fps across multiple window resizes with zero device loss. The earlier live device loss was a **consumer-side resize/re-import use-after-free** (freeing an import under Qt's in-flight frame), fixed by retiring old imports; the "compression handoff" and "missing semaphore" theories were both disproven en route (see findings doc). See [M4_INTEROP_DESIGN.md](M4_INTEROP_DESIGN.md), [docs/zero-copy-interop-findings.md](docs/zero-copy-interop-findings.md), [docs/task-tracker.md](docs/task-tracker.md) | **Done** |
 
 ## Risks & mitigations (outcomes)
 
@@ -141,17 +141,15 @@ gz HFOV → vertical FOV via `vFov = 2*atan(tan(hFov/2)/aspect)`.
 
 * Remove debug logging in `O3deBackend.cc` / `O3deRenderTarget.cc`.
 * Real meshes, textures, PBR materials, lights and shadows.
-* Zero-copy interop, M4 — realized as **native Vulkan→Vulkan** (see
+* Zero-copy interop, M4 — realized as **native Vulkan→Vulkan** and **working** (see
   [M4_INTEROP_DESIGN.md](M4_INTEROP_DESIGN.md) and
-  [docs/zero-copy-interop-findings.md](docs/zero-copy-interop-findings.md)). FD
-  export + import-onto-another-`VkDevice` + the static-probe display + the
-  render-finished timeline semaphore (#26) are **done & verified** behind
-  `-DGZ_O3DE_INTEROP=ON` (needs the small gem patch in `patches/`). The live scene
-  renders into the shared image (4× MSAA), but the remaining blocker is **not** the
-  semaphore (#26 proven working via `RHISystemNotificationBus` + `ImportScopeProducer`
-  + `FrameGraphInterface::SignalFence`): it is a **cross-device render-target/
-  compression handoff** — Qt's separate `VkDevice` faults sampling Atom's compressed
-  colour-attachment image. Candidate fix: a one-copy plain handoff or producer-side
-  decompress (findings doc, "Candidate fixes").
+  [docs/zero-copy-interop-findings.md](docs/zero-copy-interop-findings.md)). FD export
+  + import-onto-another-`VkDevice` + the static-probe display + the render-finished
+  timeline semaphore (#26) + the **live zero-copy display** (#25) are done & verified
+  behind `-DGZ_O3DE_INTEROP=ON` (needs the small gem patch in `patches/`), gated at
+  runtime by `GZ_O3DE_INTEROP_LIVE` + `GZ_O3DE_INTEROP_SEM`. Possible future hardening:
+  a consumer→producer "done sampling" edge / double-buffering (today a single shared
+  image + producer host-sync + render-finished semaphore), and bounded reclaim of
+  retired consumer imports.
 * Replace hard-coded `vendor/o3de` + `~/o3de-packages` build paths with cache
   variables; ship a minimal vendored asset bundle instead of a full project.

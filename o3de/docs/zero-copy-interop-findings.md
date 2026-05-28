@@ -1,15 +1,25 @@
-# O3DE↔Qt native Vulkan zero-copy interop — root-cause findings & #26 outcome
+# O3DE↔Qt native Vulkan zero-copy interop — root-cause findings & resolution
 
-Status: **#26 (render-finished timeline semaphore) implemented & proven working.
-Phase 2 (live zero-copy) still blocked — but on a *different* cause than first
-thought: a cross-device render-target/compression handoff, not synchronization.**
-Date: 2026-05-28. Author: bring-up debugging session.
+Status: **WORKING.** The live zero-copy path now displays stably — ~2000 frames at
+~60-100 fps across multiple window resizes (gen 1→2→3), zero device losses. Two fixes
+landed it: (1) the #26 render-finished timeline semaphore (cross-device per-frame
+sync), and (2) the consumer **retiring** old imports instead of freeing them under
+Qt's in-flight frame. Date: 2026-05-28. Author: bring-up debugging session.
 
-This documents (a) the #26 implementation and the evidence it works, (b) the
-**correction** to the earlier root-cause conclusion (the missing semaphore was
-necessary infrastructure but NOT the device-loss cause), (c) every hypothesis tested
-and the evidence that eliminated it, and (d) the real remaining blocker. It exists so
-the zero-copy build can resume deliberately without re-deriving any of this.
+This documents the full debugging journey — including **two wrong root-cause
+conclusions** that the evidence later overturned — so the reasoning is transparent:
+(a) the #26 implementation + evidence it works, (b) the real root cause (a consumer
+resize/re-import use-after-free) and the fix, (c) every hypothesis tested and the
+evidence that eliminated it.
+
+> **Honesty note on the journey.** This file twice concluded the wrong root cause:
+> first "missing render-finished semaphore" (disproven once #26 worked and the loss
+> persisted), then "cross-device render-target/compression handoff" (disproven by the
+> `GZ_O3DE_NO_RESIZE` experiment below: a single fixed-size live image samples cleanly
+> for 2000+ frames). The actual cause was mundane: the consumer freed an imported
+> VkImage while Qt still had an in-flight frame sampling it. Both earlier "fixes" (the
+> semaphore; the layout/QFOT experiments) were still useful — the semaphore is real
+> required infrastructure — but neither was the device-loss trigger.
 
 ## Goal
 
@@ -23,8 +33,9 @@ already works.
 Two phases:
 - **Phase 1 — static probe (DONE, stable):** Atom uploads a gradient into the export
   image *once* (`UpdateImageContents`); Qt imports + samples it. Verified displaying.
-- **Phase 2 — live (#25 + #26):** Atom renders the scene into the export image *every
-  frame* (`CreateRenderPipelineForImage`). This is where the device loss occurs.
+- **Phase 2 — live (#25 + #26): WORKING.** Atom renders the scene into the export image
+  *every frame* (`CreateRenderPipelineForImage`); Qt samples it zero-copy. This is where
+  the device loss used to occur — now fixed (see below).
 
 ## #26 IMPLEMENTED — and proven working
 
@@ -57,36 +68,55 @@ The shared timeline counter advances **across the two `VkDevice`s** in lockstep 
 the producer, and every consumer wait value is ≤ the counter (so the wait is satisfiable
 and cannot hang). Cross-device timeline-semaphore sharing is therefore fully functional.
 
-## CORRECTED root cause (the earlier conclusion was wrong)
+## Actual root cause (confirmed by fix) — consumer resize/re-import use-after-free
 
-The earlier version of this doc concluded the device loss *was* the missing
-render-finished semaphore. **That was disproven**: with #26 implemented and the
-semaphore proven working, the live path still loses the device, in the same place.
+The device loss is a **use-after-free across the producer/consumer device boundary**,
+triggered by an image **resize**:
 
-The real behaviour, established this session:
-- The **consumer's** acquire `vkQueueSubmit` returns `VK_ERROR_DEVICE_LOST` in **0 ms**
-  — it does **not** hang. The device was already dead before the submit (a hung wait
-  would have taken ~5 s). So it is **not** a sync/TDR on our side.
-- The **producer** stays healthy throughout (`waitIdle=VK_SUCCESS` every frame). Only
-  **Qt's** logical device dies — not a whole-physical-GPU TDR.
-- The device dies the first time **Qt's own render pass samples the producer's
-  pipeline-rendered image**. The **static probe** — a *plain* `UpdateImageContents`
-  write — is sampled forever without issue; the **live** path renders the image as a
-  **colour attachment** (a render target, with NVIDIA framebuffer/DCC compression
-  state). Qt's separate `VkDevice` samples that compressed render-target image without
-  the producer's compression context → Qt's device faults.
+1. The producer creates the exportable image at a placeholder size in setup
+   (gen=1), then recreates it at the real camera/window size on the first frame
+   (gen=2) — and again on any window resize (gen=3, …). Each recreate bumps the
+   generation and exports a fresh FD.
+2. On a generation change the consumer (`O3deCamera::RenderTextureMetalId`) re-imports
+   the new image — and, in the original code, **immediately destroyed the old import's
+   VkImage**.
+3. But Qt's scene graph still had an **in-flight frame sampling the old VkImage**.
+   Destroying it out from under that frame faulted **Qt's** device — which is why only
+   Qt's device died (producer stayed healthy, `waitIdle=VK_SUCCESS`) and the consumer's
+   *next* acquire `vkQueueSubmit` returned `VK_ERROR_DEVICE_LOST` in 0 ms (already
+   dead, not a hung wait).
 
-**Conclusion:** the remaining blocker is a **cross-device render-target / compression
-handoff** problem, orthogonal to synchronization. The render-finished semaphore is
-necessary infrastructure for a correct zero-copy pipeline, but it is not what was
-losing the device.
+### The decisive experiment (`GZ_O3DE_NO_RESIZE`)
+Forcing the live path to keep rendering at the already-created image size (never
+recreate → consumer imports exactly once) ran **2000 frames with zero device loss**.
+That single experiment overturned the compression theory (the live, compressed,
+colour-attachment image samples cleanly across devices) and pinned the cause to the
+resize / re-import churn.
 
-### Why the static probe works but the live path does not
-The static image is written **once** by a plain transfer (`UpdateImageContents`),
-leaving it in an ordinary `SHADER_READ_ONLY_OPTIMAL`, uncompressed, cross-device-
-samplable state. The live image is a **pipeline colour-attachment output**; its
-on-device representation (compression metadata / render-target state) is not valid for
-a *different* `VkDevice` to sample, regardless of layout barriers or semaphores.
+### Why the static probe worked all along
+The static probe creates its image once and never recreates it, so the consumer
+imports once and never re-imports — it simply never hit the use-after-free. (It is also
+written by a plain `UpdateImageContents`, which is why the compression theory looked
+plausible — but compression was a red herring; a *live, compressed* image at a fixed
+size samples fine, per the `NO_RESIZE` run.)
+
+## The fix
+
+1. **Consumer retires old imports** (`O3deCamera`): on a re-import, push the old
+   `O3deVkImportedImage` onto a `retiredImports` list instead of destroying it; free
+   the whole list only when the camera is destroyed. Qt's in-flight frame keeps a live
+   VkImage. (Resizes are rare, so the retained memory is bounded and cheap.)
+2. **#26 render-finished timeline semaphore** (above): the producer signals it after
+   each frame's render into the shared image; the consumer waits on the per-frame value
+   before sampling — the correct cross-device "frame ready" edge.
+3. **Image created in setup, not deferred:** the exportable image must exist before the
+   consumer builds its Qt texture node (a deferred-creation attempt crashed in
+   `QRhi::endFrame` because Qt presented a null VkImage). The first real frame still
+   recreates it at the camera size — now survivable thanks to fix 1 — and settles the
+   new pipeline's MSAA shader variants before the consumer samples it.
+
+**Result:** ~2000 frames, ~60-100 fps, multiple resizes (gen 1→2→3), the #26 shared
+timeline counter advancing in lockstep every frame, zero device loss / crash.
 
 ## Hypotheses tested and eliminated (systematic debugging)
 
@@ -109,28 +139,30 @@ This session (the decisive ones):
 | 8 | Missing render-finished semaphore (the *previous* "root cause") | Implement #26 (timeline signal + consumer timeline wait); verify the shared counter | ✅ **Disproven as the cause.** Semaphore proven working (shared counter advances 0,1,2; waits satisfiable) — yet the device loss persists unchanged. |
 | 9 | Consumer layout transition (`TRANSFER_SRC→` or `COLOR_ATTACHMENT→` `SHADER_READ`) on an image whose Qt-side layout doesn't match | Switch the consumer to a no-op `SHADER_READ→SHADER_READ` barrier (exactly the proven static-probe acquire) | ✅ Ruled out — both the real transition and the no-op barrier fail identically. |
 | 10 | EXTERNAL queue-family acquire, in combination with the semaphore | `GZ_O3DE_NO_QFOT=1` **+** `GZ_O3DE_INTEROP_SEM=1` (never tested together before) | ✅ Ruled out — fails identically. |
-| 11 | Consumer submit hangs (sync/TDR) vs. fails immediately (invalid op) | Time the submit + fence wait | ✅ **Decisive:** `submit=0 ms`, `VkResult=-4`. Immediate failure → device already dead → not our wait. |
-| 12 | What survives: cross-device sampling of a **compressed colour-attachment render target** (live) vs a **plain** write (static probe) | Static probe (plain `UpdateImageContents`) samples forever; live (pipeline colour attachment) dies on first Qt sample | ⛳ **Remaining root cause** (not yet fixed — see below). |
+| 11 | Consumer submit hangs (sync/TDR) vs. fails immediately (invalid op) | Time the submit + fence wait | ✅ **Decisive (mechanism):** `submit=0 ms`, `VkResult=-4`. Immediate failure → device already dead → not our wait. |
+| 12 | Cross-device sampling of a **compressed colour-attachment render target** is itself the problem | Hypothesised; tested by #13 | ❌ **Disproven** by #13 — a live compressed image at a fixed size samples fine for 2000+ frames. Compression was a red herring. |
+| 13 | The **resize / re-import churn** is the cause (not the live render) | `GZ_O3DE_NO_RESIZE=1` — keep rendering at the created size, never recreate, consumer imports once | ✅ **DECISIVE:** 2000 frames, zero device loss. Isolates the cause to resize/re-import (which was confounded with "live render" because every failing run resized 512→window on frame 1). |
+| 14 | Just create the image lazily at the live size (avoid the resize) | Defer image+pipeline creation to the first frame | ❌ Wrong fix — Qt builds its texture node before the first frame and presents a **null VkImage** → SIGSEGV in `QRhi::endFrame`. The image must exist in setup. |
+| 15 | The re-import **frees the old VkImage under Qt's in-flight frame** (use-after-free) | Consumer **retires** old imports (keep alive, free at camera destruction) instead of freeing on re-import | ✅ **FIX.** ~2000 frames across gen 1→2→3 resizes, zero device loss. |
 
-Net: synchronization (#26) is implemented and works; the device loss is the
-render-target/compression handoff (hypothesis 12).
+Net: the device loss was a consumer-side use-after-free on resize (hypothesis 15);
+the #26 semaphore (8) is required infrastructure but was never the trigger; compression
+(12) was a red herring disproven by the `NO_RESIZE` experiment (13).
 
-## Candidate fixes for the remaining blocker (not yet attempted)
+## Resolution (landed)
 
-1. **One-copy plain handoff (most likely to work):** render the scene into Atom's
-   normal pipeline target (same-device, compressed — fine), then GPU-copy it into the
-   shared exportable image as a *plain* image each frame — the exact state the static
-   probe proves Qt can sample. Still GPU-only (no CPU readback); one extra GPU copy.
-   Keeps the #26 semaphore for the producer→consumer "frame ready" edge.
-2. **Decompress in place (true zero-copy):** keep rendering directly into the shared
-   image but force a producer-side decompress/resolve to a cross-device-samplable
-   state (transition to `GENERAL`, or disable DCC on the image). Preserves zero-copy
-   but uncertain: depends on whether the driver makes the decompressed result visible
-   to a separate `VkDevice`.
+The live zero-copy path works (see "The fix" above): consumer retires old imports +
+#26 timeline semaphore + image created in setup (recreated/settled on resize). Verified
+~2000 frames across multiple resizes with zero device loss.
 
-A correct zero-copy design likely also needs the **reverse** edge (consumer→producer
-"done sampling") or double-buffering, so the producer never overwrites a frame Qt is
-still reading — out of scope for the single shared image used today.
+Possible future hardening (not required for the working path):
+- **Reverse edge / double-buffering:** today a single shared image is reused; the
+  producer host-syncs and the consumer waits on the render-finished semaphore, which
+  serialises in practice. A fully pipelined design would add a consumer→producer
+  "done sampling" edge or ping-pong buffers so the producer never overwrites a frame
+  Qt is still reading without a host-sync.
+- **Bounded retired-import reclaim:** free retired consumer imports a few frames after
+  the resize (Qt is surely done) rather than holding them until camera destruction.
 
 ## #26 — as implemented (reference)
 
@@ -162,6 +194,10 @@ the eventual plain-handoff make this moot.
 
 - `GZ_O3DE_INTEROP_SEM=1` — advertise + wait on the render-finished timeline semaphore
   (off → producer still signals + logs, consumer does not wait).
+- `GZ_O3DE_NO_RESIZE=1` — keep the live path rendering at the first created size, never
+  recreating the exportable image (`O3deBackend.cc::RenderOneFrame`). The experiment
+  that isolated the resize/re-import as the device-loss cause; also a handy stress
+  toggle.
 - `GZ_O3DE_NO_QFOT=1` — consumer acquire uses a plain layout barrier instead of the
   EXTERNAL queue-family ownership transfer (`O3deVkImport.cc`).
 - `GZ_O3DE_NO_IDLE_TICK=1` — render thread does not tick Atom while idle on the live
@@ -172,9 +208,9 @@ the eventual plain-handoff make this moot.
   `VK_LAYER_ENABLES=VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT`
   (layer at `vendor/o3de/build/linux/bin/profile/`).
 
-## Fallback (the plan's primary path)
+## Fallback (still available)
 
-Drive the **live** scene through the proven `O3deRenderTarget::Copy()` /
-`AttachmentReadback` path (CPU readback → Qt `glTexSubImage2D`). Stable, slower, already
-implemented. Native zero-copy then remains a clean follow-up gated on the
-render-target-handoff fix above (not on #26, which is done).
+The CPU-readback path (`O3deRenderTarget::Copy()` / `AttachmentReadback` → Qt
+`glTexSubImage2D`) remains the default when the patched gz-gui / Vulkan GUI backend /
+`GZ_O3DE_INTEROP*` are not in play. The native zero-copy path above is now the faster
+alternative when they are.

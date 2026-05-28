@@ -67,6 +67,11 @@ class O3deCamera::O3deCameraInterop
   public: uint64_t importedGeneration = 0u;  //!< Producer image gen we imported.
   public: uint64_t semaphoreWaitValue = 0u;  //!< Timeline value to wait on (#26).
   public: int warnCount = 0;           //!< Not-ready warnings emitted (rate cap).
+  /// \brief Previous imports kept alive after a re-import (producer resize). Qt
+  /// may still have an in-flight frame sampling the old VkImage; freeing it now
+  /// loses Qt's device. Freed only when the camera is destroyed. Resizes are
+  /// rare, so this bounded retention is cheap.
+  public: std::vector<O3deVkImportedImage> retiredImports;
 #endif
 };
 
@@ -79,15 +84,21 @@ O3deCamera::O3deCamera()
 O3deCamera::~O3deCamera()
 {
 #if defined(GZ_O3DE_INTEROP_BUILD)
-  // Only destroy the import if Qt's device is still alive and unchanged from the
-  // one we imported on; otherwise the VkImage already died with that device and
+  // Only destroy imports if Qt's device is still alive and unchanged from the one
+  // we imported on; otherwise the VkImage already died with that device and
   // vkDestroyImage on the stale handle would abort (see RenderTextureMetalId).
-  if (this->interop && this->interop->imported)
+  // Frees the current import plus any retired (resize) imports kept alive for Qt.
+  if (this->interop)
   {
     auto *eng = O3deRenderEngine::Instance();
     auto dev = eng ? static_cast<VkDevice>(eng->QtVulkanDevice()) : nullptr;
     if (dev && dev == this->interop->ctx.device)
-      O3deVkDestroyImported(this->interop->ctx, &this->interop->img);
+    {
+      if (this->interop->imported)
+        O3deVkDestroyImported(this->interop->ctx, &this->interop->img);
+      for (auto &old : this->interop->retiredImports)
+        O3deVkDestroyImported(this->interop->ctx, &old);
+    }
   }
 #endif
 }
@@ -139,14 +150,16 @@ void O3deCamera::RenderTextureMetalId(void *_textureIdPtr) const
   {
     if (st.imported)
     {
-      // Destroy the old import only if Qt's device is still the one we imported
-      // on. If Qt lost/recreated its device (e.g. after a device-loss), st.ctx
-      // is stale and the old VkImage died with that device; calling
-      // vkDestroyImage on the dead handle aborts ("Invalid device"). Drop it.
+      // RETIRE the old import rather than freeing it now: Qt may still have an
+      // in-flight frame sampling the old VkImage, and freeing it out from under
+      // that frame loses Qt's device -- this was the live-resize device loss (the
+      // producer recreates the image at the camera size on the first frame). Kept
+      // alive until the camera is destroyed (resizes are rare). Only retire if Qt's
+      // device is unchanged; if Qt recreated its device after a loss, st.ctx is
+      // stale and the old VkImage died with it -- just drop the handle.
       if (st.ctx.device == dev)
-        O3deVkDestroyImported(st.ctx, &st.img);
-      else
-        st.img = O3deVkImportedImage{};
+        st.retiredImports.push_back(st.img);
+      st.img = O3deVkImportedImage{};
       st.imported = false;
     }
     st.ctx.instance = inst;

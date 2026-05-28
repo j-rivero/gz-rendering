@@ -279,7 +279,12 @@ bool O3deVkAcquireFromProducer(const O3deVkDeviceContext &_ctx,
     ok = VkOk(subRes, "vkQueueSubmit");
     if (ok)
       vkWaitForFences(_ctx.device, 1u, &fence, VK_TRUE, UINT64_MAX);
-    if (_img.semaphore != VK_NULL_HANDLE)
+    // Periodic acquire log (first few + every 100th) + always on a submit failure:
+    // the #26 wait value vs the shared timeline counter (counter advancing in
+    // lockstep is the cross-device-sync working) and the submit result.
+    static int acquireCount = 0;
+    if (_img.semaphore != VK_NULL_HANDLE &&
+        (acquireCount++ < 3 || acquireCount % 100 == 0 || subRes != VK_SUCCESS))
       std::fprintf(stderr,
           "[gz-o3de] vkimport: acquire wait=%llu shared-counter=%llu submit=%d\n",
           static_cast<unsigned long long>(_waitValue),

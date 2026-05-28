@@ -516,15 +516,21 @@ bool O3deBackend::Impl::SetupScene(uint32_t _width, uint32_t _height)
         AZ::Name("MainCamera"), AZ::RPI::View::UsageCamera);
     this->scene->Activate();
     AZ::RPI::RPISystemInterface::Get()->RegisterScene(this->scene);
+    // Create the exportable image + pipeline at the bootstrap placeholder size so
+    // the consumer has an image to import the moment it builds its texture node
+    // (deferring until the first frame races Qt, which then presents a null
+    // VkImage and crashes). The first real frame recreates it at the camera size;
+    // that resize is made safe by the consumer retiring (not immediately freeing)
+    // old imports -- the earlier device loss was Qt sampling an import we freed
+    // out from under its in-flight frame.
     if (!this->RecreateInteropPipeline(_width, _height))
       return false;
     // #26: create the render-finished fence + the scope that signals it after the
     // per-frame render-into, then connect the RHISystem bus so the scope is
     // imported each rendered frame (OnFramePrepare). interopSemaphoreReady --
     // env-gated by GZ_O3DE_INTEROP_SEM -- decides whether the exported semaphore
-    // FD is advertised to the consumer yet (Step B) or only signalled+logged
-    // (Step A bring-up). Failure here is non-fatal: the live path still renders
-    // (host-sync), just without the cross-device fence.
+    // FD is advertised to the consumer. Failure here is non-fatal: the live path
+    // still renders (host-sync), just without the cross-device fence.
     if (this->EnsureInteropSemaphore() && this->EnsureFenceSignalScope())
     {
       this->interopSemaphoreReady =
@@ -1705,15 +1711,24 @@ bool O3deBackend::Impl::RenderOneFrame()
 #if defined(GZ_O3DE_INTEROP_BUILD)
   if (this->interopLive)
   {
-    std::fprintf(stderr, "[gz-o3de] interop live frame %d: START\n", frameNum);
     // Stage B live render: (re)size the exportable image + its pipeline to the
     // requested logical resolution (SSAA is forced 1x on this path), render the
     // scene straight into the image, then host-sync so the consumer samples a
     // complete frame. No SSAA downsample, no CPU readback.
-    const uint32_t lw =
+    uint32_t lw =
         (this->reqWidth > 0u) ? this->reqWidth : this->interopWidth;
-    const uint32_t lh =
+    uint32_t lh =
         (this->reqHeight > 0u) ? this->reqHeight : this->interopHeight;
+    // ISOLATION (GZ_O3DE_NO_RESIZE): keep rendering at the already-created image
+    // size, so the exportable image is never recreated (gen stays 1) and the
+    // consumer imports it exactly once. Distinguishes a resize / re-import bug
+    // (works with this set) from a live-render / compression bug (still fails).
+    if (this->interopImageReady && this->interopWidth > 0u &&
+        std::getenv("GZ_O3DE_NO_RESIZE"))
+    {
+      lw = this->interopWidth;
+      lh = this->interopHeight;
+    }
     if (lw == 0u || lh == 0u)
       return false;
     if (lw != this->interopWidth || lh != this->interopHeight || !this->pipeline)
@@ -1722,6 +1737,21 @@ bool O3deBackend::Impl::RenderOneFrame()
         return false;
       this->outputWidth = lw;
       this->outputHeight = lh;
+      // Settle the freshly (re)created pipeline's pass + MSAA shader-variant builds
+      // before rendering the frame the consumer will sample (they self-pump on this
+      // thread). Deferred here from SetupScene so the exportable image is created
+      // ONCE, at the real camera size -- the first frame creates it instead of an
+      // initial placeholder->live resize that would recreate it under the consumer.
+      this->ApplyCamera(lw, lh);
+      this->pipeline->AddToRenderTick();
+      for (int i = 0; i < 5; ++i)
+      {
+        this->SubmitPrimitives();
+        this->app->PumpSystemEventLoopUntilEmpty();
+        this->app->TickSystem();
+        this->app->Tick();
+      }
+      this->pipeline->RemoveFromRenderTick();
     }
     this->ApplyCamera(lw, lh);
 
@@ -1778,11 +1808,12 @@ bool O3deBackend::Impl::RenderOneFrame()
       }
     }
 
+    // Periodic liveness log (first few frames + every 20th, see logThis) + always
+    // on a host-sync failure: frame rate, generation, the #26 fence value consumer
+    // waits on, and vkDeviceWaitIdle's result (a VK_ERROR_DEVICE_LOST here would
+    // flag a producer-side fault).
+    if (logThis || waitResult != VK_SUCCESS || !fenceSignalled)
     {
-      // DEBUG (interop bring-up): log EVERY live frame + the host-sync result so
-      // we can see whether the producer keeps rendering past frame 3 and whether
-      // vkDeviceWaitIdle ever returns VK_ERROR_DEVICE_LOST (-4) -- the smoking gun
-      // for a GPU TDR vs. a consumer-side timeout. Trim back to logThis later.
       const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
           std::chrono::steady_clock::now() - frameStart).count();
       std::fprintf(stderr,
@@ -1794,7 +1825,6 @@ bool O3deBackend::Impl::RenderOneFrame()
           fenceSignalled ? "Signaled" : "Reset",
           static_cast<unsigned long long>(signaledValue));
     }
-    (void)logThis;
 
     {
       std::lock_guard<std::mutex> lock(this->mutex);
