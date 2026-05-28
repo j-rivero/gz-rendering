@@ -141,8 +141,11 @@ target_link_libraries(${o3de_target}
 if (GZ_O3DE_INTEROP)
   target_compile_definitions(${o3de_target} PRIVATE GZ_O3DE_INTEROP_BUILD=1)
   # O3deGlInterop.cc imports the exported Vulkan image into a GL texture via a
-  # private EGL/desktop-GL context.
-  target_link_libraries(${o3de_target} PRIVATE EGL GL)
+  # private EGL/desktop-GL context; O3deVkInterop.cc imports it into a second,
+  # independent VkDevice (the Strategy-2 Qt-device stand-in) via the Vulkan
+  # loader. Both are ordinary gz-rendering TUs reaching the backend through the
+  # plain-C++ O3deBackend interface.
+  target_link_libraries(${o3de_target} PRIVATE EGL GL vulkan)
 endif()
 
 # Find the O3DE shared libs at runtime (PoC: point straight at the build tree).

@@ -93,6 +93,7 @@
 
 #include "O3deBackend.hh"
 #include "O3deGlInterop.hh"  // plain-types declaration; no GL headers leak here
+#include "O3deVkInterop.hh"  // plain-types declaration; no Vulkan headers leak here
 
 namespace gz
 {
@@ -481,6 +482,14 @@ bool O3deBackend::Impl::SetupScene(uint32_t _width, uint32_t _height)
     // here (render thread, post-bootstrap) so the GL context lifetime is local.
     if (std::getenv("GZ_O3DE_INTEROP_GLTEST"))
       RunO3deInteropGlSelfTest();
+
+    // M4 "Strategy 2": optional headless Vulkan->Vulkan self-test. Off by default
+    // (GZ_O3DE_INTEROP_VKTEST) -- it creates its own VkInstance/VkDevice (the
+    // Qt-device stand-in), imports the exported FD via VkImportMemoryFdInfoKHR,
+    // and verifies the gradient round-trips. This is the path gz-gui's
+    // MinimalSceneRhiVulkan would use on Qt's QRhi device.
+    if (std::getenv("GZ_O3DE_INTEROP_VKTEST"))
+      RunO3deInteropVkSelfTest();
   }
 
   return true;

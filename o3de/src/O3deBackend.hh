@@ -46,12 +46,14 @@ namespace gz
       float color[4] = {0.8f, 0.8f, 0.8f, 1.0f}; //!< RGBA diffuse color.
     };
 
-    /// \brief Everything a GL-context thread needs to import the backend's
-    /// exportable Vulkan colour image as a GL texture (M4 zero-copy interop).
-    /// Plain data: the FD is an OS handle, no Vulkan/GL types leak through.
-    /// The image is `R8G8B8A8_UNORM`, optimal tiling. The FD refers to the whole
-    /// VMA memory block (\ref allocationSize); the image starts at
-    /// \ref allocationOffset within it. The caller owns \ref fd and must close it.
+    /// \brief Everything an importing graphics context needs to alias the
+    /// backend's exportable Vulkan colour image (M4 zero-copy interop). Consumed
+    /// by both the GL importer (O3deGlInterop.cc) and the Vulkan->Vulkan importer
+    /// (O3deVkInterop.cc). Plain data: the FDs are OS handles, no Vulkan/GL types
+    /// leak through. The image is `R8G8B8A8_UNORM`, optimal tiling. \ref fd refers
+    /// to the whole VMA memory block (\ref allocationSize); the image starts at
+    /// \ref allocationOffset within it. The caller owns \ref fd / \ref semaphoreFd
+    /// and must close (or transfer ownership of) them.
     struct O3deInteropImport
     {
       int fd = -1;                  //!< dup'd OPAQUE_FD for the backing memory.
@@ -59,6 +61,14 @@ namespace gz
       uint32_t height = 0u;         //!< Image height in pixels.
       uint64_t allocationSize = 0u; //!< Size of the whole memory block the FD maps.
       uint64_t allocationOffset = 0u; //!< Byte offset of the image in that block.
+
+      /// \brief dup'd OPAQUE_FD for the render-finished semaphore, or -1 if the
+      /// producer does not export one yet. A static, uploaded-once image needs
+      /// no synchronisation (the GL self-test confirmed this); a live
+      /// render-into-shared-image target does -- exporting this semaphore is the
+      /// M4 producer-side "semaphore sync" work that remains. A Vulkan importer
+      /// waits on it (VkImportSemaphoreFdInfoKHR) before sampling.
+      int semaphoreFd = -1;
     };
 
     /// \brief Camera pose + projection for one frame, in gz world coordinates.

@@ -95,8 +95,28 @@ namespace gz
       /// \return Pointer to the render engine
       public: static O3deRenderEngine *Instance();
 
+      /// \brief Qt's raw Vulkan handles, injected via engine params when gz-gui
+      /// runs its Vulkan RHI backend (the "vulkan_instance"/"vulkan_device"/
+      /// "vulkan_physical_device"/"vulkan_graphics_queue" keys set in
+      /// MinimalScene.cc). Stored/returned as opaque handles (the real types are
+      /// VkInstance/VkDevice/VkPhysicalDevice/VkQueue, all dispatchable-handle
+      /// pointers) so this public header stays free of Vulkan types and of the
+      /// GZ_RENDERING_HAVE_VULKAN macro. O3deCamera casts them to import Atom's
+      /// exported image onto Qt's device for native Vulkan->Vulkan display. All
+      /// null when not on the Vulkan path.
+      public: void *QtVulkanInstance() const;
+      public: void *QtVulkanPhysicalDevice() const;
+      public: void *QtVulkanDevice() const;
+      public: void *QtVulkanGraphicsQueue() const;
+
       /// \brief A list of scenes managed by the engine
       private: O3deSceneStorePtr scenes;
+
+      /// \brief Qt's injected raw Vulkan handles (see accessors above).
+      private: void *qtVkInstance{nullptr};
+      private: void *qtVkPhysicalDevice{nullptr};
+      private: void *qtVkDevice{nullptr};
+      private: void *qtVkGraphicsQueue{nullptr};
 
       /// \brief Singleton setup
       private: friend class gz::common::SingletonT<O3deRenderEngine>;

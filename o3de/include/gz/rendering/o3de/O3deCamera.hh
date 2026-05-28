@@ -17,6 +17,8 @@
 #ifndef GZ_RENDERING_O3DE_O3DECAMERA_HH_
 #define GZ_RENDERING_O3DE_O3DECAMERA_HH_
 
+#include <memory>
+
 #include "gz/rendering/base/BaseCamera.hh"
 #include "gz/rendering/o3de/O3deRenderTypes.hh"
 #include "gz/rendering/o3de/O3deSensor.hh"
@@ -45,6 +47,22 @@ namespace gz
       // Documentation inherited.
       public: virtual void Render() override;
 
+      /// \brief Native Vulkan handle for the zero-copy display path. Despite the
+      /// "Metal" name (the API is shared with macOS), for the Vulkan backend
+      /// this returns a VkImage -- created on Qt's injected VkDevice and aliasing
+      /// Atom's exported colour image -- that gz-gui's MinimalSceneRhiVulkan
+      /// hands to QSGVulkanTexture::fromNative(). No-op unless built with
+      /// GZ_O3DE_INTEROP and gz-gui injected its Vulkan device.
+      /// \param[out] _textureIdPtr A VkImage* to receive the handle.
+      public: virtual void RenderTextureMetalId(void *_textureIdPtr) const
+                  override;
+
+      /// \brief Ensure the imported image is in a layout Qt can sample
+      /// (SHADER_READ_ONLY_OPTIMAL), acquiring it from the producer and waiting
+      /// on the render-finished semaphore when one is exported. Called by
+      /// MinimalSceneRhiVulkan before sampling.
+      public: virtual void PrepareForExternalSampling() override;
+
       // Documentation inherited.
       protected: virtual RenderTargetPtr RenderTarget() const override;
 
@@ -56,6 +74,13 @@ namespace gz
 
       /// \brief Pointer to the render target
       protected: O3deRenderTargetPtr renderTexture;
+
+      /// \brief Holds the VkImage imported onto Qt's device for the zero-copy
+      /// path, plus its backing memory/semaphore and the device context. Opaque
+      /// here so this public header carries no Vulkan types; defined in the .cc.
+      /// Lazily populated on the first RenderTextureMetalId() call.
+      private: class O3deCameraInterop;
+      private: mutable std::unique_ptr<O3deCameraInterop> interop;
 
       /// \brief Make the scene our friend so it can create cameras
       private: friend class O3deScene;

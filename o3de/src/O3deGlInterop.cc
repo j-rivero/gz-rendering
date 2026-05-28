@@ -236,6 +236,32 @@ bool RunO3deInteropGlSelfTest()
   std::fprintf(stderr, "[gz-o3de] gltest: %s -- Vulkan->GL zero-copy import %s\n",
       match ? "PASS" : "FAIL", match ? "verified" : "did NOT verify");
 
+  // Optional: dump the texels we read *through the GL import* to a PPM, so the
+  // result of the zero-copy path is a viewable artifact (no screenshot needed).
+  if (const char *dumpPath = std::getenv("GZ_O3DE_INTEROP_GLDUMP"))
+  {
+    if (!pixels.empty())
+    {
+      if (FILE *fp = std::fopen(dumpPath, "wb"))
+      {
+        std::fprintf(fp, "P6\n%u %u\n255\n", import.width, import.height);
+        std::vector<uint8_t> rgb(static_cast<size_t>(import.width) *
+            import.height * 3u);
+        for (size_t i = 0, n = static_cast<size_t>(import.width) * import.height;
+            i < n; ++i)
+        {
+          rgb[i * 3u + 0u] = pixels[i * 4u + 0u];
+          rgb[i * 3u + 1u] = pixels[i * 4u + 1u];
+          rgb[i * 3u + 2u] = pixels[i * 4u + 2u];
+        }
+        std::fwrite(rgb.data(), 1u, rgb.size(), fp);
+        std::fclose(fp);
+        std::fprintf(stderr,
+            "[gz-o3de] gltest: wrote GL-imported image to %s\n", dumpPath);
+      }
+    }
+  }
+
   // ---- Teardown ----
   eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
   if (surf != EGL_NO_SURFACE)

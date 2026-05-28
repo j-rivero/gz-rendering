@@ -166,6 +166,20 @@ endif()
 # Vulkan SDK and add_subdirectory(vendor/o3de) for the vendored engine.
 if (BUILD_O3DE)
   set(GZ_RENDERING_HAVE_O3DE TRUE)
+  # The O3DE/Atom backend renders with Vulkan and, with GZ_O3DE_INTEROP, shares
+  # its rendered image with a Vulkan consumer (gz-gui). Enable the Vulkan struct
+  # surface (RenderEngineVulkanExternalDeviceStructs.hh, which gz-gui's Vulkan
+  # display path includes) independently of the OgreNext-Vulkan detection above,
+  # as long as plain Vulkan headers are present. Scoped to BUILD_O3DE so it does
+  # not turn on ogre2's Vulkan code paths.
+  if (NOT GZ_RENDERING_HAVE_VULKAN)
+    find_path(vulkan_INCLUDE vulkan/vulkan_core.h)
+    if (vulkan_INCLUDE)
+      message(STATUS "BUILD_O3DE: enabling GZ_RENDERING_HAVE_VULKAN "
+                     "(vulkan headers found)")
+      set(GZ_RENDERING_HAVE_VULKAN TRUE)
+    endif()
+  endif()
 endif()
 
 # Plugin install dirs

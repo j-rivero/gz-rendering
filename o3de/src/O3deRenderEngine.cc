@@ -14,6 +14,8 @@
  * limitations under the License.
  *
  */
+#include <cstdint>
+
 #include <gz/common/Console.hh>
 #include <gz/common/SingletonT.hh>
 #include <gz/plugin/Register.hh>
@@ -79,8 +81,32 @@ GraphicsAPI O3deRenderEngine::GraphicsAPI() const
 
 //////////////////////////////////////////////////
 bool O3deRenderEngine::LoadImpl(
-    const std::map<std::string, std::string> &/*_params*/)
+    const std::map<std::string, std::string> &_params)
 {
+  // When gz-gui runs its Vulkan RHI backend it injects Qt's raw Vulkan handles
+  // as decimal uintptr_t strings. We keep them as opaque pointers; O3deCamera
+  // casts them to import Atom's exported colour image onto Qt's device for
+  // native Vulkan->Vulkan display. Absent these (the OpenGL backend), the engine
+  // falls back to the CPU-readback Copy() path.
+  auto toHandle = [&_params](const char *_key) -> void *
+  {
+    auto it = _params.find(_key);
+    if (it == _params.end())
+      return nullptr;
+    return reinterpret_cast<void *>(
+        static_cast<uintptr_t>(std::stoull(it->second)));
+  };
+  if (_params.count("vulkan"))
+  {
+    this->qtVkInstance = toHandle("vulkan_instance");
+    this->qtVkPhysicalDevice = toHandle("vulkan_physical_device");
+    this->qtVkDevice = toHandle("vulkan_device");
+    this->qtVkGraphicsQueue = toHandle("vulkan_graphics_queue");
+    gzmsg << "[gz-o3de] Vulkan backend: Qt device=" << this->qtVkDevice
+          << " physicalDevice=" << this->qtVkPhysicalDevice
+          << " queue=" << this->qtVkGraphicsQueue << std::endl;
+  }
+
   // Bring up the embedded O3DE runtime once. This hosts an AzGameFramework
   // GameApplication, loads the Atom gems and creates the offscreen render
   // pipeline. It is never torn down for the life of the process.
@@ -90,6 +116,30 @@ bool O3deRenderEngine::LoadImpl(
     return false;
   }
   return true;
+}
+
+//////////////////////////////////////////////////
+void *O3deRenderEngine::QtVulkanInstance() const
+{
+  return this->qtVkInstance;
+}
+
+//////////////////////////////////////////////////
+void *O3deRenderEngine::QtVulkanPhysicalDevice() const
+{
+  return this->qtVkPhysicalDevice;
+}
+
+//////////////////////////////////////////////////
+void *O3deRenderEngine::QtVulkanDevice() const
+{
+  return this->qtVkDevice;
+}
+
+//////////////////////////////////////////////////
+void *O3deRenderEngine::QtVulkanGraphicsQueue() const
+{
+  return this->qtVkGraphicsQueue;
 }
 
 //////////////////////////////////////////////////
