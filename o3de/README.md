@@ -114,6 +114,14 @@ O3DE's `MinimalProject` template):
    `libxcb-xkb-dev libxcb-xfixes0-dev libxcb-xinput-dev libxcb-keysyms1-dev`
    `libxcb-image0-dev libxkbcommon-x11-dev`.
 
+5. **Patched gz-gui (only for the native Vulkan→Vulkan display).** The default
+   CPU-readback display path works with upstream gz-gui. The experimental
+   zero-copy path — Atom renders on its own VkDevice and gz-gui imports the image
+   onto Qt's Vulkan-RHI device — needs a patched gz-gui that runs Qt on the
+   Vulkan RHI and injects its device handles into `MinimalScene`:
+   <https://github.com/j-rivero/gz-gui>, branch **`o3de_vulkan_interop`**
+   (branched off gz-gui `main`).
+
 ### Building the O3DE prerequisite (one-time)
 
 ```bash
@@ -212,6 +220,12 @@ export DISPLAY=:1
 #                          into a GL texture via its FD on a private EGL context,
 #                          read back and compared. Logs "gltest: PASS/FAIL". Proves
 #                          the import/tiling path without gz-gui or a visible window.
+#   GZ_O3DE_INTEROP_VKTEST=1  (with GZ_O3DE_INTEROP=1) the Vulkan->Vulkan sibling
+#                          of GLTEST: imports the exported FD onto a second,
+#                          private VkDevice and verifies a bit-exact gradient
+#                          readback. Logs "vktest: PASS/FAIL". Proves the
+#                          import-onto-another-VkDevice path that gz-gui's native
+#                          display uses, without gz-gui or a visible window.
 
 GZ_O3DE_DEMO_SHAPES=1 gz gui -c examples/config/scene3d.config   # <engine>o3de</engine>
 ```
@@ -219,11 +233,33 @@ GZ_O3DE_DEMO_SHAPES=1 gz gui -c examples/config/scene3d.config   # <engine>o3de<
 `gz sim` / `gz gui` select this engine when the rendering config requests
 `<engine>o3de</engine>` (or via `--render-engine o3de`).
 
+### Native Vulkan→Vulkan display (zero-copy, experimental)
+
+With the patched gz-gui (prerequisite 5) the rendered image is shared with the
+GUI zero-copy: Atom renders on its own VkDevice, exports the colour image over an
+OPAQUE_FD, and gz-gui imports it onto Qt's Vulkan-RHI device and samples it
+directly — no CPU readback.
+
+```bash
+# Point the gz tool at the patched gz-gui (colcon does not export this, so the
+# tool otherwise falls back to the system gz-gui):
+export GZ_CONFIG_PATH=<gz-gui-prefix>/share/gz
+export GZ_GUI_RENDER_ENGINE_GUI_API_BACKEND=vulkan   # run Qt on the Vulkan RHI
+export GZ_O3DE_INTEROP=1                              # export the shared image
+gz gui -c <config-with-engine-o3de>
+```
+
+Success shows `imported Atom image onto Qt's VkDevice ... native Vulkan->Vulkan
+display` in the log. Today the shared image is a static probe; rendering the live
+scene into it is the next step.
+
 ## Known limitations
 
-* **Performance:** rendering goes through gz-gui's CPU-readback fallback, which
-  gz-gui itself warns is slow. Acceptable for the PoC; a zero-copy Vulkan↔GL
-  path is future work.
+* **Performance:** the default display path goes through gz-gui's CPU-readback
+  fallback, which gz-gui itself warns is slow. An experimental zero-copy
+  Vulkan→Vulkan path now exists (see *Native Vulkan→Vulkan display* above and
+  prerequisite 5); it currently shares a static probe image, with live-scene
+  render-into still to come.
 * **Primitives only:** box / sphere / cylinder / cone via AuxGeom with flat
   diffuse colour. No meshes, textures, PBR materials, lights or shadows yet.
 * **Teardown:** the O3DE/Vulkan runtime cannot be cleanly torn down at process
