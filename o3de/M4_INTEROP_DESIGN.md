@@ -1,6 +1,18 @@
-# M4 — zero-copy Vulkan↔GL interop (design & feasibility)
+# M4 — zero-copy Vulkan interop (design & feasibility)
 
-**Status: steps 1–2 (export + GL import) DONE & verified; steps 3–4 not started.**
+> **Update (2026-05) — the shipping path pivoted to native Vulkan→Vulkan.** The
+> design below targets Vulkan→**GL** (sharing Atom's image with Qt's *GL* context).
+> The actual path realized runs Qt on its **Vulkan** RHI and imports Atom's image
+> onto Qt's `VkDevice` (`QSGVulkanTexture::fromNative`) — no GL. The foundation
+> (FD export, import-onto-another-VkDevice) and the static-probe display are done
+> and verified; the **live** scene now renders into the shared image (4× MSAA), but
+> the live path is blocked on a cross-device render-finished semaphore. See
+> **[docs/zero-copy-interop-findings.md](docs/zero-copy-interop-findings.md)** for
+> the Phase-2 root-cause analysis + the confirmed-feasible semaphore design, and
+> **[docs/task-tracker.md](docs/task-tracker.md)** for the #20–#26 task breakdown.
+> The Vulkan↔GL design is retained below for reference.
+
+**Status (GL path): steps 1–2 (export + GL import) DONE & verified; steps 3–4 not pursued (pivoted to native V→V).**
 This is the post-PoC performance milestone from
 [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md). It records the validated design
 plus the implemented/verified pieces: with `GZ_O3DE_INTEROP=ON` (build, **now the

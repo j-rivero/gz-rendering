@@ -250,16 +250,23 @@ gz gui -c <config-with-engine-o3de>
 ```
 
 Success shows `imported Atom image onto Qt's VkDevice ... native Vulkan->Vulkan
-display` in the log. Today the shared image is a static probe; rendering the live
-scene into it is the next step.
+display` in the log. The **static probe** image displays correctly (Phase 1). With
+`GZ_O3DE_INTEROP_LIVE=1` the **live scene** also renders into the shared image (4×
+MSAA), but that path is **not yet stable**: it lacks a cross-device render-finished
+semaphore, so the GPU is lost (TDR) a few seconds in. Root cause and the
+confirmed-feasible fix are in
+[docs/zero-copy-interop-findings.md](docs/zero-copy-interop-findings.md); the task
+breakdown is in [docs/task-tracker.md](docs/task-tracker.md).
 
 ## Known limitations
 
 * **Performance:** the default display path goes through gz-gui's CPU-readback
   fallback, which gz-gui itself warns is slow. An experimental zero-copy
   Vulkan→Vulkan path now exists (see *Native Vulkan→Vulkan display* above and
-  prerequisite 5); it currently shares a static probe image, with live-scene
-  render-into still to come.
+  prerequisite 5). The static-probe image displays; the live-scene render-into
+  works but is blocked on a cross-device render-finished semaphore (the GPU is
+  lost a few seconds in without it) — see
+  [docs/zero-copy-interop-findings.md](docs/zero-copy-interop-findings.md).
 * **Primitives only:** box / sphere / cylinder / cone via AuxGeom with flat
   diffuse colour. No meshes, textures, PBR materials, lights or shadows yet.
 * **Teardown:** the O3DE/Vulkan runtime cannot be cleanly torn down at process
