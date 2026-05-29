@@ -31,6 +31,7 @@ namespace gz
     class O3deCamera;
     class O3deDirectionalLight;
     class O3deGeometry;
+    class O3deGrid;
     class O3deLight;
     class O3deMaterial;
     class O3deNode;
@@ -43,6 +44,7 @@ namespace gz
     class O3deSensor;
     class O3deSpotLight;
     class O3deVisual;
+    class O3deWireBox;
 
     typedef BaseGeometryStore<O3deGeometry>   O3deGeometryStore;
     typedef BaseLightStore<O3deLight>         O3deLightStore;
@@ -56,6 +58,7 @@ namespace gz
     typedef shared_ptr<O3deCamera>            O3deCameraPtr;
     typedef shared_ptr<O3deDirectionalLight>  O3deDirectionalLightPtr;
     typedef shared_ptr<O3deGeometry>          O3deGeometryPtr;
+    typedef shared_ptr<O3deGrid>              O3deGridPtr;
     typedef shared_ptr<O3deLight>             O3deLightPtr;
     typedef shared_ptr<O3deMaterial>          O3deMaterialPtr;
     typedef shared_ptr<O3deNode>              O3deNodePtr;
@@ -68,6 +71,7 @@ namespace gz
     typedef shared_ptr<O3deSensor>            O3deSensorPtr;
     typedef shared_ptr<O3deSpotLight>         O3deSpotLightPtr;
     typedef shared_ptr<O3deVisual>            O3deVisualPtr;
+    typedef shared_ptr<O3deWireBox>           O3deWireBoxPtr;
 
     typedef shared_ptr<O3deGeometryStore>     O3deGeometryStorePtr;
     typedef shared_ptr<O3deLightStore>        O3deLightStorePtr;

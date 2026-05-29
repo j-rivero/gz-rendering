@@ -8,16 +8,21 @@ and samples it directly. No CPU readback, no intermediate copy.
 
 ## What you should see
 
-A grey viewport with three shaded primitives you can orbit / pan / zoom:
+A grey viewport you can orbit / pan / zoom, with:
 
-| shape | colour | position |
-|-------|--------|----------|
+| element | colour | position |
+|---------|--------|----------|
 | box | red | left (`y = +1.5`) |
 | sphere | green | centre (origin) |
 | cylinder | blue | right (`y = -1.5`, taller) |
+| ground grid | grey | 20×20 unit cells on the floor |
+| wireframe cage | yellow | around the green sphere |
+| plane (wall) | orange | standing behind the row |
 
 These come from `GZ_O3DE_DEMO_SHAPES` (set by the script) — they stand in for
-what a real Gazebo scene (gz-sim) would push into the engine.
+what a real Gazebo scene (gz-sim) would push into the engine. The box, sphere
+and cylinder are AuxGeom solids; the grid, wireframe box and plane exercise the
+line/quad geometry path.
 
 ## Run it
 
@@ -75,6 +80,11 @@ A couple of toggles are useful if something misbehaves (export before running):
   isolation experiment that pinned the original device-loss root cause).
 * `GZ_O3DE_INTEROP_SEM=0` — drop the timeline semaphore (host-sync only) to
   compare.
+* `GZ_O3DE_DUMP_PNG=1` — once the scene settles, read the imported image back on
+  Qt's device and write it to `/tmp/o3de_consumer.ppm` (override with
+  `GZ_O3DE_DUMP_PATH`). The supported way to inspect what the engine renders
+  without screen-grabbing the display; convert with e.g.
+  `convert /tmp/o3de_consumer.ppm out.png`.
 
 Per-frame interop logging (producer + consumer) is printed periodically — run
 with `-v 4` (edit the `exec` line) for the full firehose.

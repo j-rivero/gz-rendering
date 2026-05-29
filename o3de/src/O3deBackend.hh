@@ -37,13 +37,31 @@ namespace gz
     struct O3deShapeData
     {
       /// \brief Primitive kind (mirrors O3deGeometry::GeometryType).
-      enum class Type : int { BOX = 0, SPHERE = 1, CYLINDER = 2, CONE = 3 };
+      enum class Type : int
+      {
+        BOX = 0, SPHERE = 1, CYLINDER = 2, CONE = 3,
+        PLANE = 4,    //!< Flat quad in the visual's local XY plane (scale = size).
+        GRID = 5,     //!< Wireframe ground grid (see cellCount/cellLength).
+        WIREBOX = 6   //!< Wireframe box edges (see boxMin/boxMax, local AABB).
+      };
 
       Type type = Type::BOX;
       double pos[3] = {0.0, 0.0, 0.0};       //!< World position (gz frame).
       double quat[4] = {1.0, 0.0, 0.0, 0.0}; //!< World orientation w,x,y,z.
       double scale[3] = {1.0, 1.0, 1.0};     //!< World scale / dimensions.
       float color[4] = {0.8f, 0.8f, 0.8f, 1.0f}; //!< RGBA diffuse color.
+
+      // Grid params (Type::GRID): a cellCount x cellCount grid of cellLength
+      // squares centred on the origin in local XY; verticalCellCount > 0 adds
+      // horizontal layers stacked along local +Z.
+      int cellCount = 10;
+      double cellLength = 1.0;
+      int verticalCellCount = 0;
+
+      // WireBox local axis-aligned box (Type::WIREBOX), before the world
+      // pose/scale above is applied.
+      double boxMin[3] = {-0.5, -0.5, -0.5};
+      double boxMax[3] = {0.5, 0.5, 0.5};
     };
 
     /// \brief Everything an importing graphics context needs to alias the

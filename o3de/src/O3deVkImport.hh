@@ -31,6 +31,7 @@
 #include "O3deBackend.hh"
 
 #include <cstdint>
+#include <vector>
 
 #include <vulkan/vulkan.h>
 
@@ -89,6 +90,18 @@ namespace gz
     /// FD) and destroy the semaphore (closing its FD). Safe on partial handles.
     void O3deVkDestroyImported(const O3deVkDeviceContext &_ctx,
         O3deVkImportedImage *_img);
+
+    /// \brief Diagnostic: copy the imported image (as it appears on \p _ctx's
+    /// device) into a CPU RGBA8 buffer. Lets callers verify what the consumer's
+    /// device actually sees in the shared memory without screen-grabbing the
+    /// display (e.g. dump to a PPM under GZ_O3DE_DUMP_PNG). Transitions \p _img
+    /// from \p _currentLayout to TRANSFER_SRC and back, vkCmdCopyImageToBuffer
+    /// into a host-visible staging buffer, and blocks on a fence.
+    /// \return True on success, with \p _out filled (width*height*4 bytes,
+    /// R8G8B8A8 order).
+    bool O3deVkReadbackImageRgba(const O3deVkDeviceContext &_ctx,
+        const O3deVkImportedImage &_img, VkImageLayout _currentLayout,
+        std::vector<uint8_t> *_out);
   }
 }
 #endif

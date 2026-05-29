@@ -20,10 +20,13 @@
 #include <fstream>
 #include <vector>
 
+#include <gz/math/AxisAlignedBox.hh>
 #include <gz/math/Pose3.hh>
 #include <gz/math/Vector3.hh>
 
+#include "gz/rendering/Grid.hh"
 #include "gz/rendering/PixelFormat.hh"
+#include "gz/rendering/WireBox.hh"
 #include "gz/rendering/o3de/O3deCamera.hh"
 #include "gz/rendering/o3de/O3deGeometry.hh"
 #include "gz/rendering/o3de/O3deMaterial.hh"
@@ -52,6 +55,12 @@ namespace
         _out = O3deShapeData::Type::CYLINDER; return true;
       case O3deGeometry::GeometryType::CONE:
         _out = O3deShapeData::Type::CONE; return true;
+      case O3deGeometry::GeometryType::PLANE:
+        _out = O3deShapeData::Type::PLANE; return true;
+      case O3deGeometry::GeometryType::GRID:
+        _out = O3deShapeData::Type::GRID; return true;
+      case O3deGeometry::GeometryType::WIREBOX:
+        _out = O3deShapeData::Type::WIREBOX; return true;
       default:
         return false;
     }
@@ -98,6 +107,33 @@ namespace
         O3deShapeData shape;
         if (!ToBackendType(geom->Type(), shape.type))
           continue;
+
+        // Grid / wire-box carry extra parameters beyond the world pose/scale.
+        if (shape.type == O3deShapeData::Type::GRID)
+        {
+          if (auto grid = std::dynamic_pointer_cast<Grid>(
+                  o3deVisual->GeometryByIndex(j)))
+          {
+            shape.cellCount = static_cast<int>(grid->CellCount());
+            shape.cellLength = grid->CellLength();
+            shape.verticalCellCount =
+                static_cast<int>(grid->VerticalCellCount());
+          }
+        }
+        else if (shape.type == O3deShapeData::Type::WIREBOX)
+        {
+          if (auto wireBox = std::dynamic_pointer_cast<WireBox>(
+                  o3deVisual->GeometryByIndex(j)))
+          {
+            const math::AxisAlignedBox b = wireBox->Box();
+            shape.boxMin[0] = b.Min().X();
+            shape.boxMin[1] = b.Min().Y();
+            shape.boxMin[2] = b.Min().Z();
+            shape.boxMax[0] = b.Max().X();
+            shape.boxMax[1] = b.Max().Y();
+            shape.boxMax[2] = b.Max().Z();
+          }
+        }
 
         shape.pos[0] = wp.Pos().X();
         shape.pos[1] = wp.Pos().Y();

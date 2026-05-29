@@ -44,7 +44,10 @@ namespace gz
         BOX,
         SPHERE,
         CYLINDER,
-        CONE
+        CONE,
+        PLANE,
+        GRID,
+        WIREBOX
       };
 
       /// \brief Constructor

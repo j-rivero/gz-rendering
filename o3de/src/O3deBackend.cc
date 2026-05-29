@@ -1171,6 +1171,15 @@ void O3deBackend::Impl::SubmitPrimitives()
         shape.color[3]);
     // The shape's local +Z axis in world space (for cylinder/cone direction).
     const AZ::Vector3 axisZ = rot.TransformVector(AZ::Vector3::CreateAxisZ());
+    // Map a point from the shape's local frame to world (scale, then rotate,
+    // then translate) -- used by the line-based primitives below.
+    auto toWorld = [&](const AZ::Vector3 &_local)
+    {
+      return pos + rot.TransformVector(AZ::Vector3(
+          _local.GetX() * scale.GetX(),
+          _local.GetY() * scale.GetY(),
+          _local.GetZ() * scale.GetZ()));
+    };
 
     switch (shape.type)
     {
@@ -1202,6 +1211,103 @@ void O3deBackend::Impl::SubmitPrimitives()
       {
         auxGeom->DrawCone(pos, axisZ, 0.5f * scale.GetX(),
             scale.GetZ(), color);
+        break;
+      }
+      case O3deShapeData::Type::PLANE:
+      {
+        // A gz plane lies in its local XY plane with a +Z normal; AuxGeom's
+        // DrawQuad instead builds the quad in XZ with a +Y normal. Rotate the
+        // quad +90 deg about X so it matches the gz convention (normal +Z,
+        // width=scale.x along X, height=scale.y along Y), then apply the visual
+        // pose. FaceCullMode::None so it is visible from both sides.
+        const AZ::Quaternion q =
+            rot * AZ::Quaternion::CreateRotationX(AZ::Constants::HalfPi);
+        const AZ::Matrix3x4 xform =
+            AZ::Matrix3x4::CreateFromQuaternionAndTranslation(q, pos);
+        auxGeom->DrawQuad(
+            static_cast<float>(scale.GetX()), static_cast<float>(scale.GetY()),
+            xform, color, AZ::RPI::AuxGeomDraw::DrawStyle::Shaded,
+            AZ::RPI::AuxGeomDraw::DepthTest::On,
+            AZ::RPI::AuxGeomDraw::DepthWrite::On,
+            AZ::RPI::AuxGeomDraw::FaceCullMode::None);
+        break;
+      }
+      case O3deShapeData::Type::GRID:
+      {
+        // A cellCount x cellCount grid of cellLength squares centred on the
+        // origin in the local XY plane, plus optional stacked layers along +Z.
+        const double len = shape.cellLength;
+        const int n = (shape.cellCount > 0) ? shape.cellCount : 0;
+        const int layers = (shape.verticalCellCount > 0)
+            ? shape.verticalCellCount : 0;
+        const double half = 0.5 * n * len;
+        std::vector<AZ::Vector3> verts;
+        verts.reserve(static_cast<size_t>((n + 1)) * 4u * (layers + 1) + 64u);
+        auto pushLine = [&](const AZ::Vector3 &_a, const AZ::Vector3 &_b)
+        { verts.push_back(toWorld(_a)); verts.push_back(toWorld(_b)); };
+        for (int l = 0; l <= layers; ++l)
+        {
+          const double z = l * len;
+          for (int i = 0; i <= n; ++i)
+          {
+            const double t = -half + i * len;
+            pushLine(AZ::Vector3(-half, t, z), AZ::Vector3(half, t, z));
+            pushLine(AZ::Vector3(t, -half, z), AZ::Vector3(t, half, z));
+          }
+        }
+        if (layers > 0)  // vertical connectors between the stacked layers
+        {
+          for (int i = 0; i <= n; ++i)
+            for (int k = 0; k <= n; ++k)
+            {
+              const double x = -half + i * len;
+              const double y = -half + k * len;
+              pushLine(AZ::Vector3(x, y, 0.0), AZ::Vector3(x, y, layers * len));
+            }
+        }
+        if (!verts.empty())
+        {
+          AZ::RPI::AuxGeomDraw::AuxGeomDynamicDrawArguments args;
+          args.m_verts = verts.data();
+          args.m_vertCount = static_cast<uint32_t>(verts.size());
+          args.m_colors = &color;
+          args.m_colorCount = 1u;
+          auxGeom->DrawLines(args);
+        }
+        break;
+      }
+      case O3deShapeData::Type::WIREBOX:
+      {
+        // 12 edges of the local axis-aligned box, oriented + placed by the
+        // visual world pose/scale.
+        const AZ::Vector3 lo(shape.boxMin[0], shape.boxMin[1], shape.boxMin[2]);
+        const AZ::Vector3 hi(shape.boxMax[0], shape.boxMax[1], shape.boxMax[2]);
+        const AZ::Vector3 c[8] = {
+            toWorld(AZ::Vector3(lo.GetX(), lo.GetY(), lo.GetZ())),
+            toWorld(AZ::Vector3(hi.GetX(), lo.GetY(), lo.GetZ())),
+            toWorld(AZ::Vector3(hi.GetX(), hi.GetY(), lo.GetZ())),
+            toWorld(AZ::Vector3(lo.GetX(), hi.GetY(), lo.GetZ())),
+            toWorld(AZ::Vector3(lo.GetX(), lo.GetY(), hi.GetZ())),
+            toWorld(AZ::Vector3(hi.GetX(), lo.GetY(), hi.GetZ())),
+            toWorld(AZ::Vector3(hi.GetX(), hi.GetY(), hi.GetZ())),
+            toWorld(AZ::Vector3(lo.GetX(), hi.GetY(), hi.GetZ()))};
+        static const int edges[12][2] = {
+            {0, 1}, {1, 2}, {2, 3}, {3, 0},   // bottom face
+            {4, 5}, {5, 6}, {6, 7}, {7, 4},   // top face
+            {0, 4}, {1, 5}, {2, 6}, {3, 7}};  // verticals
+        std::vector<AZ::Vector3> verts;
+        verts.reserve(24u);
+        for (const auto &e : edges)
+        {
+          verts.push_back(c[e[0]]);
+          verts.push_back(c[e[1]]);
+        }
+        AZ::RPI::AuxGeomDraw::AuxGeomDynamicDrawArguments args;
+        args.m_verts = verts.data();
+        args.m_vertCount = static_cast<uint32_t>(verts.size());
+        args.m_colors = &color;
+        args.m_colorCount = 1u;
+        auxGeom->DrawLines(args);
         break;
       }
     }
@@ -1601,6 +1707,34 @@ static void MaybeInjectDemoShapes(std::vector<O3deShapeData> &_shapes)
   cylinder.scale[2] = 1.5;
   cylinder.color[0] = 0.0f; cylinder.color[1] = 0.0f; cylinder.color[2] = 1.0f;
   _shapes.push_back(cylinder);
+
+  // Ground grid the shapes sit on (20x20 unit cells, centred on the origin).
+  O3deShapeData grid;
+  grid.type = O3deShapeData::Type::GRID;
+  grid.cellCount = 20;
+  grid.cellLength = 1.0;
+  grid.color[0] = 0.4f; grid.color[1] = 0.4f; grid.color[2] = 0.4f;
+  _shapes.push_back(grid);
+
+  // Yellow wireframe cage around the green sphere (local AABB +/-0.6 at z=0.5).
+  O3deShapeData wireBox;
+  wireBox.type = O3deShapeData::Type::WIREBOX;
+  wireBox.pos[0] = 0.0; wireBox.pos[1] = 0.0; wireBox.pos[2] = 0.5;
+  wireBox.boxMin[0] = -0.6; wireBox.boxMin[1] = -0.6; wireBox.boxMin[2] = -0.6;
+  wireBox.boxMax[0] = 0.6; wireBox.boxMax[1] = 0.6; wireBox.boxMax[2] = 0.6;
+  wireBox.color[0] = 1.0f; wireBox.color[1] = 1.0f; wireBox.color[2] = 0.0f;
+  _shapes.push_back(wireBox);
+
+  // Orange wall plane standing behind the row (rotated -90 deg about Y so the
+  // default XY quad stands vertical; 3x3, normal facing the camera).
+  O3deShapeData plane;
+  plane.type = O3deShapeData::Type::PLANE;
+  plane.pos[0] = 2.5; plane.pos[1] = 0.0; plane.pos[2] = 1.5;
+  plane.quat[0] = 0.70710678; plane.quat[1] = 0.0;
+  plane.quat[2] = -0.70710678; plane.quat[3] = 0.0;
+  plane.scale[0] = 3.0; plane.scale[1] = 3.0; plane.scale[2] = 1.0;
+  plane.color[0] = 1.0f; plane.color[1] = 0.5f; plane.color[2] = 0.0f;
+  _shapes.push_back(plane);
 }
 
 //////////////////////////////////////////////////

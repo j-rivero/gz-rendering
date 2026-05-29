@@ -18,6 +18,7 @@
 
 #include "gz/rendering/o3de/O3deCamera.hh"
 #include "gz/rendering/o3de/O3deGeometry.hh"
+#include "gz/rendering/o3de/O3deGrid.hh"
 #include "gz/rendering/o3de/O3deLight.hh"
 #include "gz/rendering/o3de/O3deMaterial.hh"
 #include "gz/rendering/o3de/O3deRayQuery.hh"
@@ -25,6 +26,7 @@
 #include "gz/rendering/o3de/O3deScene.hh"
 #include "gz/rendering/o3de/O3deStorage.hh"
 #include "gz/rendering/o3de/O3deVisual.hh"
+#include "gz/rendering/o3de/O3deWireBox.hh"
 
 using namespace gz;
 using namespace rendering;
@@ -241,7 +243,7 @@ GeometryPtr O3deScene::CreateCylinderImpl(unsigned int _id,
 GeometryPtr O3deScene::CreatePlaneImpl(unsigned int _id,
     const std::string &_name)
 {
-  return this->CreateGeometryImpl(_id, _name);
+  return this->CreateGeometryImpl(_id, _name, O3deGeometry::GeometryType::PLANE);
 }
 
 //////////////////////////////////////////////////
@@ -269,11 +271,12 @@ CapsulePtr O3deScene::CreateCapsuleImpl(unsigned int /*_id*/,
 }
 
 //////////////////////////////////////////////////
-GridPtr O3deScene::CreateGridImpl(unsigned int /*_id*/,
-    const std::string &/*_name*/)
+GridPtr O3deScene::CreateGridImpl(unsigned int _id,
+    const std::string &_name)
 {
-  gzerr << "Grid not supported by: " << this->Engine()->Name() << std::endl;
-  return nullptr;
+  O3deGridPtr grid(new O3deGrid);
+  bool result = this->InitObject(grid, _id, _name);
+  return (result) ? grid : nullptr;
 }
 
 //////////////////////////////////////////////////
@@ -312,12 +315,12 @@ HeightmapPtr O3deScene::CreateHeightmapImpl(unsigned int /*_id*/,
 }
 
 //////////////////////////////////////////////////
-WireBoxPtr O3deScene::CreateWireBoxImpl(unsigned int /*_id*/,
-    const std::string &/*_name*/)
+WireBoxPtr O3deScene::CreateWireBoxImpl(unsigned int _id,
+    const std::string &_name)
 {
-  gzerr << "Wire box not supported by: " << this->Engine()->Name()
-        << std::endl;
-  return nullptr;
+  O3deWireBoxPtr wireBox(new O3deWireBox);
+  bool result = this->InitObject(wireBox, _id, _name);
+  return (result) ? wireBox : nullptr;
 }
 
 //////////////////////////////////////////////////

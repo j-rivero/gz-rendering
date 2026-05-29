@@ -20,6 +20,8 @@
 #if defined(GZ_O3DE_INTEROP_BUILD)
 #include <unistd.h>  // close()
 
+#include <cstdio>
+#include <cstdlib>
 #include <vector>
 
 #include <gz/common/Console.hh>
@@ -242,6 +244,38 @@ void O3deCamera::PrepareForExternalSampling()
         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
         st.semaphoreWaitValue);
+
+    // Diagnostic (GZ_O3DE_DUMP_PNG): once the pipeline has settled, read the
+    // imported image back on Qt's own device and dump it to a PPM. This is the
+    // supported way to inspect what the engine renders without screen-grabbing
+    // the display. Fires once (the camera is static); convert with e.g.
+    // `convert /tmp/o3de_consumer.ppm out.png`.
+    if (std::getenv("GZ_O3DE_DUMP_PNG"))
+    {
+      static int dumpFrame = 0;
+      if (dumpFrame++ == 30)
+      {
+        std::vector<uint8_t> rgba;
+        if (O3deVkReadbackImageRgba(st.ctx, st.img,
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, &rgba) &&
+            !rgba.empty())
+        {
+          const char *path = std::getenv("GZ_O3DE_DUMP_PATH");
+          if (!path)
+            path = "/tmp/o3de_consumer.ppm";
+          if (FILE *f = std::fopen(path, "wb"))
+          {
+            std::fprintf(f, "P6\n%u %u\n255\n", st.img.width, st.img.height);
+            const size_t n = rgba.size() / 4u;
+            for (size_t i = 0; i < n; ++i)
+              std::fwrite(rgba.data() + i * 4u, 1u, 3u, f);  // RGB, drop alpha
+            std::fclose(f);
+            gzmsg << "[gz-o3de] dumped consumer image to " << path << " ("
+                  << st.img.width << "x" << st.img.height << ")" << std::endl;
+          }
+        }
+      }
+    }
   }
   else if (!st.acquired)
   {

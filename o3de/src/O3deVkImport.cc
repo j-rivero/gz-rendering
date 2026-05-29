@@ -24,6 +24,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 #include <unistd.h>
 
@@ -293,6 +294,135 @@ bool O3deVkAcquireFromProducer(const O3deVkDeviceContext &_ctx,
   }
 
   vkDestroyCommandPool(_ctx.device, pool, nullptr);
+  return ok;
+}
+
+//////////////////////////////////////////////////
+bool O3deVkReadbackImageRgba(const O3deVkDeviceContext &_ctx,
+    const O3deVkImportedImage &_img, VkImageLayout _currentLayout,
+    std::vector<uint8_t> *_out)
+{
+  if (!_out || _ctx.device == VK_NULL_HANDLE || _img.image == VK_NULL_HANDLE ||
+      _img.width == 0u || _img.height == 0u)
+    return false;
+  const VkDeviceSize bytes =
+      static_cast<VkDeviceSize>(_img.width) * _img.height * 4u;
+
+  // Host-visible staging buffer for the copy destination.
+  VkBuffer buf = VK_NULL_HANDLE;
+  VkBufferCreateInfo bufInfo{};
+  bufInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+  bufInfo.size = bytes;
+  bufInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+  bufInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  if (!VkOk(vkCreateBuffer(_ctx.device, &bufInfo, nullptr, &buf),
+          "vkCreateBuffer(readback)"))
+    return false;
+
+  VkMemoryRequirements memReq{};
+  vkGetBufferMemoryRequirements(_ctx.device, buf, &memReq);
+  const int memType = FindMemoryType(_ctx.physicalDevice, memReq.memoryTypeBits,
+      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+  if (memType < 0)
+  {
+    vkDestroyBuffer(_ctx.device, buf, nullptr);
+    return false;
+  }
+  VkDeviceMemory mem = VK_NULL_HANDLE;
+  VkMemoryAllocateInfo allocInfo{};
+  allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+  allocInfo.allocationSize = memReq.size;
+  allocInfo.memoryTypeIndex = static_cast<uint32_t>(memType);
+  if (!VkOk(vkAllocateMemory(_ctx.device, &allocInfo, nullptr, &mem),
+          "vkAllocateMemory(readback)"))
+  {
+    vkDestroyBuffer(_ctx.device, buf, nullptr);
+    return false;
+  }
+  vkBindBufferMemory(_ctx.device, buf, mem, 0u);
+
+  VkCommandPool pool = VK_NULL_HANDLE;
+  VkCommandPoolCreateInfo poolInfo{};
+  poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+  poolInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+  poolInfo.queueFamilyIndex = _ctx.queueFamily;
+  vkCreateCommandPool(_ctx.device, &poolInfo, nullptr, &pool);
+
+  VkCommandBuffer cmd = VK_NULL_HANDLE;
+  VkCommandBufferAllocateInfo cbAlloc{};
+  cbAlloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+  cbAlloc.commandPool = pool;
+  cbAlloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+  cbAlloc.commandBufferCount = 1u;
+  bool ok = VkOk(vkAllocateCommandBuffers(_ctx.device, &cbAlloc, &cmd),
+      "vkAllocateCommandBuffers(readback)");
+  if (ok)
+  {
+    VkCommandBufferBeginInfo begin{};
+    begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &begin);
+
+    VkImageMemoryBarrier toSrc{};
+    toSrc.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    toSrc.srcAccessMask = 0;
+    toSrc.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    toSrc.oldLayout = _currentLayout;
+    toSrc.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    toSrc.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toSrc.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toSrc.image = _img.image;
+    toSrc.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 0u, 1u};
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toSrc);
+
+    VkBufferImageCopy region{};
+    region.bufferOffset = 0u;
+    region.bufferRowLength = 0u;
+    region.bufferImageHeight = 0u;
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 0u, 1u};
+    region.imageOffset = {0, 0, 0};
+    region.imageExtent = {_img.width, _img.height, 1u};
+    vkCmdCopyImageToBuffer(cmd, _img.image,
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1u, &region);
+
+    VkImageMemoryBarrier back = toSrc;
+    back.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    back.dstAccessMask = 0;
+    back.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    back.newLayout = _currentLayout;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &back);
+    vkEndCommandBuffer(cmd);
+
+    VkFence fence = VK_NULL_HANDLE;
+    VkFenceCreateInfo fenceInfo{};
+    fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    vkCreateFence(_ctx.device, &fenceInfo, nullptr, &fence);
+    VkSubmitInfo submit{};
+    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit.commandBufferCount = 1u;
+    submit.pCommandBuffers = &cmd;
+    ok = VkOk(vkQueueSubmit(_ctx.queue, 1u, &submit, fence), "vkQueueSubmit(rb)");
+    if (ok)
+    {
+      vkWaitForFences(_ctx.device, 1u, &fence, VK_TRUE, UINT64_MAX);
+      void *mapped = nullptr;
+      if (vkMapMemory(_ctx.device, mem, 0u, bytes, 0, &mapped) == VK_SUCCESS)
+      {
+        _out->resize(static_cast<size_t>(bytes));
+        std::memcpy(_out->data(), mapped, static_cast<size_t>(bytes));
+        vkUnmapMemory(_ctx.device, mem);
+      }
+      else
+        ok = false;
+    }
+    vkDestroyFence(_ctx.device, fence, nullptr);
+  }
+
+  vkDestroyCommandPool(_ctx.device, pool, nullptr);
+  vkFreeMemory(_ctx.device, mem, nullptr);
+  vkDestroyBuffer(_ctx.device, buf, nullptr);
   return ok;
 }
 
