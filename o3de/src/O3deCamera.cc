@@ -227,16 +227,17 @@ void O3deCamera::PrepareForExternalSampling()
     // also host-syncs, but the semaphore wait is what makes the writes visible to
     // Qt's separate device (host-sync alone is spec-insufficient). When no
     // semaphore is advertised (GZ_O3DE_INTEROP_SEM off) the wait is a no-op.
-    // Acquire each frame, waiting on the producer's render-finished timeline
-    // semaphore at this frame's value (#26) for cross-device write visibility.
     // The layout barrier is a no-op SHADER_READ -> SHADER_READ (old == new),
-    // matching the proven static-probe acquire: tested both this and a real
-    // transition from the producer's layout, and the layout barrier is NOT what
-    // loses the device. The live path still loses Qt's device the first time Qt
-    // samples the producer's COLOUR-ATTACHMENT render-target image in its own
-    // render pass (the plain static-probe write samples fine) -- a cross-device
-    // render-target/compression handoff problem, orthogonal to the (now working)
-    // semaphore sync. See o3de/docs/zero-copy-interop-findings.md (#26 section).
+    // matching the proven static-probe acquire.
+    //
+    // VERIFIED working: reading this imported image back on Qt's own VkDevice
+    // yields pixels identical to the producer's pipeline output (the demo
+    // box/sphere/cylinder), and the live demo displays correctly. So the
+    // cross-device COLOUR-ATTACHMENT render-target handoff is fine -- there is NO
+    // compression/visibility problem here. (An earlier comment claimed one; it was
+    // wrong. The live device loss it referred to was the resize re-import
+    // use-after-free, now fixed by retiring old imports -- see
+    // o3de/docs/zero-copy-interop-findings.md.)
     O3deVkAcquireFromProducer(st.ctx, st.img,
         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,

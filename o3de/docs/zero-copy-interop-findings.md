@@ -21,6 +21,17 @@ evidence that eliminated it.
 > semaphore; the layout/QFOT experiments) were still useful — the semaphore is real
 > required infrastructure — but neither was the device-loss trigger.
 
+> **Final visual confirmation (2026-05-29).** The earlier "stable" claim was based on
+> frame counts + zero device loss; the *scene content* was later confirmed directly.
+> Reading the imported image back on Qt's own `VkDevice` yields pixels identical to
+> the producer's pipeline output (the demo box/sphere/cylinder), and the on-screen
+> result matches — so the cross-device colour-attachment handoff carries full detail,
+> not just the background (a worry the disproven "compression handoff" theory had
+> raised). The one remaining gotcha was mundane and *not* a rendering bug: the demo's
+> initial camera framed the shapes small and low under a large grey sky, which read as
+> "all grey" until the camera was reframed. A runnable demo lives at
+> [`o3de/examples/native_vulkan_live/`](../examples/native_vulkan_live/).
+
 ## Goal
 
 Display O3DE/Atom's live offscreen render in gz-gui's MinimalScene via **native
