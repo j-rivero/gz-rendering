@@ -675,9 +675,19 @@ bool O3deBackend::Impl::EnsureInteropImage(uint32_t _w, uint32_t _h)
     return false;
   }
   // Color (render-into) + ShaderRead (consumer sampling) + CopyRead (readback) +
-  // CopyWrite (UpdateImageContents upload).
+  // CopyWrite (UpdateImageContents upload) + ShaderWrite (-> STORAGE usage).
+  // ShaderWrite/STORAGE forces NVIDIA's proprietary driver to DISABLE colour
+  // (DCC) compression on this image: a DCC-compressed image shares its colour
+  // plane via the exported FD but NOT the compression metadata, so the importing
+  // device's sampler reads the fast-clear/metadata state (a uniform background)
+  // instead of the rendered pixels -- while transfer/copy reads the real pixels
+  // because the copy engine decompresses. Disabling DCC makes the colour plane
+  // self-describing and the importer's sampler correct. The consumer image
+  // (O3deVkImportImage) must add VK_IMAGE_USAGE_STORAGE_BIT to match (opaque-FD
+  // sharing requires identical VkImageCreateInfo).
   const AZ::RHI::ImageDescriptor desc = AZ::RHI::ImageDescriptor::Create2D(
       AZ::RHI::ImageBindFlags::Color | AZ::RHI::ImageBindFlags::ShaderRead |
+          AZ::RHI::ImageBindFlags::ShaderWrite |
           AZ::RHI::ImageBindFlags::CopyRead | AZ::RHI::ImageBindFlags::CopyWrite,
       _w, _h, AZ::RHI::Format::R8G8B8A8_UNORM);
   // AttachmentImage names must be unique per live instance; suffix the next

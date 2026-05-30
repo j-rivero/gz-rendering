@@ -345,6 +345,77 @@ bool RunO3deInteropVkSelfTest()
     std::fprintf(stderr,
         "[gz-o3de] vktest: first mismatch at (%d,%d)\n", firstBadX, firstBadY);
 
+  // ---- Sampler-path readback (stabilises the "cross-device sampler works"
+  // finding). Reads exactly what Qt's QSGSimpleTextureNode draw samples --
+  // texelFetch through a VkSampler on the consumer device -- and asserts it is
+  // byte-identical to the transfer-copy readback above. If the producer image,
+  // memory import or sampler swizzle were broken on this consumer device, this
+  // would diverge from the transfer copy. The reusable helper is
+  // O3deVkSampleProbeRgba (O3deVkImport.hh), also exposed as the runtime
+  // GZ_O3DE_SAMPLE_PROBE diagnostic (see o3de/docs/diagnostic-tools.md). The
+  // imported image is currently in TRANSFER_SRC_OPTIMAL (the layout the
+  // transfer readback left it in); the probe transitions it through
+  // SHADER_READ_ONLY_OPTIMAL and restores it.
+  bool samplerMatch = false;
+  {
+    std::vector<uint8_t> probeRgba;
+    if (!O3deVkSampleProbeRgba(ctx, imported,
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, &probeRgba))
+    {
+      std::fprintf(stderr,
+          "[gz-o3de] vksamplertest: O3deVkSampleProbeRgba failed -- "
+          "cross-device sampler readback not verified\n");
+    }
+    else if (probeRgba.size() != static_cast<size_t>(bufSize))
+    {
+      std::fprintf(stderr,
+          "[gz-o3de] vksamplertest: probe size mismatch: probe=%zu transfer=%zu\n",
+          probeRgba.size(), static_cast<size_t>(bufSize));
+    }
+    else
+    {
+      size_t sampGood = 0;
+      int sampBadX = -1, sampBadY = -1;
+      for (uint32_t y = 0u; y < import.height; ++y)
+      {
+        for (uint32_t x = 0u; x < import.width; ++x)
+        {
+          const size_t off = (static_cast<size_t>(y) * import.width + x) * 4u;
+          if (probeRgba[off + 0u] == pixels[off + 0u] &&
+              probeRgba[off + 1u] == pixels[off + 1u] &&
+              probeRgba[off + 2u] == pixels[off + 2u] &&
+              probeRgba[off + 3u] == pixels[off + 3u])
+          {
+            ++sampGood;
+          }
+          else if (sampBadX < 0)
+          {
+            sampBadX = static_cast<int>(x);
+            sampBadY = static_cast<int>(y);
+          }
+        }
+      }
+      samplerMatch = (sampGood == total);
+      const uint8_t *ps = probeRgba.data();
+      const size_t cOff = (static_cast<size_t>(import.height / 2u) *
+          import.width + import.width / 2u) * 4u;
+      std::fprintf(stderr,
+          "[gz-o3de] vksamplertest: %zu/%zu texels match the transfer copy. "
+          "probe(0,0)=[%u %u %u %u] transfer(0,0)=[%u %u %u %u]; "
+          "probe.center=[%u %u %u %u]\n",
+          sampGood, total, ps[0], ps[1], ps[2], ps[3], s[0], s[1], s[2], s[3],
+          ps[cOff + 0u], ps[cOff + 1u], ps[cOff + 2u], ps[cOff + 3u]);
+      if (!samplerMatch)
+        std::fprintf(stderr,
+            "[gz-o3de] vksamplertest: first sampler/transfer mismatch at "
+            "(%d,%d)\n", sampBadX, sampBadY);
+      std::fprintf(stderr,
+          "[gz-o3de] vksamplertest: %s -- cross-device texture sampler %s\n",
+          samplerMatch ? "PASS" : "FAIL",
+          samplerMatch ? "verified" : "did NOT verify");
+    }
+  }
+
   if (const char *dumpPath = std::getenv("GZ_O3DE_INTEROP_VKDUMP"))
   {
     if (FILE *fp = std::fopen(dumpPath, "wb"))
@@ -367,7 +438,14 @@ bool RunO3deInteropVkSelfTest()
   }
 
   vkUnmapMemory(ctx.device, readbackMem);
-  return done(match);
+  // Overall PASS requires both: transfer-copy texels matched the producer's
+  // uploaded gradient (existing "vktest"), AND sampler-path readback was
+  // byte-identical to the transfer-copy (new "vksamplertest"). The sampler
+  // half stabilises the empirical finding that cross-device sampling of an
+  // OPAQUE_FD-imported OPTIMAL image on NVIDIA proprietary works correctly
+  // when the producer uses a dedicated allocation -- a regression in either
+  // the producer's export or the consumer's import would surface here.
+  return done(match && samplerMatch);
 }
 
 }  // namespace rendering

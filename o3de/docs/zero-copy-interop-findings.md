@@ -1,10 +1,14 @@
 # O3DE↔Qt native Vulkan zero-copy interop — root-cause findings & resolution
 
-Status: **WORKING.** The live zero-copy path now displays stably — ~2000 frames at
-~60-100 fps across multiple window resizes (gen 1→2→3), zero device losses. Two fixes
-landed it: (1) the #26 render-finished timeline semaphore (cross-device per-frame
-sync), and (2) the consumer **retiring** old imports instead of freeing them under
-Qt's in-flight frame. Date: 2026-05-28. Author: bring-up debugging session.
+Status: **WORKING** for stability + cross-device pixel transport (~2000 frames at
+~60-100 fps across multiple window resizes, zero device losses). Two fixes landed
+the stability: (1) the #26 render-finished timeline semaphore, and (2) the consumer
+**retiring** old imports instead of freeing them under Qt's in-flight frame.
+**Remaining issue (open, 2026-05-30):** a separate gz-gui-side rendering bug -- the
+QSGSimpleTextureNode draw of the cross-device fromNative-wrapped image renders
+uniform on screen even though the imported VkImage carries the correct pixels (a
+consumer-side compute sampler probe confirms it). See the new "Remaining issue:
+QSGSimpleTextureNode renders uniform" section below. Date: 2026-05-30.
 
 This documents the full debugging journey — including **two wrong root-cause
 conclusions** that the evidence later overturned — so the reasoning is transparent:
@@ -225,3 +229,52 @@ The CPU-readback path (`O3deRenderTarget::Copy()` / `AttachmentReadback` → Qt
 `glTexSubImage2D`) remains the default when the patched gz-gui / Vulkan GUI backend /
 `GZ_O3DE_INTEROP*` are not in play. The native zero-copy path above is now the faster
 alternative when they are.
+
+## Remaining issue: QSGSimpleTextureNode renders uniform on screen (2026-05-30)
+
+Above proves that the cross-device interop *transports the producer's pixels intact*.
+A separate symptom is still open: the gz-gui window itself shows a uniform colour
+instead of the producer's rendered content, even though every probe on Qt's `VkDevice`
+reads the imported image's real pixels.
+
+### How the cross-device sampling was proven correct
+
+Two independent readbacks on the consumer (Qt's) `VkDevice`, both gated by env vars
+documented in [`diagnostic-tools.md`](diagnostic-tools.md):
+
+1. **`GZ_O3DE_DUMP_PNG`** -- `O3deVkReadbackImageRgba` does a transfer-copy of the
+   imported image to a host-visible buffer. Reads *memory*.
+2. **`GZ_O3DE_SAMPLE_PROBE`** -- `O3deVkSampleProbeRgba` runs a compute shader on
+   Qt's device that `texelFetch`s through a real `VkSampler` -- the *same access
+   path* `QSGSimpleTextureNode` uses -- and writes RGBA8 to a storage buffer.
+
+When both PPMs are diffed: byte-identical, showing the producer's rendered shapes.
+The `vksamplertest` self-test (`GZ_O3DE_INTEROP_VKTEST`, see
+[`diagnostic-tools.md`](diagnostic-tools.md)) automates this assertion -- a regression
+in either the FD export, the dedicated import, or the cross-device sampler would
+surface there. The cross-device sampler is provably correct.
+
+### Hypotheses already eliminated by the new gz-gui isolation tests
+
+A focused regression test in gz-gui isolates the bug step-by-step on Qt's own device,
+removing variables one at a time:
+`gz-gui/test/regression/qsg_simple_texture_node_vulkan.cc`.
+
+| # | Hypothesis | Test | Result |
+|---|-----------|------|--------|
+| 16 | `fromNative` + `QSGSimpleTextureNode` is broken at the simplest level | `FromNativeRendersLinearPattern`: LINEAR + host-visible VkImage on Qt's own device, four-quadrant pattern, wrap + grab + assert | ❌ **Disproven** -- PASSES; the simple case renders the pattern correctly. |
+| 17 | OPTIMAL tiling + `COLOR_ATTACHMENT \| SAMPLED \| TRANSFER_DST` usage breaks the fromNative draw on a single device | `FromNativeRendersOptimalPattern`: same pattern, OPTIMAL VkImage on Qt's own device, staging-uploaded via `vkCmdCopyBufferToImage`, transitioned to `SHADER_READ_ONLY_OPTIMAL` | ❌ **Disproven** -- PASSES; the production-usage flags on a single device render correctly. |
+
+Net: the bug requires the **cross-device FD-imported VkImage** specifically. Not
+OPTIMAL alone, not COLOR_ATTACHMENT alone, not fromNative alone.
+
+### Remaining hypothesis to test
+
+| # | Hypothesis | Test (planned, gz-gui) | Status |
+|---|-----------|------------------------|--------|
+| 18 | `QSGSimpleTextureNode`'s draw mishandles a `fromNative`-wrapped VkImage when the underlying VkDeviceMemory was imported from a foreign device's exported FD | `FromNativeRendersImportedFdPattern`: stand up a private VkInstance/VkDevice in the test, create an exportable OPTIMAL VkImage there with dedicated allocation, populate it, export the FD, import onto Qt's device, wrap + grab + assert (the same pattern check as the two passing tests) | 📋 **Planned** -- the focused harness against which to debug QSGSimpleTextureNode without any O3DE/Atom dependency. |
+
+If #18 fails, we have a sub-second single-binary reproducer for the QSGSimpleTextureNode
+cross-device-import bug. If it passes, the bug is more specific still (something Atom
+does differently from a staging upload, e.g. a render-target layout the importer's
+sampler can't read).
