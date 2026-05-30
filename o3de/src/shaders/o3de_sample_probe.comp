@@ -1,0 +1,38 @@
+// Diagnostic compute shader for O3deVkSampleProbeRgba (see O3deVkImport.hh).
+//
+// Purpose: read the imported cross-device VkImage through an actual texture
+// SAMPLER -- the exact access path Qt's QSGSimpleTextureNode draw uses -- and
+// write RGBA8 (packed into uint32) to a storage buffer the host can map and
+// inspect. The transfer-copy readback (O3deVkReadbackImageRgba) reads memory;
+// this one reads through a sampler. Comparing the two distinguishes:
+//
+//   * Both match the producer's content              => cross-device sampler
+//                                                       and memory both work;
+//                                                       the bug is in the
+//                                                       Qt/QRhi draw using the
+//                                                       fromNative texture.
+//   * Transfer matches, sampler returns a constant   => cross-device sampler
+//                                                       problem (e.g. tiling
+//                                                       swizzle on the
+//                                                       importing device).
+//   * Neither matches                                => cross-device memory
+//                                                       sharing itself broken.
+//
+// Regenerate the embedded SPV (../O3deSampleProbeSpv.h) after editing:
+//   glslc -O -mfmt=c o3de/src/shaders/o3de_sample_probe.comp -o /tmp/probe.inc
+// then wrap the resulting initializer list in the header's
+// `static const uint32_t kO3deSampleProbeSpv[] = { ... };`.
+//
+// The shader is intentionally tiny so the disassembly is short to audit.
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler2D uSrc;
+layout(set = 0, binding = 1) writeonly buffer Dst { uint data[]; };
+layout(push_constant) uniform PC { uint w; uint h; } pc;
+void main() {
+  uvec2 gid = gl_GlobalInvocationID.xy;
+  if (gid.x >= pc.w || gid.y >= pc.h) return;
+  vec4 c = texelFetch(uSrc, ivec2(gid), 0);          // texture-unit read (Qt's path)
+  uvec4 u = uvec4(clamp(c, 0.0, 1.0) * 255.0 + 0.5);
+  data[gid.y * pc.w + gid.x] = u.x | (u.y << 8) | (u.z << 16) | (u.w << 24);
+}

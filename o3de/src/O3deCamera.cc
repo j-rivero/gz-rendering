@@ -240,10 +240,37 @@ void O3deCamera::PrepareForExternalSampling()
     // wrong. The live device loss it referred to was the resize re-import
     // use-after-free, now fixed by retiring old imports -- see
     // o3de/docs/zero-copy-interop-findings.md.)
+    // The consumer acquire's oldLayout MUST equal the layout Atom actually left
+    // the exported image in; on NVIDIA a wrong oldLayout means the importing
+    // device's sampler reads the image's unresolved (compressed/cleared) state.
+    // GZ_O3DE_PRODUCER_LAYOUT sweeps candidates to find Atom's real final layout:
+    // 0/unset=SHADER_READ, 1=TRANSFER_SRC, 2=GENERAL, 3=COLOR_ATTACHMENT.
+    VkImageLayout producerLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    if (const char *pl = std::getenv("GZ_O3DE_PRODUCER_LAYOUT"))
+    {
+      switch (std::atoi(pl))
+      {
+        case 1: producerLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL; break;
+        case 2: producerLayout = VK_IMAGE_LAYOUT_GENERAL; break;
+        case 3: producerLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL; break;
+        default: break;
+      }
+    }
     O3deVkAcquireFromProducer(st.ctx, st.img,
-        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        producerLayout,
         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
         st.semaphoreWaitValue);
+
+    // Diagnostic (GZ_O3DE_DIAG_CLEAR): overwrite the imported image with solid
+    // red on Qt's own device every frame, right before Qt samples it. If the
+    // window turns red, Qt is genuinely sampling THIS image's content (so a grey
+    // window means the producer's content is not what Qt reads); if it stays
+    // grey, Qt is not sampling this image at all.
+    if (std::getenv("GZ_O3DE_DIAG_CLEAR"))
+    {
+      O3deVkClearImageDiag(st.ctx, st.img,
+          VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 1.0f, 0.0f, 0.0f, 1.0f);
+    }
 
     // Diagnostic (GZ_O3DE_DUMP_PNG): once the pipeline has settled, read the
     // imported image back on Qt's own device and dump it to a PPM. This is the
@@ -273,6 +300,42 @@ void O3deCamera::PrepareForExternalSampling()
             gzmsg << "[gz-o3de] dumped consumer image to " << path << " ("
                   << st.img.width << "x" << st.img.height << ")" << std::endl;
           }
+        }
+      }
+    }
+
+    // Diagnostic (GZ_O3DE_SAMPLE_PROBE): read the imported image back through a
+    // real texture SAMPLER (compute texelFetch) -- the same access path Qt uses --
+    // and dump it. If this PPM is a uniform colour while the GZ_O3DE_DUMP_PNG
+    // transfer-copy PPM shows the shapes, the cross-device SAMPLER is the problem
+    // (not Qt). Fires once.
+    if (std::getenv("GZ_O3DE_SAMPLE_PROBE"))
+    {
+      static int probeFrame = 0;
+      if (probeFrame++ == 31)
+      {
+        std::vector<uint8_t> rgba;
+        if (O3deVkSampleProbeRgba(st.ctx, st.img,
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, &rgba) &&
+            !rgba.empty())
+        {
+          const char *path = std::getenv("GZ_O3DE_SAMPLE_PROBE_PATH");
+          if (!path)
+            path = "/tmp/o3de_sample_probe.ppm";
+          if (FILE *f = std::fopen(path, "wb"))
+          {
+            std::fprintf(f, "P6\n%u %u\n255\n", st.img.width, st.img.height);
+            const size_t n = rgba.size() / 4u;
+            for (size_t i = 0; i < n; ++i)
+              std::fwrite(rgba.data() + i * 4u, 1u, 3u, f);
+            std::fclose(f);
+            gzmsg << "[gz-o3de] SAMPLE PROBE dumped to " << path << " ("
+                  << st.img.width << "x" << st.img.height << ")" << std::endl;
+          }
+        }
+        else
+        {
+          gzerr << "[gz-o3de] SAMPLE PROBE failed" << std::endl;
         }
       }
     }

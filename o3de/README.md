@@ -195,7 +195,9 @@ export GZ_O3DE_PROJECT_NAME=GzAtomPoc
 # O3DE/Atom opens a window on Linux; a display is required.
 export DISPLAY=:1
 
-# Optional helpers:
+# Optional helpers (the full diagnostic env-var surface -- probes, dumps,
+# producer-layout sweep, NO_RESIZE / NO_QFOT / NO_IDLE_TICK toggles, the two
+# headless self-tests -- is catalogued in docs/diagnostic-tools.md):
 #   GZ_O3DE_DEMO_SHAPES=1  inject a red box / green sphere / blue cylinder when
 #                          the scene has no primitives (e.g. an empty MinimalScene)
 #   GZ_O3DE_DUMP_FRAME=1   dump the first rendered frame to /tmp/gz_gui_frame.ppm
@@ -209,23 +211,17 @@ export DISPLAY=:1
 #                          external-memory-fd device extension, then prove a real
 #                          OS FD can be exported from an Atom image via
 #                          vkGetMemoryFdKHR (logged "interop: PROVED FD export").
-#                          The foundation for the future zero-copy Vulkan->GL
-#                          display path. Only effective if the plugin was built
-#                          with -DGZ_O3DE_INTEROP=ON (which needs the O3DE gem
-#                          patch); otherwise it is a logged no-op. The default
-#                          readback path is unaffected. See o3de/M4_INTEROP_DESIGN.md.
-#   GZ_O3DE_INTEROP_GLTEST=1  (with GZ_O3DE_INTEROP=1) run a one-shot headless
-#                          self-test of the Vulkan->GL zero-copy import: a known
-#                          gradient is uploaded into the exportable image, imported
-#                          into a GL texture via its FD on a private EGL context,
-#                          read back and compared. Logs "gltest: PASS/FAIL". Proves
-#                          the import/tiling path without gz-gui or a visible window.
-#   GZ_O3DE_INTEROP_VKTEST=1  (with GZ_O3DE_INTEROP=1) the Vulkan->Vulkan sibling
-#                          of GLTEST: imports the exported FD onto a second,
-#                          private VkDevice and verifies a bit-exact gradient
-#                          readback. Logs "vktest: PASS/FAIL". Proves the
-#                          import-onto-another-VkDevice path that gz-gui's native
-#                          display uses, without gz-gui or a visible window.
+#                          Foundation for the zero-copy Vulkan->Vulkan path. Only
+#                          effective if the plugin was built with -DGZ_O3DE_INTEROP=ON
+#                          (which needs the O3DE gem patch); otherwise a logged
+#                          no-op. The CPU-readback path is unaffected.
+#   GZ_O3DE_INTEROP_VKTEST=1  (with GZ_O3DE_INTEROP=1) one-shot headless self-test
+#                          of the Vulkan->Vulkan zero-copy import: imports the
+#                          exported FD onto a private VkDevice and verifies the
+#                          gradient via BOTH a transfer-copy readback ("vktest")
+#                          AND a real-sampler readback ("vksamplertest"). Both
+#                          PASS = cross-device interop and sampler are working
+#                          on this GPU/driver. See docs/diagnostic-tools.md.
 
 GZ_O3DE_DEMO_SHAPES=1 gz gui -c examples/config/scene3d.config   # <engine>o3de</engine>
 ```
@@ -259,7 +255,9 @@ render-finished timeline semaphore (#26, per-frame cross-device sync) and the co
 resize use-after-free that was the real device-loss bug — compression was a red
 herring). The full debugging journey, elimination table and fix are in
 [docs/zero-copy-interop-findings.md](docs/zero-copy-interop-findings.md); the task
-breakdown is in [docs/task-tracker.md](docs/task-tracker.md).
+breakdown is in [docs/task-tracker.md](docs/task-tracker.md); the diagnostic
+env-var surface (probes, dumps, layout sweep, self-tests) is documented in
+[docs/diagnostic-tools.md](docs/diagnostic-tools.md).
 
 ## Known limitations
 

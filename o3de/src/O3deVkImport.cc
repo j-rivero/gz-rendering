@@ -21,6 +21,7 @@
 #if defined(GZ_O3DE_INTEROP_BUILD)
 
 #include "O3deVkImport.hh"
+#include "O3deSampleProbeSpv.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -89,8 +90,13 @@ bool O3deVkImportImage(const O3deVkDeviceContext &_ctx,
   imgInfo.arrayLayers = 1u;
   imgInfo.samples = VK_SAMPLE_COUNT_1_BIT;
   imgInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+  // STORAGE matches the producer's ShaderWrite bind flag (O3deBackend.cc
+  // EnsureInteropImage): it disables NVIDIA DCC compression so the shared colour
+  // plane is sampler-correct on this device. Opaque-FD sharing requires the
+  // VkImageCreateInfo (incl. usage) to be identical on both sides.
   imgInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
-      VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+      VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
+      VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
       VK_IMAGE_USAGE_TRANSFER_DST_BIT;
   imgInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
   imgInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -120,14 +126,27 @@ bool O3deVkImportImage(const O3deVkDeviceContext &_ctx,
   }
 
   // VkImportMemoryFdInfoKHR transfers ownership of _import.fd to the device.
+  // The producer allocates the exported image as a DEDICATED allocation (one
+  // VkDeviceMemory per image, bound at offset 0, carrying
+  // VkMemoryDedicatedAllocateInfo -- see Atom RHI Image::Init). An OPAQUE_FD
+  // import of dedicated memory must mirror that: chain a
+  // VkMemoryDedicatedAllocateInfo referencing the image we bind here, and bind
+  // at offset 0. Required on NVIDIA proprietary for the importing device's
+  // sampler to interpret the shared image's block-linear tiling correctly; a
+  // sub-allocated (non-dedicated, non-zero-offset) external image samples as a
+  // constant even though transfer/copy reads the correct pixels.
   VkImportMemoryFdInfoKHR importFd{};
   importFd.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR;
   importFd.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
   importFd.fd = _import.fd;
+  VkMemoryDedicatedAllocateInfo dedicated{};
+  dedicated.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
+  dedicated.image = _out->image;
+  dedicated.pNext = &importFd;
   VkMemoryAllocateInfo allocInfo{};
   allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-  allocInfo.pNext = &importFd;
-  allocInfo.allocationSize = _import.allocationSize;  // whole VMA block
+  allocInfo.pNext = &dedicated;
+  allocInfo.allocationSize = _import.allocationSize;  // dedicated allocation size
   allocInfo.memoryTypeIndex = static_cast<uint32_t>(memType);
   if (!VkOk(vkAllocateMemory(_ctx.device, &allocInfo, nullptr, &_out->memory),
           "vkAllocateMemory(import fd)"))
@@ -135,12 +154,19 @@ bool O3deVkImportImage(const O3deVkDeviceContext &_ctx,
     O3deVkDestroyImported(_ctx, _out);
     return false;
   }
+  // Dedicated memory binds at offset 0 (the producer's image owns the whole
+  // allocation); the spec requires memoryOffset == 0 for dedicated memory.
   if (!VkOk(vkBindImageMemory(_ctx.device, _out->image, _out->memory,
-              _import.allocationOffset), "vkBindImageMemory"))
+              0u), "vkBindImageMemory"))
   {
     O3deVkDestroyImported(_ctx, _out);
     return false;
   }
+  std::fprintf(stderr,
+      "[gz-o3de] vkimport: DEDICATED import OK (size=%llu offset=0, "
+      "VkMemoryDedicatedAllocateInfo image=%p) %ux%u\n",
+      static_cast<unsigned long long>(_import.allocationSize),
+      reinterpret_cast<void *>(_out->image), _out->width, _out->height);
 
   // Import the render-finished semaphore if the producer exported one. The
   // producer's fence is a TIMELINE semaphore (Atom's TimelineSemaphoreFence), so
@@ -423,6 +449,374 @@ bool O3deVkReadbackImageRgba(const O3deVkDeviceContext &_ctx,
   vkDestroyCommandPool(_ctx.device, pool, nullptr);
   vkFreeMemory(_ctx.device, mem, nullptr);
   vkDestroyBuffer(_ctx.device, buf, nullptr);
+  return ok;
+}
+
+//////////////////////////////////////////////////
+bool O3deVkClearImageDiag(const O3deVkDeviceContext &_ctx,
+    const O3deVkImportedImage &_img, VkImageLayout _currentLayout,
+    float _r, float _g, float _b, float _a)
+{
+  if (_ctx.device == VK_NULL_HANDLE || _img.image == VK_NULL_HANDLE)
+    return false;
+
+  VkCommandPool pool = VK_NULL_HANDLE;
+  VkCommandPoolCreateInfo poolInfo{};
+  poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+  poolInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+  poolInfo.queueFamilyIndex = _ctx.queueFamily;
+  vkCreateCommandPool(_ctx.device, &poolInfo, nullptr, &pool);
+
+  VkCommandBuffer cmd = VK_NULL_HANDLE;
+  VkCommandBufferAllocateInfo cbAlloc{};
+  cbAlloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+  cbAlloc.commandPool = pool;
+  cbAlloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+  cbAlloc.commandBufferCount = 1u;
+  bool ok = VkOk(vkAllocateCommandBuffers(_ctx.device, &cbAlloc, &cmd),
+      "vkAllocateCommandBuffers(clear)");
+  if (ok)
+  {
+    VkCommandBufferBeginInfo begin{};
+    begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &begin);
+
+    VkImageMemoryBarrier toDst{};
+    toDst.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    toDst.srcAccessMask = 0;
+    toDst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    toDst.oldLayout = _currentLayout;
+    toDst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    toDst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toDst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toDst.image = _img.image;
+    toDst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 0u, 1u};
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toDst);
+
+    VkClearColorValue color{};
+    color.float32[0] = _r; color.float32[1] = _g;
+    color.float32[2] = _b; color.float32[3] = _a;
+    VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 0u, 1u};
+    vkCmdClearColorImage(cmd, _img.image,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &color, 1u, &range);
+
+    VkImageMemoryBarrier back = toDst;
+    back.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    back.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    back.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    back.newLayout = _currentLayout;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &back);
+    vkEndCommandBuffer(cmd);
+
+    VkFence fence = VK_NULL_HANDLE;
+    VkFenceCreateInfo fenceInfo{};
+    fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    vkCreateFence(_ctx.device, &fenceInfo, nullptr, &fence);
+    VkSubmitInfo submit{};
+    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit.commandBufferCount = 1u;
+    submit.pCommandBuffers = &cmd;
+    ok = VkOk(vkQueueSubmit(_ctx.queue, 1u, &submit, fence),
+        "vkQueueSubmit(clear)");
+    if (ok)
+      vkWaitForFences(_ctx.device, 1u, &fence, VK_TRUE, UINT64_MAX);
+    vkDestroyFence(_ctx.device, fence, nullptr);
+  }
+
+  vkDestroyCommandPool(_ctx.device, pool, nullptr);
+  return ok;
+}
+
+//////////////////////////////////////////////////
+bool O3deVkSampleProbeRgba(const O3deVkDeviceContext &_ctx,
+    const O3deVkImportedImage &_img, VkImageLayout _currentLayout,
+    std::vector<uint8_t> *_out)
+{
+  if (!_out || _ctx.device == VK_NULL_HANDLE || _img.image == VK_NULL_HANDLE ||
+      _img.width == 0u || _img.height == 0u)
+    return false;
+  const VkDeviceSize bytes =
+      static_cast<VkDeviceSize>(_img.width) * _img.height * 4u;
+  const VkDevice dev = _ctx.device;
+  bool ok = true;
+
+  // Sampled image view + nearest sampler over the imported image.
+  VkImageView view = VK_NULL_HANDLE;
+  VkSampler sampler = VK_NULL_HANDLE;
+  VkBuffer buf = VK_NULL_HANDLE;
+  VkDeviceMemory mem = VK_NULL_HANDLE;
+  VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
+  VkPipelineLayout pl = VK_NULL_HANDLE;
+  VkShaderModule shader = VK_NULL_HANDLE;
+  VkPipeline pipe = VK_NULL_HANDLE;
+  VkDescriptorPool dpool = VK_NULL_HANDLE;
+  VkCommandPool cpool = VK_NULL_HANDLE;
+  VkFence fence = VK_NULL_HANDLE;
+
+  VkImageViewCreateInfo viewInfo{};
+  viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+  viewInfo.image = _img.image;
+  viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+  viewInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+  viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 0u, 1u};
+  ok = ok && VkOk(vkCreateImageView(dev, &viewInfo, nullptr, &view),
+      "vkCreateImageView(probe)");
+
+  VkSamplerCreateInfo sampInfo{};
+  sampInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+  sampInfo.magFilter = VK_FILTER_NEAREST;
+  sampInfo.minFilter = VK_FILTER_NEAREST;
+  sampInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+  sampInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+  sampInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+  sampInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+  ok = ok && VkOk(vkCreateSampler(dev, &sampInfo, nullptr, &sampler),
+      "vkCreateSampler(probe)");
+
+  // Host-visible storage buffer for the compute output (packed RGBA8).
+  VkBufferCreateInfo bufInfo{};
+  bufInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+  bufInfo.size = bytes;
+  bufInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+  bufInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  ok = ok && VkOk(vkCreateBuffer(dev, &bufInfo, nullptr, &buf),
+      "vkCreateBuffer(probe)");
+  if (ok)
+  {
+    VkMemoryRequirements mr{};
+    vkGetBufferMemoryRequirements(dev, buf, &mr);
+    const int mt = FindMemoryType(_ctx.physicalDevice, mr.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (mt < 0)
+      ok = false;
+    else
+    {
+      VkMemoryAllocateInfo ai{};
+      ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+      ai.allocationSize = mr.size;
+      ai.memoryTypeIndex = static_cast<uint32_t>(mt);
+      ok = VkOk(vkAllocateMemory(dev, &ai, nullptr, &mem),
+          "vkAllocateMemory(probe)");
+      if (ok)
+        vkBindBufferMemory(dev, buf, mem, 0u);
+    }
+  }
+
+  // Descriptor set layout: 0=combined image sampler, 1=storage buffer.
+  if (ok)
+  {
+    VkDescriptorSetLayoutBinding b[2]{};
+    b[0].binding = 0u;
+    b[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    b[0].descriptorCount = 1u;
+    b[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    b[1].binding = 1u;
+    b[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    b[1].descriptorCount = 1u;
+    b[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    VkDescriptorSetLayoutCreateInfo dslInfo{};
+    dslInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    dslInfo.bindingCount = 2u;
+    dslInfo.pBindings = b;
+    ok = VkOk(vkCreateDescriptorSetLayout(dev, &dslInfo, nullptr, &dsl),
+        "vkCreateDescriptorSetLayout(probe)");
+  }
+  if (ok)
+  {
+    VkPushConstantRange pc{};
+    pc.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    pc.offset = 0u;
+    pc.size = 2u * sizeof(uint32_t);
+    VkPipelineLayoutCreateInfo plInfo{};
+    plInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    plInfo.setLayoutCount = 1u;
+    plInfo.pSetLayouts = &dsl;
+    plInfo.pushConstantRangeCount = 1u;
+    plInfo.pPushConstantRanges = &pc;
+    ok = VkOk(vkCreatePipelineLayout(dev, &plInfo, nullptr, &pl),
+        "vkCreatePipelineLayout(probe)");
+  }
+  if (ok)
+  {
+    VkShaderModuleCreateInfo smInfo{};
+    smInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    smInfo.codeSize = sizeof(kO3deSampleProbeSpv);
+    smInfo.pCode = kO3deSampleProbeSpv;
+    ok = VkOk(vkCreateShaderModule(dev, &smInfo, nullptr, &shader),
+        "vkCreateShaderModule(probe)");
+  }
+  if (ok)
+  {
+    VkComputePipelineCreateInfo cpInfo{};
+    cpInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    cpInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    cpInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    cpInfo.stage.module = shader;
+    cpInfo.stage.pName = "main";
+    cpInfo.layout = pl;
+    ok = VkOk(vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1u, &cpInfo, nullptr,
+        &pipe), "vkCreateComputePipelines(probe)");
+  }
+  VkDescriptorSet dset = VK_NULL_HANDLE;
+  if (ok)
+  {
+    VkDescriptorPoolSize ps[2]{};
+    ps[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    ps[0].descriptorCount = 1u;
+    ps[1].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    ps[1].descriptorCount = 1u;
+    VkDescriptorPoolCreateInfo dpInfo{};
+    dpInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    dpInfo.maxSets = 1u;
+    dpInfo.poolSizeCount = 2u;
+    dpInfo.pPoolSizes = ps;
+    ok = VkOk(vkCreateDescriptorPool(dev, &dpInfo, nullptr, &dpool),
+        "vkCreateDescriptorPool(probe)");
+  }
+  if (ok)
+  {
+    VkDescriptorSetAllocateInfo dsAlloc{};
+    dsAlloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    dsAlloc.descriptorPool = dpool;
+    dsAlloc.descriptorSetCount = 1u;
+    dsAlloc.pSetLayouts = &dsl;
+    ok = VkOk(vkAllocateDescriptorSets(dev, &dsAlloc, &dset),
+        "vkAllocateDescriptorSets(probe)");
+  }
+  if (ok)
+  {
+    VkDescriptorImageInfo dii{};
+    dii.sampler = sampler;
+    dii.imageView = view;
+    dii.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    VkDescriptorBufferInfo dbi{};
+    dbi.buffer = buf;
+    dbi.offset = 0u;
+    dbi.range = bytes;
+    VkWriteDescriptorSet w[2]{};
+    w[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    w[0].dstSet = dset;
+    w[0].dstBinding = 0u;
+    w[0].descriptorCount = 1u;
+    w[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    w[0].pImageInfo = &dii;
+    w[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    w[1].dstSet = dset;
+    w[1].dstBinding = 1u;
+    w[1].descriptorCount = 1u;
+    w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    w[1].pBufferInfo = &dbi;
+    vkUpdateDescriptorSets(dev, 2u, w, 0u, nullptr);
+  }
+
+  VkCommandPoolCreateInfo poolInfo{};
+  poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+  poolInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+  poolInfo.queueFamilyIndex = _ctx.queueFamily;
+  if (ok)
+    vkCreateCommandPool(dev, &poolInfo, nullptr, &cpool);
+  VkCommandBuffer cmd = VK_NULL_HANDLE;
+  if (ok)
+  {
+    VkCommandBufferAllocateInfo cb{};
+    cb.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cb.commandPool = cpool;
+    cb.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cb.commandBufferCount = 1u;
+    ok = VkOk(vkAllocateCommandBuffers(dev, &cb, &cmd),
+        "vkAllocateCommandBuffers(probe)");
+  }
+  if (ok)
+  {
+    VkCommandBufferBeginInfo begin{};
+    begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &begin);
+
+    // Image -> SHADER_READ for the compute sampler read (matches Qt's sampling).
+    VkImageMemoryBarrier toRead{};
+    toRead.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    toRead.srcAccessMask = 0;
+    toRead.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    toRead.oldLayout = _currentLayout;
+    toRead.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    toRead.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toRead.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toRead.image = _img.image;
+    toRead.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 0u, 1u};
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+        &toRead);
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0u, 1u,
+        &dset, 0u, nullptr);
+    const uint32_t pcData[2] = {_img.width, _img.height};
+    vkCmdPushConstants(cmd, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0u,
+        2u * sizeof(uint32_t), pcData);
+    vkCmdDispatch(cmd, (_img.width + 7u) / 8u, (_img.height + 7u) / 8u, 1u);
+
+    VkBufferMemoryBarrier bb{};
+    bb.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    bb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    bb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    bb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    bb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    bb.buffer = buf;
+    bb.offset = 0u;
+    bb.size = bytes;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1, &bb, 0, nullptr);
+
+    // Restore the image to the layout the caller expects.
+    VkImageMemoryBarrier back = toRead;
+    back.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    back.dstAccessMask = 0;
+    back.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    back.newLayout = _currentLayout;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &back);
+    vkEndCommandBuffer(cmd);
+
+    VkFenceCreateInfo fi{};
+    fi.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    vkCreateFence(dev, &fi, nullptr, &fence);
+    VkSubmitInfo submit{};
+    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit.commandBufferCount = 1u;
+    submit.pCommandBuffers = &cmd;
+    ok = VkOk(vkQueueSubmit(_ctx.queue, 1u, &submit, fence),
+        "vkQueueSubmit(probe)");
+    if (ok)
+    {
+      vkWaitForFences(dev, 1u, &fence, VK_TRUE, UINT64_MAX);
+      void *mapped = nullptr;
+      if (vkMapMemory(dev, mem, 0u, bytes, 0, &mapped) == VK_SUCCESS)
+      {
+        _out->resize(static_cast<size_t>(bytes));
+        std::memcpy(_out->data(), mapped, static_cast<size_t>(bytes));
+        vkUnmapMemory(dev, mem);
+      }
+      else
+        ok = false;
+    }
+  }
+
+  if (fence) vkDestroyFence(dev, fence, nullptr);
+  if (cpool) vkDestroyCommandPool(dev, cpool, nullptr);
+  if (dpool) vkDestroyDescriptorPool(dev, dpool, nullptr);
+  if (pipe) vkDestroyPipeline(dev, pipe, nullptr);
+  if (shader) vkDestroyShaderModule(dev, shader, nullptr);
+  if (pl) vkDestroyPipelineLayout(dev, pl, nullptr);
+  if (dsl) vkDestroyDescriptorSetLayout(dev, dsl, nullptr);
+  if (mem) vkFreeMemory(dev, mem, nullptr);
+  if (buf) vkDestroyBuffer(dev, buf, nullptr);
+  if (sampler) vkDestroySampler(dev, sampler, nullptr);
+  if (view) vkDestroyImageView(dev, view, nullptr);
   return ok;
 }
 

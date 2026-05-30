@@ -102,6 +102,28 @@ namespace gz
     bool O3deVkReadbackImageRgba(const O3deVkDeviceContext &_ctx,
         const O3deVkImportedImage &_img, VkImageLayout _currentLayout,
         std::vector<uint8_t> *_out);
+
+    /// \brief Diagnostic: clear the imported image to a solid colour on \p _ctx's
+    /// device (transition \p _currentLayout -> TRANSFER_DST, vkCmdClearColorImage,
+    /// back to \p _currentLayout, block on a fence). Used (under an env flag) to
+    /// test whether Qt actually samples this image's content: if the window turns
+    /// the cleared colour, Qt is sampling the shared image; if not, it is showing
+    /// something else. \return True on success.
+    bool O3deVkClearImageDiag(const O3deVkDeviceContext &_ctx,
+        const O3deVkImportedImage &_img, VkImageLayout _currentLayout,
+        float _r, float _g, float _b, float _a);
+
+    /// \brief Diagnostic: read the imported image on \p _ctx's device through an
+    /// actual texture SAMPLER (a compute shader doing texelFetch), not a transfer
+    /// copy, into a CPU RGBA8 buffer. This reproduces exactly the access path Qt's
+    /// scene-graph draw uses, so it distinguishes a cross-device *sampler* problem
+    /// (this returns a constant while O3deVkReadbackImageRgba returns the real
+    /// pixels) from a Qt/QRhi draw problem (this returns the real pixels too).
+    /// Transitions \p _img from \p _currentLayout to SHADER_READ and back.
+    /// \return True on success, \p _out filled (width*height*4, R8G8B8A8).
+    bool O3deVkSampleProbeRgba(const O3deVkDeviceContext &_ctx,
+        const O3deVkImportedImage &_img, VkImageLayout _currentLayout,
+        std::vector<uint8_t> *_out);
   }
 }
 #endif
