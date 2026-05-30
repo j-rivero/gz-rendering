@@ -371,3 +371,108 @@ output symptom under on-screen capture, we have a self-contained bug repro.
 If even the on-screen capture shows the pattern correctly, the bug requires
 the full production threading model (Atom thread + gz-rendering render
 thread + Qt scene-graph thread + MinimalScene's NewTexture handoff).
+
+## 2026-05-30 -- ISOLATED reproduction via a vkQueuePresentKHR layer hook
+
+The grabWindow vs swapchain divergence noted above motivated a new
+verification tool that reads the swapchain image directly. Live-demo
+Xvfb captures had three confounds: Mesa lavapipe (software Vulkan, no
+NVIDIA driver), cross-vendor OPAQUE_FD interop failing by construction,
+and "is `grabWindow()` even faithful to the swapchain?" The right tool
+is to dump the swapchain image at `vkQueuePresentKHR` time, on the real
+GPU, in the real process.
+
+### The tool
+
+`gz-gui/test/regression/swapchain_dump_layer/` ships a ~700-line Vulkan
+layer `VK_LAYER_GZ_swapchain_dump` that intercepts `vkQueuePresentKHR`,
+copies the about-to-be-presented swapchain image to a host-visible
+buffer via a `vkCmdCopyImageToBuffer` + barriers, CPU-waits the fence,
+and writes a PPM file. Activated with:
+
+```
+export VK_LAYER_PATH=<gz-gui build>/test/regression/swapchain_dump_layer
+export VK_INSTANCE_LAYERS=VK_LAYER_GZ_swapchain_dump
+export GZ_SWAPCHAIN_DUMP_PATH=/tmp/out
+```
+
+The layer is general-purpose and the same `.so` + `.json` can be loaded
+into any Vulkan process (including the live `gz gui` interop run). See
+the layer's `README.md` for full docs.
+
+### The isolating regression test (gz-gui)
+
+`qsg_simple_texture_node_vulkan.cc` Test 5
+`FromNativeSwapchainPresentsPattern` loads the layer, builds the *same*
+single-device OPTIMAL pattern image as Test 2 (which PASSES against
+`grabWindow()`), wraps it with `QSGVulkanTexture::fromNative` and a
+`QSGSimpleTextureNode`, pumps a frame, and asserts on the PPM the layer
+wrote.
+
+**Result on NVIDIA proprietary 580 + Qt 6: FAILS.**
+
+The dumped frame is a 128x128 PPM (64x64 logical * `devicePixelRatio=2`)
+in which **all 16384 pixels are exactly `(255, 255, 255)`** -- a single
+unique colour, no noise, no partial pattern. Sidecar metadata:
+
+```
+frame=0
+swapchain_image_index=0
+extent=128x128
+format=44                  # VK_FORMAT_B8G8R8A8_UNORM
+```
+
+`grabWindow()` on the same view reads the pattern's four quadrant
+colours correctly (Tests 1-4 PASS). So in the same process, the same
+`VkImage`, the same `fromNative` wrapper:
+
+| Read path | Result |
+|-----------|--------|
+| `QQuickWindow::grabWindow()` | pattern (red / green / blue / yellow) |
+| swapchain image at present time | uniform white |
+
+This is the same failure shape as the production "uniform 148"
+(different uniform colour because the test's QQuickView default clear
+is white while production's Atom render-target clear is 148).
+
+### What this rules out
+
+The bug isolated by Test 5 needs *none* of the previously suspected
+ingredients:
+
+* no Atom / RPI / RHI on the producer side -- pure Qt;
+* no cross-device FD import -- single device;
+* no producer/consumer threading -- single process, single frame;
+* no `MinimalScene` infrastructure (`NewTexture`/`PrepareNode` plumbing);
+* no recreate-every-frame `fromNative` lifecycle (the failing case here
+  uses Tests 1-3's stable wrapper);
+* no size mismatch between `VkImage` extent and `fromNative` size;
+* no zero-copy interop pipeline at all.
+
+The minimum failing recipe: **`QSGVulkanTexture::fromNative` +
+`QSGSimpleTextureNode` + NVIDIA proprietary Vulkan + Qt 6's WSI present
+path**, on the developer's NVIDIA RTX 4060 Ti / driver 580.159.03.
+
+Implication: this is a Qt 6 QSG/QRhi draw bug, not an Atom or
+interop bug. Fixing the production O3DE/Atom live demo requires either
+fixing Qt's draw of `fromNative` textures into the swapchain, or
+side-stepping it (e.g. drawing into an offscreen `QQuickRenderTarget`
+we own and presenting that ourselves).
+
+### Where to look next in Qt
+
+* `QSGSimpleTextureNode::updatePaintNode` material descriptor (sampler,
+  view, layout) when the texture is a `QSGVulkanTexture::fromNative`
+  wrap (not a native-create-via-QRhi texture). 
+* `QSGVulkanTexture::fromNative` size / `normalizedTextureSubRect`
+  handling when the image is `VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL`.
+* The QRhi Vulkan backend's per-frame draw-call recording for a
+  `QSGSimpleTextureNode` whose texture is a foreign-owned `VkImage` --
+  whether the texture is being bound at all or whether the swapchain
+  ends in its cleared state.
+* Why the QML scene-graph wraps the swapchain in a clear-then-draw
+  sequence that yields the cleared colour (`grabWindow()` paths run
+  the same draw but read back a different render target).
+
+The Test 5 failure makes this debuggable in isolation -- no need to
+spin up the full Atom/o3de stack any more.
