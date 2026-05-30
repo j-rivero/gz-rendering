@@ -1625,13 +1625,31 @@ bool O3deBackend::Impl::BootstrapOnThread()
 
   // Fabricate a minimal argv. We are not a real launcher; gz-gui owns the real
   // process arguments, which O3DE must not see.
+  //
+  // `--console-mode` is what suppresses Atom's parasitic native X11 window.
+  // Without it, GameApplication's QueryApplicationType reports Game (not
+  // ConsoleMode), so Atom's BootstrapSystemComponent::Activate() takes the
+  // "create the game window" branch (vendor/o3de/Gems/Atom/Bootstrap/Code/
+  // Source/BootstrapSystemComponent.cpp:358) -- it builds a 1920x1080
+  // AzFramework::NativeWindow titled "GzAtomPoc" that the WM then stacks on
+  // top of gz-gui's window, fully grey because Atom's render-to-texture
+  // pipeline never draws into that swapchain. With `--console-mode` Atom
+  // takes the IsConsoleMode branch (line 349) which sets m_nativeWindow =
+  // nullptr and additionally runs the BRDF pipeline for render-to-texture
+  // (line 475) -- exactly what we want for the o3de PoC. Pair with
+  // app->SetConsoleModeSupported(true) below; both are required.
   static char arg0[] = "gz-rendering-o3de";
   static char arg1[] = "--rhi=vulkan";
-  static char *fakeArgv[] = { arg0, arg1, nullptr };
-  int fakeArgc = 2;
+  static char arg2[] = "--console-mode";
+  static char *fakeArgv[] = { arg0, arg1, arg2, nullptr };
+  int fakeArgc = 3;
 
   this->app = new AzGameFramework::GameApplication(
       fakeArgc, fakeArgv, AZStd::move(componentAppSettings));
+
+  // Required for `--console-mode` to take effect; GameApplication's
+  // QueryApplicationType ANDs against m_consoleModeSupported.
+  this->app->SetConsoleModeSupported(true);
 
   auto *settingsRegistry = AZ::SettingsRegistry::Get();
   if (!settingsRegistry)
