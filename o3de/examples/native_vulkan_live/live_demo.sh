@@ -58,6 +58,29 @@ export GZ_CONFIG_PATH="$GZ_O3DE_WS/install/share/gz"
 export GZ_RENDERING_PLUGIN_PATH="$GZ_O3DE_WS/install/lib/gz-rendering/engine-plugins"
 export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}:$O3DE_LIBS"
 
+# Force a 1.0 device pixel ratio on Qt's side. Without this, on a HiDPI
+# display Qt 6.4.2 + QRhi-Vulkan + NVIDIA proprietary 580 renders the QSG
+# scene graph (incl. our QSGSimpleTextureNode sampling Atom's imported
+# VkImage) into an offscreen render target sized in LOGICAL pixels
+# (Main.qml 1200x1000 minus the ToolBar header == 1200x902), but the swap-
+# chain is created at PHYSICAL pixels (2048x1536 for DPR=2). The final
+# composite/blit from that offscreen target into the swapchain never
+# fires -- the swapchain stays at its `#fafafa` Material-Light clear and
+# the on-screen viewport is uniformly grey, while the layer trace shows
+# 141 fullscreen-triangle composite draws into the 1200x902 target and
+# zero draws into any swapchain-targeting framebuffer.
+#
+# Forcing DPR=1 makes the logical size match the physical swapchain size
+# so the implicit-render-target reuse path on this driver picks the swap-
+# chain. The Qt 6.8 commit a15c3519 ("Optimize QQuickRt behavior with
+# implicitly created buffers") restructures exactly this caching logic;
+# upgrading the Qt build to >=6.8 should make this workaround unnecessary.
+# Until then, both vars below are required (QT_SCALE_FACTOR alone is not
+# enough on Qt 6.4.2 -- Qt re-derives a DPR from the screen unless the
+# auto-scaling environment is also disabled).
+export QT_SCALE_FACTOR=1
+export QT_AUTO_SCREEN_SCALE_FACTOR=0
+
 # Qt MinimalScene: use the Vulkan RHI backend (the importer side of zero-copy).
 export GZ_GUI_RENDER_ENGINE_GUI_API_BACKEND=vulkan
 # O3DE interop path: enabled, live (per-frame), with the render-finished
