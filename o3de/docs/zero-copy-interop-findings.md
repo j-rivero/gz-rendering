@@ -476,3 +476,134 @@ we own and presenting that ourselves).
 
 The Test 5 failure makes this debuggable in isolation -- no need to
 spin up the full Atom/o3de stack any more.
+
+## 2026-05-30 (cont) -- Production trace narrows the bug to a single fullscreen-triangle composite
+
+Extended `VK_LAYER_GZ_swapchain_dump` with `GZ_SWAPCHAIN_DRAW_TRACE=1` (per
+`gz-gui/test/regression/swapchain_dump_layer/README.md`) to log every
+`vkCmdBeginRenderPass`/`vkCmdBindPipeline`/`vkCmdBindDescriptorSets`/
+`vkCmdDraw*`/`vkCmdEndRenderPass` (plus dynamic-rendering and
+`vkCmdBlitImage`/`vkCmdCopyImage`/`vkCmdCopyImageToBuffer`/
+`vkCmdResolveImage`). Ran it on the actual `gz gui` o3de live demo on `:1`
+for 12 s and dumped 3 swapchain present frames.
+
+**Quantitative breakdown of the production trace:**
+
+| Category | Count |
+|----------|------:|
+| non-swapchain `BeginRenderPass` with draws | 126,197 |
+| non-swapchain `BeginRenderPass` empty       | 115,658 |
+| swapchain-targeting `BeginRenderPass` with draws | 10,480 |
+| swapchain-targeting `BeginRenderPass` empty |       9 |
+| `BeginRendering` (dynamic) | 0 |
+| `CmdCopyImage` / `CmdBlitImage` / `CmdResolveImage` | 0 |
+| `CmdCopyImageToBuffer` (app side, not the dump) | 0 |
+
+**The three dumped swapchain-present frames:**
+
+| frame | extent | unique colours | top palette |
+|------:|--------|---------------:|-------------|
+| 0000 | 1024x768 | **1914** | (255,255,255), (255,87,34) orange, (3,169,244) blue -- normal UI |
+| 0001 | 1024x768 | 1914 | same |
+| 0002 | **1920x1080** | **1** | (148,148,148) -- Atom's clear colour |
+
+The bug ONLY manifests after the window resizes to 1920x1080. Before
+resize, the swapchain renders correctly (1914 colours, UI chrome intact).
+After resize, it goes uniform 148.
+
+**Framebuffer-attachment shape changes across the resize:**
+
+| swapchain framebuffer creates | attachment count | when |
+|------------------------------:|------------------|------|
+| 3  | 2 attachments | pre-resize (1024x768) |
+| 12 | **1 attachment** | post-resize (1920x1080) |
+
+So Qt changes its rendering strategy on resize. Pre-resize the swapchain
+framebuffer holds 2 attachments (likely colour + depth, with QSG drawing
+directly into it); post-resize the swapchain framebuffer has a single
+colour attachment and a different code path is used to populate it.
+
+**What the post-resize swapchain-targeting pass actually does:**
+
+A representative pass after the resize, in trace order:
+
+```
+BeginRenderPass fb=... clearCount=1 render_area=1920x1080 (SWAPCHAIN-targeting)
+  clear[0] color = {0.000, 0.000, 0.000, 0.000}    <-- BLACK clear, NOT 148
+  BindPipeline       bp=0 pipeline=0x...
+  BindDescriptorSets first=0 count=1 set0=0x...    <-- ONE sampled texture
+  Draw               verts=3 inst=1 firstV=0       <-- ONE fullscreen TRIANGLE
+EndRenderPass         binds=1 sets=1 draws=1 clears=0
+```
+
+3 vertices = fullscreen triangle. So post-resize Qt's swapchain pass is
+literally: "clear swapchain to black + sample one texture across one
+fullscreen triangle into the swapchain". This is the standard
+QRhiSwapChainRenderTarget composite pattern when the QSG scene first
+renders into an offscreen colour FBO and then composites that FBO onto
+the swapchain via a single textured triangle.
+
+Therefore:
+
+- the 148 we see in the swapchain present is NOT from a render-pass
+  clear (which clears to black);
+- the 148 is NOT from `vkCmdClearColorImage`/`vkCmdClearAttachments`
+  (the trace counts 0 of both on the swapchain image);
+- the 148 IS from the single sampled texture that the fullscreen
+  triangle reads -- i.e. the offscreen FBO that QSG renders into.
+
+So the chain of failure is:
+
+```
+Atom-rendered VkImage (correct: 67 colours, shapes)
+   --> imported on Qt's VkDevice via VK_KHR_external_memory_fd
+       (probe verified: sampler reads shapes byte-identically)
+   --> wrapped in a QSGTexture via QSGVulkanTexture::fromNative
+   --> added to a QSGSimpleTextureNode in MinimalScene's QML scene
+   --> QSG offscreen FBO   <-- !!! becomes uniform 148 here
+   --> fullscreen-triangle composite samples the FBO into the swapchain
+   --> swapchain present shows uniform 148
+```
+
+The QSG-FBO step is where the imported texture's content vanishes. This
+is much tighter than "Qt+Vulkan fromNative is broken": the imported
+VkImage IS sampled (the probe proved it), but somewhere between the
+QSGSimpleTextureNode draw and the offscreen FBO, the result is the
+FBO's clear colour (= MinimalScene QML's background, which happens to
+be Atom's clear) -- never the imported texture's pixels.
+
+**Gz-gui Test 5 vs production -- different failure modes:**
+
+Test 5 (`qsg_simple_texture_node_vulkan_swapchain_present`) also dumps a
+uniform-fill swapchain but the trace shows ALL its swapchain passes have
+`binds=0 sets=0 draws=0`. Test 5's QQuickView has no QML loaded (the
+test creates a `QQuickItem` programmatically, parented to
+`view.contentItem()`); the QSG renderer never schedules a draw for that
+configuration. So Test 5's uniform-white swapchain is "no draws issued",
+while production's uniform-148 is "draws issued but they sampled the
+wrong texture/FBO". Both manifest as a uniform-colour present, but the
+root causes diverge.
+
+Implications for Test 5: it's a useful sentinel for "QSG schedules no
+draws against a fromNative-textured node in this configuration" but it
+does NOT reproduce the production composite-path bug. A follow-up
+variant should add an actual QML scene (a `Rectangle { color: ... }`
+plus the PatternItem child) so the QSG render reaches the composite
+phase; THAT test would reproduce the production fullscreen-triangle
+failure if the bug is in QSG/QRhi's sampling of fromNative textures
+into an offscreen FBO.
+
+**Next investigation:**
+
+Find which image the post-resize fullscreen-triangle's sampler binding
+points at. Two paths:
+
+1. Hook `vkUpdateDescriptorSets` to record per-set per-binding image
+   bindings, then at each composite `BindDescriptorSets` log the
+   sampled image's identity. ~150 lines added to the layer.
+2. Dump every non-swapchain colour-attachment image post-render with
+   the existing `vkCmdCopyImageToBuffer` machinery, find which one
+   ends up uniform 148.
+
+Path 1 gives a single decisive answer per frame. Path 2 is brute force
+but reuses the existing dump path. Both shippable.
