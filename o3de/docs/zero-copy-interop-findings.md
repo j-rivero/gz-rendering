@@ -317,3 +317,57 @@ Run the live demo with the existing diagnostics layered:
 * `GZ_GUI_VULKAN_DIAG=1` -- log every `VkImage` handle Qt actually wraps via
   `fromNative` and compare against the producer's reported handle. A mismatch
   here pinpoints the production-only stale-handle case.
+
+### Findings from the next-diagnostic run (2026-05-30)
+
+Ran the live demo on a throwaway Xvfb (`:99`) with the four toggles above
+plus an `import -window root` capture of the framebuffer at frame ~120. The
+result:
+
+| Source | What it reports | Pixel content |
+|--------|-----------------|---------------|
+| Atom's exported `VkImage` (`O3deBackend.cc`) | handle `0x777294873ed0`, 512x512 | -- |
+| Imported VkImage on Qt's device (`vkimport DEDICATED import OK`) | handle `0x63ccc62a0690`, 512x512 | -- |
+| `RenderTextureMetalId` handoff (`O3deCamera.cc`) | handle `0x63ccc62a0690`, 512x512 | -- |
+| Qt's `fromNative` wrap (`[gz-gui-diag] CreateTexture`) | handle `0x63ccc62a0690` (every frame), size `0x0` -> `1024x1024` -> `1024x670` (window-sized) | -- |
+| `GZ_O3DE_DUMP_PNG` (transfer-copy readback, Qt's device) | 512x512 PPM | **67 unique colours**, centre pixel `(102, 102, 102)`, shapes present |
+| `GZ_O3DE_SAMPLE_PROBE` (sampler readback, Qt's device) | 512x512 PPM | **67 unique colours**, byte-identical to transfer dump |
+| Xvfb root capture (the actual presented framebuffer) | 1280x800 PNG | **uniform `(148, 148, 148)`** -- Atom's clear colour |
+
+So the imported VkImage on Qt's device carries the producer's correct
+shapes (proven two independent ways: memory transfer copy AND sampler-path
+compute readback). Qt's `fromNative` wraps the correct VkImage handle every
+frame. Yet the swapchain-presented framebuffer is uniform Atom-clear.
+
+Crucially: the centre-pixel value in the dumps `(102, 102, 102)` does not
+match the screen value `(148, 148, 148)`. So Qt is rendering content
+*different from* what the imported VkImage actually contains -- not just a
+washed-out version of the same content.
+
+### What does NOT reproduce the symptom in isolation
+
+The gz-gui regression test added four cases (all four pass against
+`QQuickWindow::grabWindow`):
+
+* Test 4a -- size mismatch (`fromNative` told 2x larger than VkImage extent): harmless.
+* Test 4 (the current 4b) -- recreate-every-frame `fromNative` wrapper around the same VkImage: harmless.
+
+Combined with Tests 1-3 (LINEAR / OPTIMAL single-device / cross-device FD
+import all PASS), no isolated test reproduces the bug.
+
+**Important caveat**: an Xvfb capture of Test 3's passing run shows a pure
+64x64 white block on screen -- not the four-quadrant pattern that
+`grabWindow()` reports as correct. So `grabWindow()` and the swapchain
+presentation diverge: the regression tests' assertion on `grabWindow()`
+is not the same as what the user sees. The production bug lives on the
+swapchain-present path that `grabWindow()` does not exercise.
+
+### Next investigation -- on-screen verification
+
+The next test variant must capture the actual swapchain framebuffer (Xvfb
+root grab or RenderDoc swapchain capture), not the grabWindow output, and
+assert the pattern there. If a single-device test reproduces the uniform-
+output symptom under on-screen capture, we have a self-contained bug repro.
+If even the on-screen capture shows the pattern correctly, the bug requires
+the full production threading model (Atom thread + gz-rendering render
+thread + Qt scene-graph thread + MinimalScene's NewTexture handoff).
