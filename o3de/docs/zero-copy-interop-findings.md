@@ -268,13 +268,52 @@ removing variables one at a time:
 Net: the bug requires the **cross-device FD-imported VkImage** specifically. Not
 OPTIMAL alone, not COLOR_ATTACHMENT alone, not fromNative alone.
 
-### Remaining hypothesis to test
+### Hypothesis 18 -- also eliminated (cross-device FD import is fine too)
 
-| # | Hypothesis | Test (planned, gz-gui) | Status |
-|---|-----------|------------------------|--------|
-| 18 | `QSGSimpleTextureNode`'s draw mishandles a `fromNative`-wrapped VkImage when the underlying VkDeviceMemory was imported from a foreign device's exported FD | `FromNativeRendersImportedFdPattern`: stand up a private VkInstance/VkDevice in the test, create an exportable OPTIMAL VkImage there with dedicated allocation, populate it, export the FD, import onto Qt's device, wrap + grab + assert (the same pattern check as the two passing tests) | 📋 **Planned** -- the focused harness against which to debug QSGSimpleTextureNode without any O3DE/Atom dependency. |
+| # | Hypothesis | Test (gz-gui) | Result |
+|---|-----------|---------------|--------|
+| 18 | `QSGSimpleTextureNode`'s draw mishandles a `fromNative`-wrapped VkImage when the underlying VkDeviceMemory was imported from a foreign device's exported FD | `FromNativeRendersImportedFdPattern`: stand up a private VkInstance/VkDevice in the test, create an exportable OPTIMAL VkImage there with dedicated allocation, populate it, transition+QFOT-release to EXTERNAL, export the FD, import onto Qt's device with `VkMemoryDedicatedAllocateInfo`, QFOT-acquire onto Qt's queue, wrap + grab + assert (the same pattern check as the two passing tests) | ❌ **Disproven** -- PASSES. The cross-device round-trip is fine, even with dedicated allocation, QFOT, OPAQUE_FD, and OPTIMAL tiling. |
 
-If #18 fails, we have a sub-second single-binary reproducer for the QSGSimpleTextureNode
-cross-device-import bug. If it passes, the bug is more specific still (something Atom
-does differently from a staging upload, e.g. a render-target layout the importer's
-sampler can't read).
+### Where the production bug must therefore live
+
+Hypotheses 16, 17 and 18 together eliminate every Qt + Vulkan primitive variant
+along the path. The closest test-level analog to the production setup -- second
+VkInstance, OPTIMAL exportable image, dedicated allocation, OPAQUE_FD export +
+import, QFOT release+acquire, `fromNative` + `QSGSimpleTextureNode` -- renders
+the pattern correctly. The bug must therefore live in one of the dimensions
+the regression test does NOT exercise:
+
+1. **What Atom's pipeline leaves in the image vs a clean staging upload.** Atom
+   renders into the exportable image via its FrameGraph (`CreateRenderPipeline
+   ForImage`) -- the image is a colour attachment, not a staging-copy target.
+   The "compression handoff" theory was disproven by `GZ_O3DE_NO_RESIZE`
+   (hypothesis 13) and by the sampler probe (which reads the producer's pixels
+   correctly), but there may be a more specific Atom-side state -- e.g. an
+   incomplete copy-attachment-read in `FenceSignalPrepare` (#26's signal scope),
+   a mismatched final layout the consumer's acquire doesn't undo, or a queue
+   submit timing window between Atom's host-sync and Qt's frame.
+2. **MinimalScene's threading model.** Production runs Atom on its own
+   dedicated thread, the gz-rendering camera on the gz-gui render thread, and
+   `TextureNodeRhiVulkan::CreateTexture` / `PrepareNode` on Qt's scene-graph
+   thread. The regression test bypasses all of this with a single QQuickItem
+   doing direct `updatePaintNode`. A handoff race between threads, or a stale
+   VkImage handle being read through `camera->RenderTextureMetalId()` after a
+   resize re-import, would surface in production but not in the test.
+3. **Re-import-on-resize churn.** Production re-imports the image on every
+   gen change; the consumer "retires" old imports past Qt's in-flight frame
+   but the `QSGSimpleTextureNode`'s previously-wrapped texture may still
+   reference the *old* VkImage on the next `PrepareNode`, even though the
+   handle has been retired. The test creates exactly one VkImage and never
+   resizes, so this is not exercised.
+
+### Next focused diagnostic
+
+Run the live demo with the existing diagnostics layered:
+* `GZ_O3DE_INTEROP=1 GZ_O3DE_INTEROP_LIVE=1 GZ_O3DE_INTEROP_SEM=1` -- normal
+  live path.
+* `GZ_O3DE_NO_RESIZE=1` -- pin the image so resize churn is eliminated.
+* `GZ_O3DE_DUMP_PNG=1` + `GZ_O3DE_SAMPLE_PROBE=1` -- confirm the consumer
+  still sees correct pixels at the moment of grey display.
+* `GZ_GUI_VULKAN_DIAG=1` -- log every `VkImage` handle Qt actually wraps via
+  `fromNative` and compare against the producer's reported handle. A mismatch
+  here pinpoints the production-only stale-handle case.
