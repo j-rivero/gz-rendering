@@ -51,6 +51,8 @@
 #include <condition_variable>
 #include <mutex>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <Atom/RPI.Public/RPISystemInterface.h>
@@ -60,6 +62,13 @@
 #include <Atom/RPI.Public/Pass/Specific/RenderToTexturePass.h>
 #include <Atom/RPI.Public/AuxGeom/AuxGeomFeatureProcessorInterface.h>
 #include <Atom/RPI.Public/AuxGeom/AuxGeomDraw.h>
+// M6 lights (Atom Common, header-only interfaces): the 3 light feature
+// processors we acquire/release/sync handles against. PhotometricValue
+// supplies the strongly-typed colour types Set*Intensity takes.
+#include <Atom/Feature/CoreLights/DirectionalLightFeatureProcessorInterface.h>
+#include <Atom/Feature/CoreLights/SimplePointLightFeatureProcessorInterface.h>
+#include <Atom/Feature/CoreLights/SimpleSpotLightFeatureProcessorInterface.h>
+#include <Atom/Feature/CoreLights/PhotometricValue.h>
 #include <Atom/RPI.Public/Image/AttachmentImage.h>
 #include <Atom/RPI.Public/Image/AttachmentImagePool.h>
 #include <Atom/RPI.Public/Image/ImageSystemInterface.h>
@@ -325,6 +334,7 @@ class O3deBackend::Impl
   // Latest input posted by RenderFrame() (gz-gui thread -> render thread).
   public: O3deCameraData pendingCamera;
   public: std::vector<O3deShapeData> pendingShapes;
+  public: std::vector<O3deLightData> pendingLights;
   public: uint32_t pendingWidth = 0u;
   public: uint32_t pendingHeight = 0u;
   public: bool haveInput = false;
@@ -338,8 +348,34 @@ class O3deBackend::Impl
   // Render-thread-private working copy of the current scene contents.
   public: O3deCameraData camera;
   public: std::vector<O3deShapeData> shapes;
+  public: std::vector<O3deLightData> lights;
   public: uint32_t reqWidth = 0u;
   public: uint32_t reqHeight = 0u;
+
+  // ---- M6 lights ----------------------------------------------------------
+  // Cached feature-processor interface pointers (set in SetupScene after the
+  // scene activates). The 3 light FPs are pre-registered with the scene at
+  // line ~470 below; we just keep raw pointers for the per-frame Set*Data
+  // calls. nullptr until SetupScene completes; SubmitLights() short-circuits
+  // each branch independently if its FP isn't available.
+  public: AZ::Render::DirectionalLightFeatureProcessorInterface *dirLightFp
+      = nullptr;
+  public: AZ::Render::SimplePointLightFeatureProcessorInterface *pointLightFp
+      = nullptr;
+  public: AZ::Render::SimpleSpotLightFeatureProcessorInterface *spotLightFp
+      = nullptr;
+  // gz light id (stable across frames) -> Atom FP-issued handle. SubmitLights()
+  // acquires on first sighting, syncs every frame, and releases when the id
+  // disappears from the gathered set.
+  public: std::unordered_map<uint32_t,
+      AZ::Render::DirectionalLightFeatureProcessorInterface::LightHandle>
+      dirLightHandles;
+  public: std::unordered_map<uint32_t,
+      AZ::Render::SimplePointLightFeatureProcessorInterface::LightHandle>
+      pointLightHandles;
+  public: std::unordered_map<uint32_t,
+      AZ::Render::SimpleSpotLightFeatureProcessorInterface::LightHandle>
+      spotLightHandles;
 
   // Capture scratch (render thread only), refilled each RenderOneFrame().
   public: AZStd::vector<uint8_t> captureBuffer;
@@ -405,6 +441,13 @@ class O3deBackend::Impl
   public: void ApplyCamera(uint32_t _width, uint32_t _height);
   /// \brief Submit the current frame's AuxGeom primitives.
   public: void SubmitPrimitives();
+  /// \brief Synchronise the current frame's lights to the 3 light feature
+  /// processors: acquire a handle on first sighting, set its photometric
+  /// colour + transform + attenuation + cone angles, and release handles
+  /// whose id has disappeared from the gathered set. AuxGeom primitives do
+  /// NOT consume these (debug-draw uses a fixed shader); the lights become
+  /// visible once the scene has a shaded surface (M8 PBR / M9 meshes).
+  public: void SubmitLights();
   /// \brief Stop driving the offscreen pipeline when the render thread is told
   /// to stop. Runs on the render thread itself (process exit). It deliberately
   /// does NOT tear down the O3DE/Vulkan runtime -- that crashes in upstream GPU
@@ -465,7 +508,13 @@ bool O3deBackend::Impl::SetupScene(uint32_t _width, uint32_t _height)
   // The MainPipeline's LightCullingPass dereferences every light feature
   // processor, so all must be present (omitting one segfaults on a null FP).
   // This is the full AtomToolsFramework::PreviewRenderer set (DirectionalLight
-  // omitted - known multi-instance flicker bug) plus AuxGeom for our shapes.
+  // re-enable rolled back: even with zero instances, registering its FP here
+  // turns the existing live-display path entirely grey in the demo -- the
+  // QSG offscreen FBO ends up sampling an unwritten gen of the imported
+  // image. Root cause not yet narrowed; sticking with the original omission
+  // and letting SubmitLights() short-circuit the DIRECTIONAL branch when its
+  // FP pointer is null. The directional case will land alongside the M7
+  // shadow work that needs the same FP.) plus AuxGeom for our shapes.
   const AZStd::vector<AZStd::string> featureProcessors = {
     "AZ::Render::TransformServiceFeatureProcessor",
     "AZ::Render::MeshFeatureProcessor",
@@ -516,6 +565,21 @@ bool O3deBackend::Impl::SetupScene(uint32_t _width, uint32_t _height)
         AZ::Name("MainCamera"), AZ::RPI::View::UsageCamera);
     this->scene->Activate();
     AZ::RPI::RPISystemInterface::Get()->RegisterScene(this->scene);
+
+    // M6: cache the 3 light FP pointers. The scene's FP set is fixed at
+    // create-time, so this is a one-shot lookup; SubmitLights() consults
+    // them every frame to acquire/release/sync per-light handles.
+    this->dirLightFp = this->scene->GetFeatureProcessor<
+        AZ::Render::DirectionalLightFeatureProcessorInterface>();
+    this->pointLightFp = this->scene->GetFeatureProcessor<
+        AZ::Render::SimplePointLightFeatureProcessorInterface>();
+    this->spotLightFp = this->scene->GetFeatureProcessor<
+        AZ::Render::SimpleSpotLightFeatureProcessorInterface>();
+    std::fprintf(stderr,
+        "[gz-o3de] M6 light FPs cached: dir=%p point=%p spot=%p\n",
+        static_cast<void *>(this->dirLightFp),
+        static_cast<void *>(this->pointLightFp),
+        static_cast<void *>(this->spotLightFp));
     // Create the exportable image + pipeline at the bootstrap placeholder size so
     // the consumer has an image to import the moment it builds its texture node
     // (deferring until the first frame races Qt, which then presents a null
@@ -552,6 +616,7 @@ bool O3deBackend::Impl::SetupScene(uint32_t _width, uint32_t _height)
     this->pipeline->AddToRenderTick();
     for (int i = 0; i < 5; ++i)
     {
+      this->SubmitLights();
       this->SubmitPrimitives();
       this->app->PumpSystemEventLoopUntilEmpty();
       this->app->TickSystem();
@@ -584,6 +649,20 @@ bool O3deBackend::Impl::SetupScene(uint32_t _width, uint32_t _height)
   this->scene->AddRenderPipeline(this->pipeline);
   this->scene->Activate();
   rpiSystem->RegisterScene(this->scene);
+
+  // M6: cache the 3 light FP pointers (see the interop branch above for the
+  // rationale; same one-shot lookup applies on the offscreen path).
+  this->dirLightFp = this->scene->GetFeatureProcessor<
+      AZ::Render::DirectionalLightFeatureProcessorInterface>();
+  this->pointLightFp = this->scene->GetFeatureProcessor<
+      AZ::Render::SimplePointLightFeatureProcessorInterface>();
+  this->spotLightFp = this->scene->GetFeatureProcessor<
+      AZ::Render::SimpleSpotLightFeatureProcessorInterface>();
+  std::fprintf(stderr,
+      "[gz-o3de] M6 light FPs cached: dir=%p point=%p spot=%p\n",
+      static_cast<void *>(this->dirLightFp),
+      static_cast<void *>(this->pointLightFp),
+      static_cast<void *>(this->spotLightFp));
 
   // Apply the multisample state at the application level *after* the scene is
   // registered (mirrors BootstrapSystemComponent). This both selects the MSAA
@@ -1397,6 +1476,123 @@ void O3deBackend::Impl::SubmitPrimitives()
 }
 
 //////////////////////////////////////////////////
+void O3deBackend::Impl::SubmitLights()
+{
+  // Build the set of gz light ids present this frame, partitioned by type --
+  // we use it both to (a) acquire+sync each one against the matching FP and
+  // (b) release any handle whose id is no longer in the set.
+  std::unordered_set<uint32_t> dirIds;
+  std::unordered_set<uint32_t> pointIds;
+  std::unordered_set<uint32_t> spotIds;
+
+  for (const O3deLightData &light : this->lights)
+  {
+    const AZ::Vector3 pos = GzVec(light.pos);
+    const AZ::Quaternion rot = GzQuat(light.quat);
+    const AZ::Vector3 dir = AZ::Vector3(
+        aznumeric_cast<float>(light.dir[0]),
+        aznumeric_cast<float>(light.dir[1]),
+        aznumeric_cast<float>(light.dir[2]));
+    const float i = aznumeric_cast<float>(light.intensity);
+    // gz light intensity is dimensionless; gz callers typically pass values
+    // around 1.0 (the default in BaseLight). Scale the diffuse colour by it
+    // and pass straight through to PhotometricColor -- the user is expected
+    // to pre-scale into the appropriate unit (lux for directional, candela
+    // for point/spot) when realistic photometry matters.
+    const AZ::Color rgb(
+        aznumeric_cast<float>(light.diffuseColor[0]) * i,
+        aznumeric_cast<float>(light.diffuseColor[1]) * i,
+        aznumeric_cast<float>(light.diffuseColor[2]) * i,
+        1.0f);
+
+    switch (light.type)
+    {
+      case O3deLightData::Type::DIRECTIONAL:
+      {
+        if (!this->dirLightFp)
+          break;
+        dirIds.insert(light.id);
+        auto it = this->dirLightHandles.find(light.id);
+        if (it == this->dirLightHandles.end())
+          it = this->dirLightHandles.emplace(
+              light.id, this->dirLightFp->AcquireLight()).first;
+        this->dirLightFp->SetRgbIntensity(it->second,
+            AZ::Render::PhotometricColor<AZ::Render::PhotometricUnit::Lux>(rgb));
+        this->dirLightFp->SetDirection(it->second, dir);
+        break;
+      }
+      case O3deLightData::Type::POINT:
+      {
+        if (!this->pointLightFp)
+          break;
+        pointIds.insert(light.id);
+        auto it = this->pointLightHandles.find(light.id);
+        if (it == this->pointLightHandles.end())
+          it = this->pointLightHandles.emplace(
+              light.id, this->pointLightFp->AcquireLight()).first;
+        this->pointLightFp->SetRgbIntensity(it->second,
+            AZ::Render::PhotometricColor<AZ::Render::PhotometricUnit::Candela>(
+                rgb));
+        this->pointLightFp->SetPosition(it->second, pos);
+        this->pointLightFp->SetAttenuationRadius(it->second,
+            aznumeric_cast<float>(light.attenRange));
+        break;
+      }
+      case O3deLightData::Type::SPOT:
+      {
+        if (!this->spotLightFp)
+          break;
+        spotIds.insert(light.id);
+        auto it = this->spotLightHandles.find(light.id);
+        if (it == this->spotLightHandles.end())
+          it = this->spotLightHandles.emplace(
+              light.id, this->spotLightFp->AcquireLight()).first;
+        this->spotLightFp->SetRgbIntensity(it->second,
+            AZ::Render::PhotometricColor<AZ::Render::PhotometricUnit::Candela>(
+                rgb));
+        // SimpleSpotLight takes a full transform; gz puts the spot down its
+        // local -Z by convention. Use the quaternion the gz wrapper supplied.
+        this->spotLightFp->SetTransform(it->second,
+            AZ::Transform::CreateFromQuaternionAndTranslation(rot, pos));
+        this->spotLightFp->SetAttenuationRadius(it->second,
+            aznumeric_cast<float>(light.attenRange));
+        this->spotLightFp->SetConeAngles(it->second,
+            aznumeric_cast<float>(light.innerAngle),
+            aznumeric_cast<float>(light.outerAngle));
+        break;
+      }
+    }
+  }
+
+  // Release handles whose ids are no longer in the gathered set.
+  auto releaseStale = [](auto &_handles, const std::unordered_set<uint32_t> &_keep,
+      auto *_fp)
+  {
+    if (!_fp)
+    {
+      _handles.clear();
+      return;
+    }
+    for (auto it = _handles.begin(); it != _handles.end();)
+    {
+      if (_keep.find(it->first) == _keep.end())
+      {
+        auto handle = it->second;
+        _fp->ReleaseLight(handle);
+        it = _handles.erase(it);
+      }
+      else
+      {
+        ++it;
+      }
+    }
+  };
+  releaseStale(this->dirLightHandles, dirIds, this->dirLightFp);
+  releaseStale(this->pointLightHandles, pointIds, this->pointLightFp);
+  releaseStale(this->spotLightHandles, spotIds, this->spotLightFp);
+}
+
+//////////////////////////////////////////////////
 O3deBackend &O3deBackend::Instance()
 {
   // Leaked on purpose: the O3DE runtime is never torn down (see header).
@@ -1574,6 +1770,7 @@ void O3deBackend::Impl::RenderThreadMain()
       {
         this->camera = this->pendingCamera;
         this->shapes = this->pendingShapes;
+        this->lights = this->pendingLights;
         this->reqWidth = this->pendingWidth;
         this->reqHeight = this->pendingHeight;
         this->haveInput = false;
@@ -1961,6 +2158,7 @@ static void MaybeInjectDemoShapes(std::vector<O3deShapeData> &_shapes)
 //////////////////////////////////////////////////
 bool O3deBackend::RenderFrame(const O3deCameraData &_camera,
     const std::vector<O3deShapeData> &_shapes,
+    const std::vector<O3deLightData> &_lights,
     uint32_t _width, uint32_t _height, uint8_t *_outRgba)
 {
   Impl &d = *this->dataPtr;
@@ -1971,6 +2169,7 @@ bool O3deBackend::RenderFrame(const O3deCameraData &_camera,
   // the render thread).
   std::vector<O3deShapeData> shapes = _shapes;
   MaybeInjectDemoShapes(shapes);
+  std::vector<O3deLightData> lights = _lights;
 
   // Post the input to the render thread and wait for a frame rendered after it.
   uint64_t startSeq = 0u;
@@ -1978,6 +2177,7 @@ bool O3deBackend::RenderFrame(const O3deCameraData &_camera,
     std::lock_guard<std::mutex> lock(d.mutex);
     d.pendingCamera = _camera;
     d.pendingShapes = std::move(shapes);
+    d.pendingLights = std::move(lights);
     d.pendingWidth = _width;
     d.pendingHeight = _height;
     d.haveInput = true;
@@ -2013,6 +2213,7 @@ bool O3deBackend::RenderFrame(const O3deCameraData &_camera,
 //////////////////////////////////////////////////
 bool O3deBackend::RenderFrameForInterop(const O3deCameraData &_camera,
     const std::vector<O3deShapeData> &_shapes,
+    const std::vector<O3deLightData> &_lights,
     uint32_t _width, uint32_t _height)
 {
   Impl &d = *this->dataPtr;
@@ -2025,6 +2226,7 @@ bool O3deBackend::RenderFrameForInterop(const O3deCameraData &_camera,
 
   std::vector<O3deShapeData> shapes = _shapes;
   MaybeInjectDemoShapes(shapes);
+  std::vector<O3deLightData> lights = _lights;
 
   // Post the input to the render thread and wait for a frame rendered after it
   // (the frame is published into the shared image by RenderOneFrame()).
@@ -2033,6 +2235,7 @@ bool O3deBackend::RenderFrameForInterop(const O3deCameraData &_camera,
     std::lock_guard<std::mutex> lock(d.mutex);
     d.pendingCamera = _camera;
     d.pendingShapes = std::move(shapes);
+    d.pendingLights = std::move(lights);
     d.pendingWidth = _width;
     d.pendingHeight = _height;
     d.haveInput = true;
@@ -2101,6 +2304,7 @@ bool O3deBackend::Impl::RenderOneFrame()
       this->pipeline->AddToRenderTick();
       for (int i = 0; i < 5; ++i)
       {
+        this->SubmitLights();
         this->SubmitPrimitives();
         this->app->PumpSystemEventLoopUntilEmpty();
         this->app->TickSystem();
@@ -2115,6 +2319,7 @@ bool O3deBackend::Impl::RenderOneFrame()
     this->pipeline->AddToRenderTick();
     for (int k = 0; k < 3; ++k)
     {
+      this->SubmitLights();
       this->SubmitPrimitives();
       // #26: import the fence-signal scope on exactly the last render tick, so
       // its SignalFence runs once per frame after the scene is drawn into the
@@ -2230,6 +2435,7 @@ bool O3deBackend::Impl::RenderOneFrame()
     this->pipeline->AddToRenderTick();
     for (int k = 0; k < 3; ++k)
     {
+      this->SubmitLights();
       this->SubmitPrimitives();
       this->app->PumpSystemEventLoopUntilEmpty();
       this->app->TickSystem();
@@ -2297,6 +2503,7 @@ bool O3deBackend::Impl::RenderOneFrame()
   int iters = 0;
   for (; iters < maxFrames && !finishListener.finished; ++iters)
   {
+    this->SubmitLights();
     this->SubmitPrimitives();
     this->app->PumpSystemEventLoopUntilEmpty();
     this->app->TickSystem();

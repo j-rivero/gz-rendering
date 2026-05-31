@@ -131,6 +131,34 @@ namespace gz
       bool live = false;
     };
 
+    /// \brief One scene light for this frame, in gz world coordinates.
+    /// Plain data so the gz wrappers can populate it without any Atom type.
+    /// Carries a stable id so the backend can round-trip Atom LightFeature-
+    /// Processor handles across frames (acquire on first sighting, release
+    /// when the id disappears).
+    struct O3deLightData
+    {
+      /// \brief Light kind. Maps to the matching Atom feature processor.
+      enum class Type : int
+      {
+        DIRECTIONAL = 0,  //!< Atom DirectionalLightFeatureProcessor (lux).
+        POINT = 1,        //!< Atom SimplePointLightFeatureProcessor (candela).
+        SPOT = 2          //!< Atom SimpleSpotLightFeatureProcessor (candela).
+      };
+
+      Type type = Type::DIRECTIONAL;
+      uint32_t id = 0u;                      //!< Stable gz object id.
+      double pos[3] = {0.0, 0.0, 0.0};       //!< World position (gz frame).
+      double quat[4] = {1.0, 0.0, 0.0, 0.0}; //!< World orientation w,x,y,z.
+      double dir[3] = {0.0, 0.0, -1.0};      //!< World direction (normalized),
+                                             //!< used for DIRECTIONAL and SPOT.
+      double diffuseColor[3] = {1.0, 1.0, 1.0};
+      double intensity = 1.0;        //!< Photometric intensity scale.
+      double attenRange = 100.0;     //!< Effective radius for POINT and SPOT.
+      double innerAngle = 0.0;       //!< Spot inner cone angle (rad).
+      double outerAngle = 0.5;       //!< Spot outer cone angle (rad).
+    };
+
     /// \brief Camera pose + projection for one frame, in gz world coordinates.
     struct O3deCameraData
     {
@@ -187,6 +215,7 @@ namespace gz
       /// \return True if a frame was captured and copied.
       public: bool RenderFrame(const O3deCameraData &_camera,
                   const std::vector<O3deShapeData> &_shapes,
+                  const std::vector<O3deLightData> &_lights,
                   uint32_t _width, uint32_t _height, uint8_t *_outRgba);
 
       /// \brief Drive one offscreen frame of the given camera + primitives and
@@ -201,6 +230,7 @@ namespace gz
       /// \return True if a frame was rendered into the shared image.
       public: bool RenderFrameForInterop(const O3deCameraData &_camera,
                   const std::vector<O3deShapeData> &_shapes,
+                  const std::vector<O3deLightData> &_lights,
                   uint32_t _width, uint32_t _height);
 
       /// \brief Get import handles for the exportable interop colour image

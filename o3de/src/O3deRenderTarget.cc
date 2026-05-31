@@ -27,10 +27,12 @@
 #include "gz/rendering/Capsule.hh"
 #include "gz/rendering/FrustumVisual.hh"
 #include "gz/rendering/Grid.hh"
+#include "gz/rendering/Light.hh"
 #include "gz/rendering/PixelFormat.hh"
 #include "gz/rendering/WireBox.hh"
 #include "gz/rendering/o3de/O3deCamera.hh"
 #include "gz/rendering/o3de/O3deGeometry.hh"
+#include "gz/rendering/o3de/O3deLight.hh"
 #include "gz/rendering/o3de/O3deMaterial.hh"
 #include "gz/rendering/o3de/O3deRenderTarget.hh"
 #include "gz/rendering/o3de/O3deVisual.hh"
@@ -70,11 +72,13 @@ namespace
     }
   }
 
-  /// \brief Collect the camera pose/projection + drawable primitives (world
-  /// pose, scale, diffuse colour) from the camera's scene, in gz world frame.
+  /// \brief Collect the camera pose/projection, drawable primitives + lights
+  /// (world pose, scale, diffuse colour, intensity, attenuation) from the
+  /// camera's scene, in gz world frame.
   /// Shared by Copy() (CPU readback) and Render() (native interop).
   void GatherFrame(O3deCamera *_camera, O3deCameraData &_camData,
-      std::vector<O3deShapeData> &_shapes)
+      std::vector<O3deShapeData> &_shapes,
+      std::vector<O3deLightData> &_lights)
   {
     const math::Pose3d camPose = _camera->WorldPose();
     _camData.pos[0] = camPose.Pos().X();
@@ -207,6 +211,64 @@ namespace
         _shapes.push_back(shape);
       }
     }
+
+    // M6 lights: walk the scene's light store and produce one O3deLightData
+    // per gz light. The backend's SubmitLights() acquires/releases Atom FP
+    // handles keyed off each gz id (which is stable across frames). Types are
+    // disambiguated via dynamic_pointer_cast in the order DirectionalLight ->
+    // SpotLight -> PointLight; only the type-specific properties (direction,
+    // cone angles, attenuation range) are read from the matching subclass.
+    for (unsigned int i = 0u; i < scene->LightCount(); ++i)
+    {
+      LightPtr light = scene->LightByIndex(i);
+      O3deLightPtr o3deLight = std::dynamic_pointer_cast<O3deLight>(light);
+      if (!o3deLight)
+        continue;
+
+      const math::Pose3d lp = o3deLight->WorldPose();
+      const math::Color c = o3deLight->DiffuseColor();
+
+      O3deLightData data;
+      data.id = o3deLight->Id();
+      data.pos[0] = lp.Pos().X();
+      data.pos[1] = lp.Pos().Y();
+      data.pos[2] = lp.Pos().Z();
+      data.quat[0] = lp.Rot().W();
+      data.quat[1] = lp.Rot().X();
+      data.quat[2] = lp.Rot().Y();
+      data.quat[3] = lp.Rot().Z();
+      data.diffuseColor[0] = c.R();
+      data.diffuseColor[1] = c.G();
+      data.diffuseColor[2] = c.B();
+      data.intensity = o3deLight->Intensity();
+      data.attenRange = o3deLight->AttenuationRange();
+
+      if (auto dir = std::dynamic_pointer_cast<DirectionalLight>(light))
+      {
+        data.type = O3deLightData::Type::DIRECTIONAL;
+        const math::Vector3d d = dir->Direction();
+        data.dir[0] = d.X(); data.dir[1] = d.Y(); data.dir[2] = d.Z();
+      }
+      else if (auto spot = std::dynamic_pointer_cast<SpotLight>(light))
+      {
+        data.type = O3deLightData::Type::SPOT;
+        const math::Vector3d d = spot->Direction();
+        data.dir[0] = d.X(); data.dir[1] = d.Y(); data.dir[2] = d.Z();
+        data.innerAngle = spot->InnerAngle().Radian();
+        data.outerAngle = spot->OuterAngle().Radian();
+      }
+      else if (std::dynamic_pointer_cast<PointLight>(light))
+      {
+        data.type = O3deLightData::Type::POINT;
+      }
+      else
+      {
+        // Unknown light subclass -- skip rather than register it as a default
+        // directional light at the origin.
+        continue;
+      }
+      _lights.push_back(data);
+    }
   }
 }
 
@@ -237,8 +299,9 @@ void O3deRenderTarget::Render()
 
   O3deCameraData camData;
   std::vector<O3deShapeData> shapes;
-  GatherFrame(this->camera, camData, shapes);
-  O3deBackend::Instance().RenderFrameForInterop(camData, shapes, w, h);
+  std::vector<O3deLightData> lights;
+  GatherFrame(this->camera, camData, shapes, lights);
+  O3deBackend::Instance().RenderFrameForInterop(camData, shapes, lights, w, h);
 }
 
 //////////////////////////////////////////////////
@@ -264,17 +327,20 @@ void O3deRenderTarget::Copy(Image &_image) const
   if (nullptr == data || w == 0u || h == 0u || nullptr == this->camera)
     return;
 
-  // Gather the camera pose + projection and drawable primitives (gz world frame).
+  // Gather the camera pose + projection, drawable primitives and lights (gz
+  // world frame).
   O3deCameraData camData;
   std::vector<O3deShapeData> shapes;
-  GatherFrame(this->camera, camData, shapes);
+  std::vector<O3deLightData> lights;
+  GatherFrame(this->camera, camData, shapes, lights);
 
   const unsigned int channels = (_image.Format() == PF_R8G8B8) ? 3u : 4u;
 
   // The backend produces tightly packed RGBA8888.
   if (channels == 4u)
   {
-    if (!O3deBackend::Instance().RenderFrame(camData, shapes, w, h, data))
+    if (!O3deBackend::Instance().RenderFrame(camData, shapes, lights, w, h,
+        data))
     {
       // Leave the caller's buffer untouched on failure.
       return;
@@ -303,7 +369,7 @@ void O3deRenderTarget::Copy(Image &_image) const
     // PF_R8G8B8: render into a temporary RGBA buffer, then drop alpha.
     std::vector<std::uint8_t> rgba(
         static_cast<std::size_t>(w) * h * 4u, 0u);
-    if (!O3deBackend::Instance().RenderFrame(camData, shapes, w, h,
+    if (!O3deBackend::Instance().RenderFrame(camData, shapes, lights, w, h,
         rgba.data()))
       return;
     for (std::size_t i = 0; i < static_cast<std::size_t>(w) * h; ++i)
