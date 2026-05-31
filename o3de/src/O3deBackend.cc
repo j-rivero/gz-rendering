@@ -69,6 +69,7 @@
 #include <Atom/Feature/CoreLights/SimplePointLightFeatureProcessorInterface.h>
 #include <Atom/Feature/CoreLights/SimpleSpotLightFeatureProcessorInterface.h>
 #include <Atom/Feature/Shadows/ProjectedShadowFeatureProcessorInterface.h>
+#include <Atom/Feature/CoreLights/ShadowConstants.h>
 #include <Atom/Feature/CoreLights/PhotometricValue.h>
 #include <Atom/RPI.Public/Image/AttachmentImage.h>
 #include <Atom/RPI.Public/Image/AttachmentImagePool.h>
@@ -382,6 +383,13 @@ class O3deBackend::Impl
   public: std::unordered_map<uint32_t,
       AZ::Render::SimpleSpotLightFeatureProcessorInterface::LightHandle>
       spotLightHandles;
+  // M7 Phase A2: paired projected-shadow handle per spot light. Same gz id
+  // is the key in both maps so light + shadow are always acquired/released
+  // together; the spot LightHandle drives lighting, the ShadowId drives
+  // the depth-map projector.
+  public: std::unordered_map<uint32_t,
+      AZ::Render::ProjectedShadowFeatureProcessorInterface::ShadowId>
+      spotShadowHandles;
 
   // Capture scratch (render thread only), refilled each RenderOneFrame().
   public: AZStd::vector<uint8_t> captureBuffer;
@@ -1594,6 +1602,44 @@ void O3deBackend::Impl::SubmitLights()
         this->spotLightFp->SetConeAngles(it->second,
             aznumeric_cast<float>(light.innerAngle),
             aznumeric_cast<float>(light.outerAngle));
+
+        // M7 Phase A2: paired projected shadow. SimpleSpotLight has no
+        // shadow path of its own -- the ProjectedShadowFP renders the depth
+        // map separately and the lighting pass samples it via the light's
+        // world transform. We acquire one ShadowId per spot id and update
+        // its descriptor every frame from the same source-of-truth pose.
+        if (this->projectedShadowFp)
+        {
+          auto sh = this->spotShadowHandles.find(light.id);
+          if (sh == this->spotShadowHandles.end())
+          {
+            sh = this->spotShadowHandles.emplace(
+                light.id,
+                this->projectedShadowFp->AcquireShadow()).first;
+            std::fprintf(stderr,
+                "[gz-o3de] M7 spot shadow acquired: id=0x%X "
+                "(total spotShadow=%zu)\n",
+                light.id, this->spotShadowHandles.size());
+            // One-time per-shadow setup: cap atlas size at 1024^2 (plenty
+            // for the demo and avoids surprise memory pressure).
+            this->projectedShadowFp->SetShadowmapMaxResolution(sh->second,
+                AZ::Render::ShadowmapSize::Size1024);
+          }
+          AZ::Render::ProjectedShadowFeatureProcessorInterface::
+              ProjectedShadowDescriptor desc;
+          desc.m_transform =
+              AZ::Transform::CreateFromQuaternionAndTranslation(rot, pos);
+          desc.m_nearPlaneDistance = 0.1f;
+          desc.m_farPlaneDistance =
+              aznumeric_cast<float>(light.attenRange);
+          desc.m_aspectRatio = 1.0f;
+          // FOV-Y = full outer cone (the API takes the full angle, not
+          // the half-angle).
+          desc.m_fieldOfViewYRadians =
+              2.0f * aznumeric_cast<float>(light.outerAngle);
+          desc.m_isStatic = false;
+          this->projectedShadowFp->SetShadowProperties(sh->second, desc);
+        }
         break;
       }
     }
@@ -1628,6 +1674,33 @@ void O3deBackend::Impl::SubmitLights()
   releaseStale(this->dirLightHandles, dirIds, this->dirLightFp, "dir");
   releaseStale(this->pointLightHandles, pointIds, this->pointLightFp, "point");
   releaseStale(this->spotLightHandles, spotIds, this->spotLightFp, "spot");
+
+  // M7 Phase A2: spot shadows mirror spot lights. Same id key, paired
+  // lifetime -- release the ShadowId whenever the matching LightHandle
+  // disappears so the depth-map atlas slot is freed.
+  if (this->projectedShadowFp)
+  {
+    for (auto it = this->spotShadowHandles.begin();
+         it != this->spotShadowHandles.end();)
+    {
+      if (spotIds.find(it->first) == spotIds.end())
+      {
+        std::fprintf(stderr,
+            "[gz-o3de] M7 spot shadow released: id=0x%X (remaining=%zu)\n",
+            it->first, this->spotShadowHandles.size() - 1u);
+        this->projectedShadowFp->ReleaseShadow(it->second);
+        it = this->spotShadowHandles.erase(it);
+      }
+      else
+      {
+        ++it;
+      }
+    }
+  }
+  else
+  {
+    this->spotShadowHandles.clear();
+  }
 
   // Rate-limited per-frame summary so we can confirm the per-frame Set*Data
   // sync is actually running with the expected counts (without flooding the
