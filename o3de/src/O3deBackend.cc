@@ -68,6 +68,7 @@
 #include <Atom/Feature/CoreLights/DirectionalLightFeatureProcessorInterface.h>
 #include <Atom/Feature/CoreLights/SimplePointLightFeatureProcessorInterface.h>
 #include <Atom/Feature/CoreLights/SimpleSpotLightFeatureProcessorInterface.h>
+#include <Atom/Feature/Shadows/ProjectedShadowFeatureProcessorInterface.h>
 #include <Atom/Feature/CoreLights/PhotometricValue.h>
 #include <Atom/RPI.Public/Image/AttachmentImage.h>
 #include <Atom/RPI.Public/Image/AttachmentImagePool.h>
@@ -364,6 +365,11 @@ class O3deBackend::Impl
       = nullptr;
   public: AZ::Render::SimpleSpotLightFeatureProcessorInterface *spotLightFp
       = nullptr;
+  // M7 Phase A1: ProjectedShadowFP. Cached only -- Acquire/SetShadowProperties
+  // wiring lands in Phase A2 once we have proof that registering this FP
+  // doesn't grey-screen the demo the way DirectionalLightFP did.
+  public: AZ::Render::ProjectedShadowFeatureProcessorInterface *
+      projectedShadowFp = nullptr;
   // gz light id (stable across frames) -> Atom FP-issued handle. SubmitLights()
   // acquires on first sighting, syncs every frame, and releases when the id
   // disappears from the gathered set.
@@ -529,6 +535,10 @@ bool O3deBackend::Impl::SetupScene(uint32_t _width, uint32_t _height)
     "AZ::Render::PostProcessFeatureProcessor",
     "AZ::Render::SkyBoxFeatureProcessor",
     "AZ::Render::AuxGeomFeatureProcessor",
+    // M7 Phase A1: ProjectedShadowFP enables spot/disk shadow projectors.
+    // No instances yet -- Phase A1 only verifies that registering the FP
+    // does not regress the live-display path the way DirectionalLightFP did.
+    "AZ::Render::ProjectedShadowFeatureProcessor",
   };
 
   AZ::RPI::SceneDescriptor sceneDesc;
@@ -575,11 +585,16 @@ bool O3deBackend::Impl::SetupScene(uint32_t _width, uint32_t _height)
         AZ::Render::SimplePointLightFeatureProcessorInterface>();
     this->spotLightFp = this->scene->GetFeatureProcessor<
         AZ::Render::SimpleSpotLightFeatureProcessorInterface>();
+    this->projectedShadowFp = this->scene->GetFeatureProcessor<
+        AZ::Render::ProjectedShadowFeatureProcessorInterface>();
     std::fprintf(stderr,
         "[gz-o3de] M6 light FPs cached: dir=%p point=%p spot=%p\n",
         static_cast<void *>(this->dirLightFp),
         static_cast<void *>(this->pointLightFp),
         static_cast<void *>(this->spotLightFp));
+    std::fprintf(stderr,
+        "[gz-o3de] M7 shadow FPs cached: projected=%p\n",
+        static_cast<void *>(this->projectedShadowFp));
     // Create the exportable image + pipeline at the bootstrap placeholder size so
     // the consumer has an image to import the moment it builds its texture node
     // (deferring until the first frame races Qt, which then presents a null
@@ -658,11 +673,16 @@ bool O3deBackend::Impl::SetupScene(uint32_t _width, uint32_t _height)
       AZ::Render::SimplePointLightFeatureProcessorInterface>();
   this->spotLightFp = this->scene->GetFeatureProcessor<
       AZ::Render::SimpleSpotLightFeatureProcessorInterface>();
+  this->projectedShadowFp = this->scene->GetFeatureProcessor<
+      AZ::Render::ProjectedShadowFeatureProcessorInterface>();
   std::fprintf(stderr,
       "[gz-o3de] M6 light FPs cached: dir=%p point=%p spot=%p\n",
       static_cast<void *>(this->dirLightFp),
       static_cast<void *>(this->pointLightFp),
       static_cast<void *>(this->spotLightFp));
+  std::fprintf(stderr,
+      "[gz-o3de] M7 shadow FPs cached: projected=%p\n",
+      static_cast<void *>(this->projectedShadowFp));
 
   // Apply the multisample state at the application level *after* the scene is
   // registered (mirrors BootstrapSystemComponent). This both selects the MSAA
