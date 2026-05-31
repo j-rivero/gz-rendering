@@ -1514,8 +1514,13 @@ void O3deBackend::Impl::SubmitLights()
         dirIds.insert(light.id);
         auto it = this->dirLightHandles.find(light.id);
         if (it == this->dirLightHandles.end())
+        {
           it = this->dirLightHandles.emplace(
               light.id, this->dirLightFp->AcquireLight()).first;
+          std::fprintf(stderr,
+              "[gz-o3de] M6 dir light acquired: id=0x%X (total dir=%zu)\n",
+              light.id, this->dirLightHandles.size());
+        }
         this->dirLightFp->SetRgbIntensity(it->second,
             AZ::Render::PhotometricColor<AZ::Render::PhotometricUnit::Lux>(rgb));
         this->dirLightFp->SetDirection(it->second, dir);
@@ -1528,8 +1533,13 @@ void O3deBackend::Impl::SubmitLights()
         pointIds.insert(light.id);
         auto it = this->pointLightHandles.find(light.id);
         if (it == this->pointLightHandles.end())
+        {
           it = this->pointLightHandles.emplace(
               light.id, this->pointLightFp->AcquireLight()).first;
+          std::fprintf(stderr,
+              "[gz-o3de] M6 point light acquired: id=0x%X (total point=%zu)\n",
+              light.id, this->pointLightHandles.size());
+        }
         this->pointLightFp->SetRgbIntensity(it->second,
             AZ::Render::PhotometricColor<AZ::Render::PhotometricUnit::Candela>(
                 rgb));
@@ -1545,8 +1555,13 @@ void O3deBackend::Impl::SubmitLights()
         spotIds.insert(light.id);
         auto it = this->spotLightHandles.find(light.id);
         if (it == this->spotLightHandles.end())
+        {
           it = this->spotLightHandles.emplace(
               light.id, this->spotLightFp->AcquireLight()).first;
+          std::fprintf(stderr,
+              "[gz-o3de] M6 spot light acquired: id=0x%X (total spot=%zu)\n",
+              light.id, this->spotLightHandles.size());
+        }
         this->spotLightFp->SetRgbIntensity(it->second,
             AZ::Render::PhotometricColor<AZ::Render::PhotometricUnit::Candela>(
                 rgb));
@@ -1565,8 +1580,8 @@ void O3deBackend::Impl::SubmitLights()
   }
 
   // Release handles whose ids are no longer in the gathered set.
-  auto releaseStale = [](auto &_handles, const std::unordered_set<uint32_t> &_keep,
-      auto *_fp)
+  auto releaseStale = [](auto &_handles,
+      const std::unordered_set<uint32_t> &_keep, auto *_fp, const char *_kind)
   {
     if (!_fp)
     {
@@ -1578,6 +1593,9 @@ void O3deBackend::Impl::SubmitLights()
       if (_keep.find(it->first) == _keep.end())
       {
         auto handle = it->second;
+        std::fprintf(stderr,
+            "[gz-o3de] M6 %s light released: id=0x%X (remaining=%zu)\n",
+            _kind, it->first, _handles.size() - 1u);
         _fp->ReleaseLight(handle);
         it = _handles.erase(it);
       }
@@ -1587,9 +1605,23 @@ void O3deBackend::Impl::SubmitLights()
       }
     }
   };
-  releaseStale(this->dirLightHandles, dirIds, this->dirLightFp);
-  releaseStale(this->pointLightHandles, pointIds, this->pointLightFp);
-  releaseStale(this->spotLightHandles, spotIds, this->spotLightFp);
+  releaseStale(this->dirLightHandles, dirIds, this->dirLightFp, "dir");
+  releaseStale(this->pointLightHandles, pointIds, this->pointLightFp, "point");
+  releaseStale(this->spotLightHandles, spotIds, this->spotLightFp, "spot");
+
+  // Rate-limited per-frame summary so we can confirm the per-frame Set*Data
+  // sync is actually running with the expected counts (without flooding the
+  // log -- one line every ~120 frames, roughly 2-6 s of demo wall time).
+  static thread_local uint64_t submitLightsTick = 0u;
+  if ((submitLightsTick++ % 120u) == 0u)
+  {
+    std::fprintf(stderr,
+        "[gz-o3de] M6 SubmitLights tick=%lu: dir=%zu point=%zu spot=%zu "
+        "(gathered=%zu)\n",
+        static_cast<unsigned long>(submitLightsTick),
+        this->dirLightHandles.size(), this->pointLightHandles.size(),
+        this->spotLightHandles.size(), this->lights.size());
+  }
 }
 
 //////////////////////////////////////////////////
@@ -2155,6 +2187,52 @@ static void MaybeInjectDemoShapes(std::vector<O3deShapeData> &_shapes)
   _shapes.push_back(plane);
 }
 
+// Demo aid (M6 Phase C): when GZ_O3DE_DEMO_SHAPES is set and the caller did
+// not gather any lights, inject a point+spot pair so SubmitLights() exercises
+// the Acquire / SetRgbIntensity / Set{Position,Transform,...} / Release paths
+// against real Atom FPs. Stable ids in the 0xD000x range so handles persist
+// across frames (no acquire/release thrash) and don't collide with real gz
+// light ids. Directional is skipped: its FP is intentionally not enabled (see
+// SetupScene comment) and turning it on grey-screens the demo.
+static void MaybeInjectDemoLights(std::vector<O3deLightData> &_lights)
+{
+  if (!_lights.empty() || !std::getenv("GZ_O3DE_DEMO_SHAPES"))
+    return;
+
+  // Point light: warm white, ~3 m above the origin so it lights the bobbing
+  // sphere column and the orbiting cylinder. Intensity is in candela (the
+  // SimplePointLightFP unit) -- 200 cd reads as a bright bulb against the
+  // default scene tonemap.
+  O3deLightData point;
+  point.type = O3deLightData::Type::POINT;
+  point.id = 0xD0001u;
+  point.pos[0] = 0.0; point.pos[1] = 0.0; point.pos[2] = 3.0;
+  point.diffuseColor[0] = 1.0; point.diffuseColor[1] = 0.85;
+  point.diffuseColor[2] = 0.7;
+  point.intensity = 200.0;  // candela
+  point.attenRange = 10.0;
+  _lights.push_back(point);
+
+  // Spot light: cool blue, mounted high to the side near the cyan frustum
+  // widget. The simple-spot path is verified by the AcquireLight + per-frame
+  // SetTransform / SetConeAngles call sequence; precise orientation against
+  // the scene is deferred to M7, when shadow maps make the cone footprint
+  // visible.
+  O3deLightData spot;
+  spot.type = O3deLightData::Type::SPOT;
+  spot.id = 0xD0002u;
+  spot.pos[0] = -2.0; spot.pos[1] = 2.0; spot.pos[2] = 2.0;
+  spot.quat[0] = 1.0; spot.quat[1] = 0.0;
+  spot.quat[2] = 0.0; spot.quat[3] = 0.0;
+  spot.diffuseColor[0] = 0.3; spot.diffuseColor[1] = 0.5;
+  spot.diffuseColor[2] = 1.0;
+  spot.intensity = 300.0;  // candela
+  spot.attenRange = 8.0;
+  spot.innerAngle = 0.3;  // ~17 deg
+  spot.outerAngle = 0.6;  // ~34 deg
+  _lights.push_back(spot);
+}
+
 //////////////////////////////////////////////////
 bool O3deBackend::RenderFrame(const O3deCameraData &_camera,
     const std::vector<O3deShapeData> &_shapes,
@@ -2170,6 +2248,7 @@ bool O3deBackend::RenderFrame(const O3deCameraData &_camera,
   std::vector<O3deShapeData> shapes = _shapes;
   MaybeInjectDemoShapes(shapes);
   std::vector<O3deLightData> lights = _lights;
+  MaybeInjectDemoLights(lights);
 
   // Post the input to the render thread and wait for a frame rendered after it.
   uint64_t startSeq = 0u;
@@ -2227,6 +2306,7 @@ bool O3deBackend::RenderFrameForInterop(const O3deCameraData &_camera,
   std::vector<O3deShapeData> shapes = _shapes;
   MaybeInjectDemoShapes(shapes);
   std::vector<O3deLightData> lights = _lights;
+  MaybeInjectDemoLights(lights);
 
   // Post the input to the render thread and wait for a frame rendered after it
   // (the frame is published into the shared image by RenderOneFrame()).
