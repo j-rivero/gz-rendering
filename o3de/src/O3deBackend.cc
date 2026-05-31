@@ -70,6 +70,9 @@
 #include <Atom/Feature/CoreLights/SimpleSpotLightFeatureProcessorInterface.h>
 #include <Atom/Feature/Shadows/ProjectedShadowFeatureProcessorInterface.h>
 #include <Atom/Feature/CoreLights/ShadowConstants.h>
+#include <Atom/Feature/Mesh/MeshFeatureProcessorInterface.h>
+#include <Atom/RPI.Reflect/Asset/AssetUtils.h>
+#include <Atom/RPI.Reflect/Model/ModelAsset.h>
 #include <Atom/Feature/CoreLights/PhotometricValue.h>
 #include <Atom/RPI.Public/Image/AttachmentImage.h>
 #include <Atom/RPI.Public/Image/AttachmentImagePool.h>
@@ -390,6 +393,15 @@ class O3deBackend::Impl
   public: std::unordered_map<uint32_t,
       AZ::Render::ProjectedShadowFeatureProcessorInterface::ShadowId>
       spotShadowHandles;
+  // M7 Phase B: MeshFP + demo mesh handles. The shadow pass writes a depth
+  // map from each spot light's pose and the lighting pass samples it via
+  // the matching light's transform -- but only Mesh draws (not AuxGeom)
+  // participate in either pass. We acquire one static "caster" + one
+  // "receiver" mesh at SetupScene time so the shadow projector has actual
+  // geometry to interact with.
+  public: AZ::Render::MeshFeatureProcessorInterface *meshFp = nullptr;
+  public: AZStd::vector<
+      AZ::Render::MeshFeatureProcessorInterface::MeshHandle> demoMeshHandles;
 
   // Capture scratch (render thread only), refilled each RenderOneFrame().
   public: AZStd::vector<uint8_t> captureBuffer;
@@ -462,6 +474,11 @@ class O3deBackend::Impl
   /// NOT consume these (debug-draw uses a fixed shader); the lights become
   /// visible once the scene has a shaded surface (M8 PBR / M9 meshes).
   public: void SubmitLights();
+  // M7 Phase B: acquire the static demo caster + receiver meshes after the
+  // FP pointers are cached. Idempotent: called from both SetupScene paths
+  // but only the first call does work (the demoMeshHandles vector is the
+  // gate). Skipped entirely when GZ_O3DE_DEMO_SHAPES is unset.
+  public: void AcquireDemoMeshes();
   /// \brief Stop driving the offscreen pipeline when the render thread is told
   /// to stop. Runs on the render thread itself (process exit). It deliberately
   /// does NOT tear down the O3DE/Vulkan runtime -- that crashes in upstream GPU
@@ -595,14 +612,18 @@ bool O3deBackend::Impl::SetupScene(uint32_t _width, uint32_t _height)
         AZ::Render::SimpleSpotLightFeatureProcessorInterface>();
     this->projectedShadowFp = this->scene->GetFeatureProcessor<
         AZ::Render::ProjectedShadowFeatureProcessorInterface>();
+    this->meshFp = this->scene->GetFeatureProcessor<
+        AZ::Render::MeshFeatureProcessorInterface>();
     std::fprintf(stderr,
         "[gz-o3de] M6 light FPs cached: dir=%p point=%p spot=%p\n",
         static_cast<void *>(this->dirLightFp),
         static_cast<void *>(this->pointLightFp),
         static_cast<void *>(this->spotLightFp));
     std::fprintf(stderr,
-        "[gz-o3de] M7 shadow FPs cached: projected=%p\n",
-        static_cast<void *>(this->projectedShadowFp));
+        "[gz-o3de] M7 shadow FPs cached: projected=%p mesh=%p\n",
+        static_cast<void *>(this->projectedShadowFp),
+        static_cast<void *>(this->meshFp));
+    this->AcquireDemoMeshes();
     // Create the exportable image + pipeline at the bootstrap placeholder size so
     // the consumer has an image to import the moment it builds its texture node
     // (deferring until the first frame races Qt, which then presents a null
@@ -683,14 +704,18 @@ bool O3deBackend::Impl::SetupScene(uint32_t _width, uint32_t _height)
       AZ::Render::SimpleSpotLightFeatureProcessorInterface>();
   this->projectedShadowFp = this->scene->GetFeatureProcessor<
       AZ::Render::ProjectedShadowFeatureProcessorInterface>();
+  this->meshFp = this->scene->GetFeatureProcessor<
+      AZ::Render::MeshFeatureProcessorInterface>();
   std::fprintf(stderr,
       "[gz-o3de] M6 light FPs cached: dir=%p point=%p spot=%p\n",
       static_cast<void *>(this->dirLightFp),
       static_cast<void *>(this->pointLightFp),
       static_cast<void *>(this->spotLightFp));
   std::fprintf(stderr,
-      "[gz-o3de] M7 shadow FPs cached: projected=%p\n",
-      static_cast<void *>(this->projectedShadowFp));
+      "[gz-o3de] M7 shadow FPs cached: projected=%p mesh=%p\n",
+      static_cast<void *>(this->projectedShadowFp),
+      static_cast<void *>(this->meshFp));
+  this->AcquireDemoMeshes();
 
   // Apply the multisample state at the application level *after* the scene is
   // registered (mirrors BootstrapSystemComponent). This both selects the MSAA
@@ -1500,6 +1525,79 @@ void O3deBackend::Impl::SubmitPrimitives()
         break;
       }
     }
+  }
+}
+
+//////////////////////////////////////////////////
+void O3deBackend::Impl::AcquireDemoMeshes()
+{
+  if (!this->meshFp)
+    return;
+  if (!this->demoMeshHandles.empty())
+    return;  // already acquired in the other SetupScene path
+  if (!std::getenv("GZ_O3DE_DEMO_SHAPES"))
+    return;
+
+  // Two cooked assets from the existing PoC cache: a sphere (caster) and
+  // an occlusion-culling-plane (receiver, repurposed as a ground plane).
+  // LoadCriticalAsset blocks until the model is fully loaded -- safe here
+  // because we run during scene setup, off the render thread.
+  struct DemoMesh
+  {
+    const char *assetPath;
+    AZ::Vector3 pos;
+    AZ::Vector3 scale;
+    const char *kind;
+  };
+  const DemoMesh demos[] = {
+      // Sphere caster: 1.0 m above origin, slightly offset on +X so the
+      // spot light at (-2, 2, 2) casts a clear shadow onto the plane.
+      { "models/sphere.fbx.azmodel",
+        AZ::Vector3(1.0f, 0.0f, 1.0f),
+        AZ::Vector3(0.5f, 0.5f, 0.5f),
+        "sphere-caster" },
+      // Plane receiver: at z=0, scaled 8x to fill the demo viewport.
+      { "models/occlusioncullingplane.fbx.azmodel",
+        AZ::Vector3(0.0f, 0.0f, 0.0f),
+        AZ::Vector3(8.0f, 8.0f, 1.0f),
+        "plane-receiver" },
+  };
+
+  for (const auto &d : demos)
+  {
+    auto modelAsset = AZ::RPI::AssetUtils::LoadCriticalAsset<
+        AZ::RPI::ModelAsset>(d.assetPath,
+            AZ::RPI::AssetUtils::TraceLevel::Warning);
+    if (!modelAsset.IsReady())
+    {
+      std::fprintf(stderr,
+          "[gz-o3de] M7 demo mesh '%s' (%s) failed to load -- skipping\n",
+          d.kind, d.assetPath);
+      continue;
+    }
+    AZ::Render::MeshHandleDescriptor desc(modelAsset);
+    auto handle = this->meshFp->AcquireMesh(desc);
+    if (!handle.IsValid())
+    {
+      std::fprintf(stderr,
+          "[gz-o3de] M7 demo mesh '%s' AcquireMesh failed\n", d.kind);
+      continue;
+    }
+    AZ::Transform xform =
+        AZ::Transform::CreateTranslation(d.pos);
+    this->meshFp->SetTransform(handle, xform, d.scale);
+    this->demoMeshHandles.emplace_back(std::move(handle));
+    std::fprintf(stderr,
+        "[gz-o3de] M7 demo mesh acquired: %s @ (%.2f,%.2f,%.2f) "
+        "scale (%.2f,%.2f,%.2f) (total demoMeshes=%zu)\n",
+        d.kind,
+        aznumeric_cast<float>(d.pos.GetX()),
+        aznumeric_cast<float>(d.pos.GetY()),
+        aznumeric_cast<float>(d.pos.GetZ()),
+        aznumeric_cast<float>(d.scale.GetX()),
+        aznumeric_cast<float>(d.scale.GetY()),
+        aznumeric_cast<float>(d.scale.GetZ()),
+        this->demoMeshHandles.size());
   }
 }
 
