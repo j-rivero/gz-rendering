@@ -1717,21 +1717,45 @@ static void MaybeInjectDemoShapes(std::vector<O3deShapeData> &_shapes)
 {
   if (!_shapes.empty() || !std::getenv("GZ_O3DE_DEMO_SHAPES"))
     return;
+
+  // Seconds since the first call -- drives the simple per-frame animation
+  // below so the live demo proves it really is a live render and not one
+  // captured frame on a Qt swapchain. Set GZ_O3DE_DEMO_ANIMATE=0 to freeze.
+  const char *animEnv = std::getenv("GZ_O3DE_DEMO_ANIMATE");
+  const bool animate = !(animEnv && animEnv[0] == '0');
+  static const auto t0 = std::chrono::steady_clock::now();
+  const double t = animate
+      ? std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - t0).count()
+      : 0.0;
+  // gz frame: +Z up, +X forward, +Y left.
+  //   * box  spins about world +Z (gz quat = w,x,y,z; ~5.7 s / rev).
+  //   * sphere bobs up/down in Z; wirebox cage tracks it.
+  //   * cylinder orbits the origin in the XY plane (~9 s / rev).
+  const double halfAng = t * 0.5;
+  const double boxQw = std::cos(halfAng);
+  const double boxQz = std::sin(halfAng);
+  const double sphereBobZ = 0.5 + 0.3 * std::sin(t * 2.0);
+  const double cylX = 1.5 * std::cos(t * 0.7);
+  const double cylY = 1.5 * std::sin(t * 0.7);
+
   O3deShapeData box;
   box.type = O3deShapeData::Type::BOX;
   box.pos[0] = 0.0; box.pos[1] = 1.5; box.pos[2] = 0.5;
+  box.quat[0] = boxQw; box.quat[1] = 0.0;
+  box.quat[2] = 0.0;   box.quat[3] = boxQz;
   box.color[0] = 1.0f; box.color[1] = 0.0f; box.color[2] = 0.0f;
   _shapes.push_back(box);
 
   O3deShapeData sphere;
   sphere.type = O3deShapeData::Type::SPHERE;
-  sphere.pos[0] = 0.0; sphere.pos[1] = 0.0; sphere.pos[2] = 0.5;
+  sphere.pos[0] = 0.0; sphere.pos[1] = 0.0; sphere.pos[2] = sphereBobZ;
   sphere.color[0] = 0.0f; sphere.color[1] = 1.0f; sphere.color[2] = 0.0f;
   _shapes.push_back(sphere);
 
   O3deShapeData cylinder;
   cylinder.type = O3deShapeData::Type::CYLINDER;
-  cylinder.pos[0] = 0.0; cylinder.pos[1] = -1.5; cylinder.pos[2] = 0.5;
+  cylinder.pos[0] = cylX; cylinder.pos[1] = cylY; cylinder.pos[2] = 0.5;
   cylinder.scale[2] = 1.5;
   cylinder.color[0] = 0.0f; cylinder.color[1] = 0.0f; cylinder.color[2] = 1.0f;
   _shapes.push_back(cylinder);
@@ -1744,10 +1768,11 @@ static void MaybeInjectDemoShapes(std::vector<O3deShapeData> &_shapes)
   grid.color[0] = 0.4f; grid.color[1] = 0.4f; grid.color[2] = 0.4f;
   _shapes.push_back(grid);
 
-  // Yellow wireframe cage around the green sphere (local AABB +/-0.6 at z=0.5).
+  // Yellow wireframe cage around the green sphere (local AABB +/-0.6, tracks
+  // the sphere's bob so the cage stays centred on it).
   O3deShapeData wireBox;
   wireBox.type = O3deShapeData::Type::WIREBOX;
-  wireBox.pos[0] = 0.0; wireBox.pos[1] = 0.0; wireBox.pos[2] = 0.5;
+  wireBox.pos[0] = 0.0; wireBox.pos[1] = 0.0; wireBox.pos[2] = sphereBobZ;
   wireBox.boxMin[0] = -0.6; wireBox.boxMin[1] = -0.6; wireBox.boxMin[2] = -0.6;
   wireBox.boxMax[0] = 0.6; wireBox.boxMax[1] = 0.6; wireBox.boxMax[2] = 0.6;
   wireBox.color[0] = 1.0f; wireBox.color[1] = 1.0f; wireBox.color[2] = 0.0f;
