@@ -35,8 +35,10 @@ namespace gz
     class O3deGrid;
     class O3deLight;
     class O3deMaterial;
+    class O3deMesh;
     class O3deNode;
     class O3deObject;
+    class O3deSubMesh;
     class O3dePointLight;
     class O3deRayQuery;
     class O3deRenderEngine;
@@ -52,6 +54,7 @@ namespace gz
     typedef BaseNodeStore<O3deNode>           O3deNodeStore;
     typedef BaseSceneStore<O3deScene>         O3deSceneStore;
     typedef BaseSensorStore<O3deSensor>       O3deSensorStore;
+    typedef BaseSubMeshStore<O3deSubMesh>     O3deSubMeshStore;
     typedef BaseVisualStore<O3deVisual>       O3deVisualStore;
 
     typedef BaseMaterialMap<O3deMaterial>     O3deMaterialMap;
@@ -63,8 +66,10 @@ namespace gz
     typedef shared_ptr<O3deGrid>              O3deGridPtr;
     typedef shared_ptr<O3deLight>             O3deLightPtr;
     typedef shared_ptr<O3deMaterial>          O3deMaterialPtr;
+    typedef shared_ptr<O3deMesh>              O3deMeshPtr;
     typedef shared_ptr<O3deNode>              O3deNodePtr;
     typedef shared_ptr<O3deObject>            O3deObjectPtr;
+    typedef shared_ptr<O3deSubMesh>           O3deSubMeshPtr;
     typedef shared_ptr<O3dePointLight>        O3dePointLightPtr;
     typedef shared_ptr<O3deRayQuery>          O3deRayQueryPtr;
     typedef shared_ptr<O3deRenderEngine>      O3deRenderEnginePtr;
@@ -80,6 +85,7 @@ namespace gz
     typedef shared_ptr<O3deNodeStore>         O3deNodeStorePtr;
     typedef shared_ptr<O3deSceneStore>        O3deSceneStorePtr;
     typedef shared_ptr<O3deSensorStore>       O3deSensorStorePtr;
+    typedef shared_ptr<O3deSubMeshStore>      O3deSubMeshStorePtr;
     typedef shared_ptr<O3deVisualStore>       O3deVisualStorePtr;
 
     typedef shared_ptr<O3deMaterialMap>       O3deMaterialMapPtr;

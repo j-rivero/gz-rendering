@@ -22,6 +22,7 @@
 #include "gz/rendering/o3de/O3deGrid.hh"
 #include "gz/rendering/o3de/O3deLight.hh"
 #include "gz/rendering/o3de/O3deMaterial.hh"
+#include "gz/rendering/o3de/O3deMesh.hh"
 #include "gz/rendering/o3de/O3deRayQuery.hh"
 #include "gz/rendering/o3de/O3deRenderEngine.hh"
 #include "gz/rendering/o3de/O3deScene.hh"
@@ -256,11 +257,17 @@ GeometryPtr O3deScene::CreateSphereImpl(unsigned int _id,
 }
 
 //////////////////////////////////////////////////
-MeshPtr O3deScene::CreateMeshImpl(unsigned int /*_id*/,
-    const std::string &/*_name*/, const MeshDescriptor &/*_desc*/)
+MeshPtr O3deScene::CreateMeshImpl(unsigned int _id,
+    const std::string &_name, const MeshDescriptor &/*_desc*/)
 {
-  gzerr << "Mesh not supported by: " << this->Engine()->Name() << std::endl;
-  return nullptr;
+  // M5 Phase B: return a valid no-op Mesh so callers funnelling through
+  // Scene::CreateMesh -- in particular BaseArrowVisual::Init's rotation
+  // ring -- can attach a mesh geometry without crashing. The mesh contributes
+  // no AuxGeom draws (geometry type stays OTHER, so the per-frame gather
+  // skips it). Real mesh import is M9 in the post-beta1 roadmap.
+  O3deMeshPtr mesh(new O3deMesh);
+  bool result = this->InitObject(mesh, _id, _name);
+  return (result) ? mesh : nullptr;
 }
 
 //////////////////////////////////////////////////
