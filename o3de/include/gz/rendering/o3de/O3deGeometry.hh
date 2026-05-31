@@ -47,7 +47,8 @@ namespace gz
         CONE,
         PLANE,
         GRID,
-        WIREBOX
+        WIREBOX,
+        CAPSULE
       };
 
       /// \brief Constructor

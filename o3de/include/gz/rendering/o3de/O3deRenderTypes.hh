@@ -29,6 +29,7 @@ namespace gz
     inline namespace GZ_RENDERING_VERSION_NAMESPACE {
     //
     class O3deCamera;
+    class O3deCapsule;
     class O3deDirectionalLight;
     class O3deGeometry;
     class O3deGrid;
@@ -56,6 +57,7 @@ namespace gz
     typedef BaseMaterialMap<O3deMaterial>     O3deMaterialMap;
 
     typedef shared_ptr<O3deCamera>            O3deCameraPtr;
+    typedef shared_ptr<O3deCapsule>           O3deCapsulePtr;
     typedef shared_ptr<O3deDirectionalLight>  O3deDirectionalLightPtr;
     typedef shared_ptr<O3deGeometry>          O3deGeometryPtr;
     typedef shared_ptr<O3deGrid>              O3deGridPtr;

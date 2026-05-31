@@ -1286,6 +1286,22 @@ void O3deBackend::Impl::SubmitPrimitives()
         }
         break;
       }
+      case O3deShapeData::Type::CAPSULE:
+      {
+        // gz Capsule convention: a cylinder of length capsuleLength along the
+        // visual's local +Z, capped by hemispheres of radius capsuleRadius at
+        // each end. AuxGeom has no native capsule, so we draw it as a body
+        // cylinder + two full spheres at the ends. Depth-test occludes the
+        // half of each sphere that sits inside the cylinder, which gives the
+        // expected pill silhouette without explicit hemisphere geometry.
+        const float r = static_cast<float>(shape.capsuleRadius);
+        const float h = static_cast<float>(shape.capsuleLength);
+        auxGeom->DrawCylinder(pos, axisZ, r, h, color);
+        const AZ::Vector3 capOffset = axisZ * (0.5f * h);
+        auxGeom->DrawSphere(pos + capOffset, r, color);
+        auxGeom->DrawSphere(pos - capOffset, r, color);
+        break;
+      }
       case O3deShapeData::Type::WIREBOX:
       {
         // 12 edges of the local axis-aligned box, oriented + placed by the
@@ -1777,6 +1793,21 @@ static void MaybeInjectDemoShapes(std::vector<O3deShapeData> &_shapes)
   wireBox.boxMax[0] = 0.6; wireBox.boxMax[1] = 0.6; wireBox.boxMax[2] = 0.6;
   wireBox.color[0] = 1.0f; wireBox.color[1] = 1.0f; wireBox.color[2] = 0.0f;
   _shapes.push_back(wireBox);
+
+  // Magenta capsule standing upright to the left of the row, slowly tilting
+  // about its local Y so the cap-vs-body silhouette is visible. radius=0.35,
+  // body length=0.8 -> total height ~1.5; offset on -Y so it doesn't collide
+  // with the orbiting cylinder.
+  const double capTilt = 0.5 * 0.5 * std::sin(t * 0.6);  // ~+/-0.5 rad
+  O3deShapeData capsule;
+  capsule.type = O3deShapeData::Type::CAPSULE;
+  capsule.pos[0] = 0.0; capsule.pos[1] = -2.0; capsule.pos[2] = 0.75;
+  capsule.quat[0] = std::cos(capTilt); capsule.quat[1] = 0.0;
+  capsule.quat[2] = std::sin(capTilt); capsule.quat[3] = 0.0;
+  capsule.capsuleRadius = 0.35;
+  capsule.capsuleLength = 0.8;
+  capsule.color[0] = 1.0f; capsule.color[1] = 0.0f; capsule.color[2] = 1.0f;
+  _shapes.push_back(capsule);
 
   // Orange wall plane standing behind the row (rotated -90 deg about Y so the
   // default XY quad stands vertical; 3x3, normal facing the camera).

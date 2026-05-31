@@ -24,6 +24,7 @@
 #include <gz/math/Pose3.hh>
 #include <gz/math/Vector3.hh>
 
+#include "gz/rendering/Capsule.hh"
 #include "gz/rendering/Grid.hh"
 #include "gz/rendering/PixelFormat.hh"
 #include "gz/rendering/WireBox.hh"
@@ -61,6 +62,8 @@ namespace
         _out = O3deShapeData::Type::GRID; return true;
       case O3deGeometry::GeometryType::WIREBOX:
         _out = O3deShapeData::Type::WIREBOX; return true;
+      case O3deGeometry::GeometryType::CAPSULE:
+        _out = O3deShapeData::Type::CAPSULE; return true;
       default:
         return false;
     }
@@ -132,6 +135,15 @@ namespace
             shape.boxMax[0] = b.Max().X();
             shape.boxMax[1] = b.Max().Y();
             shape.boxMax[2] = b.Max().Z();
+          }
+        }
+        else if (shape.type == O3deShapeData::Type::CAPSULE)
+        {
+          if (auto capsule = std::dynamic_pointer_cast<Capsule>(
+                  o3deVisual->GeometryByIndex(j)))
+          {
+            shape.capsuleRadius = capsule->Radius();
+            shape.capsuleLength = capsule->Length();
           }
         }
 

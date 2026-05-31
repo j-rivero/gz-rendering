@@ -17,6 +17,7 @@
 #include <gz/common/Console.hh>
 
 #include "gz/rendering/o3de/O3deCamera.hh"
+#include "gz/rendering/o3de/O3deCapsule.hh"
 #include "gz/rendering/o3de/O3deGeometry.hh"
 #include "gz/rendering/o3de/O3deGrid.hh"
 #include "gz/rendering/o3de/O3deLight.hh"
@@ -263,11 +264,12 @@ MeshPtr O3deScene::CreateMeshImpl(unsigned int /*_id*/,
 }
 
 //////////////////////////////////////////////////
-CapsulePtr O3deScene::CreateCapsuleImpl(unsigned int /*_id*/,
-    const std::string &/*_name*/)
+CapsulePtr O3deScene::CreateCapsuleImpl(unsigned int _id,
+    const std::string &_name)
 {
-  gzerr << "Capsule not supported by: " << this->Engine()->Name() << std::endl;
-  return nullptr;
+  O3deCapsulePtr capsule(new O3deCapsule);
+  bool result = this->InitObject(capsule, _id, _name);
+  return (result) ? capsule : nullptr;
 }
 
 //////////////////////////////////////////////////

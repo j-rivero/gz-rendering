@@ -42,7 +42,9 @@ namespace gz
         BOX = 0, SPHERE = 1, CYLINDER = 2, CONE = 3,
         PLANE = 4,    //!< Flat quad in the visual's local XY plane (scale = size).
         GRID = 5,     //!< Wireframe ground grid (see cellCount/cellLength).
-        WIREBOX = 6   //!< Wireframe box edges (see boxMin/boxMax, local AABB).
+        WIREBOX = 6,  //!< Wireframe box edges (see boxMin/boxMax, local AABB).
+        CAPSULE = 7   //!< Cylinder body + 2 hemisphere caps along local +Z (see
+                      //!< capsuleRadius/capsuleLength).
       };
 
       Type type = Type::BOX;
@@ -62,6 +64,12 @@ namespace gz
       // pose/scale above is applied.
       double boxMin[3] = {-0.5, -0.5, -0.5};
       double boxMax[3] = {0.5, 0.5, 0.5};
+
+      // Capsule params (Type::CAPSULE): cylinder body of length capsuleLength
+      // along the visual's local +Z, with hemispherical caps of capsuleRadius
+      // at each end. Total height = capsuleLength + 2 * capsuleRadius.
+      double capsuleRadius = 0.5;
+      double capsuleLength = 0.5;
     };
 
     /// \brief Everything an importing graphics context needs to alias the
