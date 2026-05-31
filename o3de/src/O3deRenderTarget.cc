@@ -25,6 +25,7 @@
 #include <gz/math/Vector3.hh>
 
 #include "gz/rendering/Capsule.hh"
+#include "gz/rendering/FrustumVisual.hh"
 #include "gz/rendering/Grid.hh"
 #include "gz/rendering/PixelFormat.hh"
 #include "gz/rendering/WireBox.hh"
@@ -99,6 +100,43 @@ namespace
 
       const math::Pose3d wp = o3deVisual->WorldPose();
       const math::Vector3d ws = o3deVisual->WorldScale();
+
+      // FrustumVisual is a Visual subclass that carries the frustum params
+      // directly (no Geometry attached). Emit one FRUSTUM shape per matched
+      // visual so the backend can draw the wireframe.
+      if (auto frustum = std::dynamic_pointer_cast<FrustumVisual>(
+              scene->VisualByIndex(i)))
+      {
+        O3deShapeData shape;
+        shape.type = O3deShapeData::Type::FRUSTUM;
+        shape.pos[0] = wp.Pos().X();
+        shape.pos[1] = wp.Pos().Y();
+        shape.pos[2] = wp.Pos().Z();
+        shape.quat[0] = wp.Rot().W();
+        shape.quat[1] = wp.Rot().X();
+        shape.quat[2] = wp.Rot().Y();
+        shape.quat[3] = wp.Rot().Z();
+        shape.frustumNear = frustum->NearClipPlane();
+        shape.frustumFar = frustum->FarClipPlane();
+        shape.frustumHFov = frustum->HFOV().Radian();
+        shape.frustumAspectRatio = frustum->AspectRatio();
+        // Default to a transparent-blue ray colour, matching the
+        // "Frustum/BlueRay" material the BaseFrustumVisual::Init registers.
+        if (MaterialPtr mat = frustum->Material())
+        {
+          const math::Color c = mat->Diffuse();
+          shape.color[0] = c.R();
+          shape.color[1] = c.G();
+          shape.color[2] = c.B();
+          shape.color[3] = c.A();
+        }
+        else
+        {
+          shape.color[0] = 0.2f; shape.color[1] = 0.6f;
+          shape.color[2] = 1.0f; shape.color[3] = 1.0f;
+        }
+        _shapes.push_back(shape);
+      }
 
       for (unsigned int j = 0u; j < o3deVisual->GeometryCount(); ++j)
       {

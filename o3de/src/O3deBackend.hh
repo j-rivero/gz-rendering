@@ -36,15 +36,19 @@ namespace gz
     /// Plain data so the gz wrappers can populate it without any Atom type.
     struct O3deShapeData
     {
-      /// \brief Primitive kind (mirrors O3deGeometry::GeometryType).
+      /// \brief Primitive kind (mirrors O3deGeometry::GeometryType, plus
+      /// FRUSTUM which is sourced from a FrustumVisual rather than a
+      /// Geometry attached to a Visual).
       enum class Type : int
       {
         BOX = 0, SPHERE = 1, CYLINDER = 2, CONE = 3,
         PLANE = 4,    //!< Flat quad in the visual's local XY plane (scale = size).
         GRID = 5,     //!< Wireframe ground grid (see cellCount/cellLength).
         WIREBOX = 6,  //!< Wireframe box edges (see boxMin/boxMax, local AABB).
-        CAPSULE = 7   //!< Cylinder body + 2 hemisphere caps along local +Z (see
+        CAPSULE = 7,  //!< Cylinder body + 2 hemisphere caps along local +Z (see
                       //!< capsuleRadius/capsuleLength).
+        FRUSTUM = 8   //!< View frustum wireframe along local +X (see
+                      //!< frustumNear/Far/HFov/AspectRatio).
       };
 
       Type type = Type::BOX;
@@ -70,6 +74,16 @@ namespace gz
       // at each end. Total height = capsuleLength + 2 * capsuleRadius.
       double capsuleRadius = 0.5;
       double capsuleLength = 0.5;
+
+      // Frustum params (Type::FRUSTUM): a perspective view frustum extending
+      // along the visual's local +X (gz camera convention is +X forward, +Z
+      // up). Near and far rectangles are sized from the horizontal FoV and
+      // aspect ratio in the standard way; the backend draws the 12 edges
+      // plus 4 apex-to-near-corner connectors as AuxGeom lines.
+      double frustumNear = 0.1;
+      double frustumFar = 1.0;
+      double frustumHFov = 1.047;
+      double frustumAspectRatio = 1.0;
     };
 
     /// \brief Everything an importing graphics context needs to alias the

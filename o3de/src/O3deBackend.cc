@@ -1302,6 +1302,62 @@ void O3deBackend::Impl::SubmitPrimitives()
         auxGeom->DrawSphere(pos - capOffset, r, color);
         break;
       }
+      case O3deShapeData::Type::FRUSTUM:
+      {
+        // View frustum extending along local +X (gz camera convention is +X
+        // forward, +Z up, +Y left). Near rectangle at x=near, far rectangle
+        // at x=far; half-extents from horizontal FoV + aspect ratio.
+        // Draws the 12 edges of the prism plus the 4 apex-to-near connectors
+        // so the camera position is unambiguous.
+        const float nNear = static_cast<float>(shape.frustumNear);
+        const float nFar  = static_cast<float>(shape.frustumFar);
+        const float halfWn = nNear * std::tan(0.5f * shape.frustumHFov);
+        const float halfHn = halfWn / std::max(1e-3f,
+            static_cast<float>(shape.frustumAspectRatio));
+        const float halfWf = nFar  * std::tan(0.5f * shape.frustumHFov);
+        const float halfHf = halfWf / std::max(1e-3f,
+            static_cast<float>(shape.frustumAspectRatio));
+        // Frustum dimensions are absolute (encoded in near/far/hfov/aspect),
+        // so apply the visual's pose only -- the visual's scale would distort
+        // a real camera preview.
+        auto toFrustumWorld = [&](const AZ::Vector3 &_local)
+        { return pos + rot.TransformVector(_local); };
+        // 8 corners in local +X-forward frame: (x, y, z) where +X = forward,
+        // +Y = left, +Z = up. Indexing: near=0..3, far=4..7, each rectangle
+        // ordered BL, BR, TR, TL when looking along +X from behind.
+        const AZ::Vector3 cN[4] = {
+            toFrustumWorld(AZ::Vector3(nNear,  halfWn, -halfHn)),
+            toFrustumWorld(AZ::Vector3(nNear, -halfWn, -halfHn)),
+            toFrustumWorld(AZ::Vector3(nNear, -halfWn,  halfHn)),
+            toFrustumWorld(AZ::Vector3(nNear,  halfWn,  halfHn))};
+        const AZ::Vector3 cF[4] = {
+            toFrustumWorld(AZ::Vector3(nFar,   halfWf, -halfHf)),
+            toFrustumWorld(AZ::Vector3(nFar,  -halfWf, -halfHf)),
+            toFrustumWorld(AZ::Vector3(nFar,  -halfWf,  halfHf)),
+            toFrustumWorld(AZ::Vector3(nFar,   halfWf,  halfHf))};
+        const AZ::Vector3 apex = pos;  // visual origin
+        std::vector<AZ::Vector3> verts;
+        verts.reserve(32u);
+        // Near rectangle (4 edges).
+        for (int k = 0; k < 4; ++k)
+        { verts.push_back(cN[k]); verts.push_back(cN[(k + 1) & 3]); }
+        // Far rectangle (4 edges).
+        for (int k = 0; k < 4; ++k)
+        { verts.push_back(cF[k]); verts.push_back(cF[(k + 1) & 3]); }
+        // Near->Far connectors (4 edges).
+        for (int k = 0; k < 4; ++k)
+        { verts.push_back(cN[k]); verts.push_back(cF[k]); }
+        // Apex->near connectors (4 edges) so the camera point is visible.
+        for (int k = 0; k < 4; ++k)
+        { verts.push_back(apex); verts.push_back(cN[k]); }
+        AZ::RPI::AuxGeomDraw::AuxGeomDynamicDrawArguments args;
+        args.m_verts = verts.data();
+        args.m_vertCount = static_cast<uint32_t>(verts.size());
+        args.m_colors = &color;
+        args.m_colorCount = 1u;
+        auxGeom->DrawLines(args);
+        break;
+      }
       case O3deShapeData::Type::WIREBOX:
       {
         // 12 edges of the local axis-aligned box, oriented + placed by the
@@ -1808,6 +1864,87 @@ static void MaybeInjectDemoShapes(std::vector<O3deShapeData> &_shapes)
   capsule.capsuleLength = 0.8;
   capsule.color[0] = 1.0f; capsule.color[1] = 0.0f; capsule.color[2] = 1.0f;
   _shapes.push_back(capsule);
+
+  // Axis indicator at the world origin (M5 Phase C): three thin arrow-shaped
+  // cylinder/cone pairs along +X (red), +Y (green), +Z (blue) so the gz
+  // coordinate frame is unambiguous in the demo screenshot. Each "arrow" is
+  // assembled from raw shape data; the new O3deArrowVisual / O3deAxisVisual
+  // classes use the same primitive grammar through the Scene API for
+  // non-demo callers. Length ~0.5 keeps the indicator from competing with
+  // the bobbing sphere column.
+  static const float axisShaftLen = 0.4f;
+  static const float axisShaftRad = 0.04f;
+  static const float axisHeadLen  = 0.12f;
+  static const float axisHeadRad  = 0.08f;
+  struct AxisDef {
+    double shaftPos[3];
+    double tipPos[3];
+    double quat[4];  // rotates local +Z -> the desired axis direction
+    float color[3];
+  };
+  // gz quat convention: w,x,y,z. Local cylinder/cone axis is +Z.
+  const double s2 = 0.70710678;  // sqrt(2)/2
+  const AxisDef axes[3] = {
+      // +X (red): rotate +Z by 90 deg about +Y -> +X
+      {{0.5 * axisShaftLen, 0.0, 0.0},
+       {axisShaftLen + 0.5 * axisHeadLen, 0.0, 0.0},
+       {s2, 0.0, s2, 0.0},
+       {1.0f, 0.15f, 0.15f}},
+      // +Y (green): rotate +Z by -90 deg about +X -> +Y
+      {{0.0, 0.5 * axisShaftLen, 0.0},
+       {0.0, axisShaftLen + 0.5 * axisHeadLen, 0.0},
+       {s2, -s2, 0.0, 0.0},
+       {0.15f, 1.0f, 0.15f}},
+      // +Z (blue): identity
+      {{0.0, 0.0, 0.5 * axisShaftLen},
+       {0.0, 0.0, axisShaftLen + 0.5 * axisHeadLen},
+       {1.0, 0.0, 0.0, 0.0},
+       {0.15f, 0.4f, 1.0f}}};
+  for (const auto &a : axes)
+  {
+    O3deShapeData shaft;
+    shaft.type = O3deShapeData::Type::CYLINDER;
+    shaft.pos[0] = a.shaftPos[0]; shaft.pos[1] = a.shaftPos[1];
+    shaft.pos[2] = a.shaftPos[2];
+    shaft.quat[0] = a.quat[0]; shaft.quat[1] = a.quat[1];
+    shaft.quat[2] = a.quat[2]; shaft.quat[3] = a.quat[3];
+    shaft.scale[0] = 2.0 * axisShaftRad;
+    shaft.scale[1] = 2.0 * axisShaftRad;
+    shaft.scale[2] = axisShaftLen;
+    shaft.color[0] = a.color[0]; shaft.color[1] = a.color[1];
+    shaft.color[2] = a.color[2];
+    _shapes.push_back(shaft);
+
+    O3deShapeData head;
+    head.type = O3deShapeData::Type::CONE;
+    head.pos[0] = a.tipPos[0]; head.pos[1] = a.tipPos[1];
+    head.pos[2] = a.tipPos[2];
+    head.quat[0] = a.quat[0]; head.quat[1] = a.quat[1];
+    head.quat[2] = a.quat[2]; head.quat[3] = a.quat[3];
+    head.scale[0] = 2.0 * axisHeadRad;
+    head.scale[1] = 2.0 * axisHeadRad;
+    head.scale[2] = axisHeadLen;
+    head.color[0] = a.color[0]; head.color[1] = a.color[1];
+    head.color[2] = a.color[2];
+    _shapes.push_back(head);
+  }
+
+  // Cyan frustum widget (M5 Phase D): a small view frustum pointing along
+  // +X (gz camera convention), positioned high and to the side so it does
+  // not occlude the other shapes. Models e.g. a camera/sensor preview the
+  // gz-gui frustum visual would draw for a child camera.
+  O3deShapeData frustum;
+  frustum.type = O3deShapeData::Type::FRUSTUM;
+  frustum.pos[0] = -1.8; frustum.pos[1] = 1.8; frustum.pos[2] = 1.6;
+  frustum.quat[0] = 1.0; frustum.quat[1] = 0.0;
+  frustum.quat[2] = 0.0; frustum.quat[3] = 0.0;
+  frustum.frustumNear = 0.15;
+  frustum.frustumFar = 1.4;
+  frustum.frustumHFov = 1.0;
+  frustum.frustumAspectRatio = 1.6;
+  frustum.color[0] = 0.2f; frustum.color[1] = 0.7f;
+  frustum.color[2] = 1.0f; frustum.color[3] = 1.0f;
+  _shapes.push_back(frustum);
 
   // Orange wall plane standing behind the row (rotated -90 deg about Y so the
   // default XY quad stands vertical; 3x3, normal facing the camera).

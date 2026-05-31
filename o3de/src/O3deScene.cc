@@ -16,8 +16,11 @@
  */
 #include <gz/common/Console.hh>
 
+#include "gz/rendering/o3de/O3deArrowVisual.hh"
+#include "gz/rendering/o3de/O3deAxisVisual.hh"
 #include "gz/rendering/o3de/O3deCamera.hh"
 #include "gz/rendering/o3de/O3deCapsule.hh"
+#include "gz/rendering/o3de/O3deFrustumVisual.hh"
 #include "gz/rendering/o3de/O3deGeometry.hh"
 #include "gz/rendering/o3de/O3deGrid.hh"
 #include "gz/rendering/o3de/O3deLight.hh"
@@ -84,6 +87,30 @@ bool O3deScene::InitImpl()
 {
   this->CreateStores();
   this->CreateRootVisual();
+
+  // Pre-register the "Default/TransRed", "Default/TransGreen" and
+  // "Default/TransBlue" materials BaseAxisVisual::Init looks up by name to
+  // colour the X/Y/Z arrows. Without these the SetMaterial(name) call
+  // silently no-ops and the axes render at the default geometry colour.
+  // "Trans" is the gz-rendering convention -- the alpha is 0.5 to match how
+  // other backends draw them.
+  for (const auto &kv : std::initializer_list<std::pair<const char *, math::Color>>{
+       {"Default/TransRed",   math::Color(1.0f, 0.0f, 0.0f, 0.5f)},
+       {"Default/TransGreen", math::Color(0.0f, 1.0f, 0.0f, 0.5f)},
+       {"Default/TransBlue",  math::Color(0.0f, 0.0f, 1.0f, 0.5f)}})
+  {
+    if (!this->MaterialRegistered(kv.first))
+    {
+      MaterialPtr m = this->CreateMaterial(kv.first);
+      if (m)
+      {
+        m->SetAmbient(kv.second);
+        m->SetDiffuse(kv.second);
+        m->SetEmissive(kv.second);
+        m->SetSpecular(kv.second);
+      }
+    }
+  }
   return true;
 }
 
@@ -166,21 +193,21 @@ VisualPtr O3deScene::CreateVisualImpl(unsigned int _id,
 }
 
 //////////////////////////////////////////////////
-ArrowVisualPtr O3deScene::CreateArrowVisualImpl(unsigned int /*_id*/,
-    const std::string &/*_name*/)
+ArrowVisualPtr O3deScene::CreateArrowVisualImpl(unsigned int _id,
+    const std::string &_name)
 {
-  gzerr << "Arrow visual not supported by: " << this->Engine()->Name()
-        << std::endl;
-  return nullptr;
+  O3deArrowVisualPtr arrow(new O3deArrowVisual);
+  bool result = this->InitObject(arrow, _id, _name);
+  return (result) ? arrow : nullptr;
 }
 
 //////////////////////////////////////////////////
-AxisVisualPtr O3deScene::CreateAxisVisualImpl(unsigned int /*_id*/,
-    const std::string &/*_name*/)
+AxisVisualPtr O3deScene::CreateAxisVisualImpl(unsigned int _id,
+    const std::string &_name)
 {
-  gzerr << "Axis visual not supported by: " << this->Engine()->Name()
-        << std::endl;
-  return nullptr;
+  O3deAxisVisualPtr axis(new O3deAxisVisual);
+  bool result = this->InitObject(axis, _id, _name);
+  return (result) ? axis : nullptr;
 }
 
 //////////////////////////////////////////////////
@@ -306,12 +333,12 @@ LidarVisualPtr O3deScene::CreateLidarVisualImpl(unsigned int /*_id*/,
 }
 
 //////////////////////////////////////////////////
-FrustumVisualPtr O3deScene::CreateFrustumVisualImpl(unsigned int /*_id*/,
-    const std::string &/*_name*/)
+FrustumVisualPtr O3deScene::CreateFrustumVisualImpl(unsigned int _id,
+    const std::string &_name)
 {
-  gzerr << "Frustum visual not supported by: " << this->Engine()->Name()
-        << std::endl;
-  return nullptr;
+  O3deFrustumVisualPtr frustum(new O3deFrustumVisual);
+  bool result = this->InitObject(frustum, _id, _name);
+  return (result) ? frustum : nullptr;
 }
 
 //////////////////////////////////////////////////
