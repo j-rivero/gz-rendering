@@ -91,6 +91,30 @@ export GZ_O3DE_INTEROP_SEM=1
 # Inject the box/sphere/cylinder when the scene is empty (stands in for gz-sim).
 export GZ_O3DE_DEMO_SHAPES=1
 
+# WSI present-prime workaround. On Qt 6.4.2 + QRhi-Vulkan + NVIDIA proprietary
+# 580, the first few vkQueuePresentKHR calls race against the producer-side
+# render submit and the X server reads the swapchain image before its content
+# is fully written -- screen stays uniformly grey (#949494, Atom's clear) even
+# though the swapchain memory holds the correct shaded scene (verified via
+# VK_LAYER_GZ_swapchain_dump dumps). Forcing the first 4 presents through the
+# layer's "barrier swapchain to TRANSFER_SRC, copy, barrier back, wait fence,
+# then present" path inserts a CPU sync that primes the WSI; after those 4
+# frames the pipeline self-stabilises and runs unhindered for the rest of the
+# session. The dumps written to /tmp/.../gz_swapchain_prime.frame_*.ppm are
+# a harmless side-effect (~36 MB total for a 2048x1536 RGBA swapchain).
+#
+# This is a workaround, not a fix. The proper fix is either (a) Qt RHI-Vulkan
+# adding the missing fence wait before vkQueuePresentKHR (Qt 6.8 may already
+# do this -- see the live_demo.sh comment above) or (b) a one-line addition
+# to gz-gui's MinimalSceneRhiVulkan.cc that vkQueueWaitIdle()'s before the
+# first few presents.
+if [ -d "$GZ_O3DE_WS/build/gz-gui/test/regression/swapchain_dump_layer" ]; then
+  export VK_LAYER_PATH="$GZ_O3DE_WS/build/gz-gui/test/regression/swapchain_dump_layer"
+  export VK_INSTANCE_LAYERS=VK_LAYER_GZ_swapchain_dump
+  export GZ_SWAPCHAIN_DUMP_PATH=/tmp/gz_swapchain_prime
+  export GZ_SWAPCHAIN_DUMP_MAX_FRAMES=4
+fi
+
 echo "=============================================================="
 echo " O3DE / Atom  ->  Qt   native Vulkan zero-copy  (LIVE)"
 echo "--------------------------------------------------------------"
