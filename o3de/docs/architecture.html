@@ -1,0 +1,806 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>gz-rendering &harr; gz-gui &harr; O3DE: how a pixel reaches your screen</title>
+  <style>
+    :root {
+      --bg: #0f1115;
+      --panel: #161a22;
+      --panel2: #1b2030;
+      --ink: #d8dee9;
+      --ink-dim: #99a2b3;
+      --accent: #8be9fd;
+      --gz: #7aa2f7;      /* gz-rendering blue */
+      --gui: #9ece6a;     /* gz-gui green */
+      --o3de: #f7768e;    /* O3DE / Atom pink */
+      --vk: #e0af68;      /* Vulkan amber */
+      --bug: #f7768e;
+      --code-bg: #0b0d12;
+      --rule: #2a2f3e;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; background: var(--bg); color: var(--ink);
+      font-family: -apple-system, system-ui, "Segoe UI", Roboto, sans-serif;
+      line-height: 1.55; }
+    body { padding: 2rem 1rem 5rem; }
+    .wrap { max-width: 980px; margin: 0 auto; }
+    h1, h2, h3 { color: #ecf0f7; line-height: 1.2; margin-top: 2.4rem; }
+    h1 { font-size: 1.9rem; }
+    h2 { font-size: 1.4rem; border-bottom: 1px solid var(--rule); padding-bottom: .35rem; }
+    h3 { font-size: 1.1rem; color: var(--accent); }
+    p, li { color: var(--ink); }
+    a { color: var(--accent); }
+    code, .mono { font-family: ui-monospace, "JetBrains Mono", Menlo, Consolas, monospace;
+      font-size: .92em; background: var(--code-bg); padding: .1rem .35rem;
+      border-radius: 4px; color: #f8f8f2; }
+    pre { background: var(--code-bg); padding: 1rem; border-radius: 6px;
+      overflow-x: auto; border: 1px solid var(--rule); }
+    pre code { background: transparent; padding: 0; font-size: .88rem; }
+    .lede { color: var(--ink-dim); font-size: 1.05rem; }
+    .tag { display: inline-block; padding: .1rem .5rem; border-radius: 999px;
+      font-size: .75rem; font-weight: 600; margin-right: .3rem; vertical-align: middle; }
+    .tag.gz { background: rgba(122,162,247,.18); color: var(--gz); }
+    .tag.gui { background: rgba(158,206,106,.18); color: var(--gui); }
+    .tag.o3de { background: rgba(247,118,142,.18); color: var(--o3de); }
+    .tag.vk { background: rgba(224,175,104,.18); color: var(--vk); }
+
+    .card { background: var(--panel); border: 1px solid var(--rule);
+      border-radius: 8px; padding: 1.1rem 1.3rem; margin: 1rem 0; }
+    .grid { display: grid; gap: 1rem; }
+    .grid.cols-3 { grid-template-columns: repeat(3, 1fr); }
+    .grid.cols-2 { grid-template-columns: repeat(2, 1fr); }
+    @media (max-width: 720px) {
+      .grid.cols-3, .grid.cols-2 { grid-template-columns: 1fr; }
+    }
+
+    table { width: 100%; border-collapse: collapse; margin: 1rem 0; }
+    th, td { text-align: left; padding: .55rem .7rem;
+      border-bottom: 1px solid var(--rule); vertical-align: top; }
+    th { color: var(--ink-dim); font-weight: 600; font-size: .85rem;
+      text-transform: uppercase; letter-spacing: .04em; }
+    tr:last-child td { border-bottom: none; }
+
+    .bug { background: rgba(247,118,142,.08);
+      border-left: 4px solid var(--bug); padding: .8rem 1rem;
+      border-radius: 0 6px 6px 0; margin: 1rem 0; }
+    .bug b { color: var(--bug); }
+
+    .glossary dt { color: var(--accent); font-weight: 600;
+      font-family: ui-monospace, monospace; margin-top: .8rem; font-size: .95rem; }
+    .glossary dd { color: var(--ink-dim); margin: .15rem 0 0 0; }
+
+    svg { display: block; max-width: 100%; height: auto; }
+    .figcap { color: var(--ink-dim); font-size: .85rem; text-align: center;
+      margin: .35rem 0 1.5rem; font-style: italic; }
+
+    /* The "image journey" animation -- a packet riding along arrows */
+    @keyframes packet1 {
+      0%, 5%   { transform: translateX(0)    translateY(0);   opacity: 0; }
+      6%, 18%  { opacity: 1; }
+      25%      { transform: translateX(220px) translateY(0);   opacity: 1; }
+      40%      { transform: translateX(440px) translateY(0);   opacity: 1; }
+      55%      { transform: translateX(660px) translateY(0);   opacity: 1; }
+      75%      { transform: translateX(820px) translateY(0);   opacity: 1; }
+      95%, 100%{ opacity: 0; }
+    }
+    .pkt { animation: packet1 7s linear infinite; }
+    .pkt-2 { animation-delay: -2.3s; }
+    .pkt-3 { animation-delay: -4.6s; }
+
+    /* Swapchain rotation */
+    @keyframes rotate3 {
+      0%   { transform: rotate(0deg); }
+      33%  { transform: rotate(0deg); }
+      34%  { transform: rotate(-120deg); }
+      66%  { transform: rotate(-120deg); }
+      67%  { transform: rotate(-240deg); }
+      100% { transform: rotate(-240deg); }
+    }
+    .swap-ring { animation: rotate3 4.5s steps(3, end) infinite;
+      transform-origin: 200px 130px; }
+
+    /* highlight pulses on the failure step */
+    @keyframes pulseBug {
+      0%, 100% { stroke-width: 2; }
+      50%      { stroke-width: 6; }
+    }
+    .bug-pulse { stroke: var(--bug); animation: pulseBug 1.8s ease-in-out infinite; }
+
+    /* legend dots */
+    .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%;
+      vertical-align: middle; margin-right: .35rem; }
+    .dot.gz { background: var(--gz); }
+    .dot.gui { background: var(--gui); }
+    .dot.o3de { background: var(--o3de); }
+    .dot.vk { background: var(--vk); }
+
+    nav.toc { background: var(--panel2); border: 1px solid var(--rule);
+      border-radius: 6px; padding: .8rem 1.2rem; margin: 1.2rem 0; }
+    nav.toc ol { margin: 0; padding-left: 1.2rem; }
+    nav.toc li { color: var(--ink-dim); margin: .15rem 0; }
+
+    .note { color: var(--ink-dim); font-size: .9rem; }
+  </style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>gz-rendering &amp; gz-gui &amp; O3DE: how a pixel reaches your screen</h1>
+
+<p class="lede">
+  Three big pieces of software cooperate to draw a Gazebo scene when the
+  experimental O3DE backend is active. This page traces how a single rendered
+  pixel travels from <strong>O3DE / Atom</strong> all the way to your monitor,
+  who calls what, and where the current bug lives. Written for an expert
+  developer who is not a graphics expert.
+</p>
+
+<nav class="toc">
+  <strong>On this page</strong>
+  <ol>
+    <li><a href="#glossary">A few words first (mini-glossary)</a></li>
+    <li><a href="#layers">The three layers</a></li>
+    <li><a href="#journey">A pixel's journey, end to end</a></li>
+    <li><a href="#swapchain">What is a "swapchain"?</a></li>
+    <li><a href="#fd">What's "FD" in Vulkan land?</a></li>
+    <li><a href="#qsg">What is QSG?</a></li>
+    <li><a href="#apis">Who calls which API</a></li>
+    <li><a href="#bug">Where the current bug is</a></li>
+  </ol>
+</nav>
+
+<h2 id="glossary">A few words first</h2>
+
+<p>
+  The same word means different things in different contexts. Just enough
+  definitions so the diagrams make sense:
+</p>
+
+<div class="card glossary">
+  <dl>
+    <dt>GPU memory</dt>
+    <dd>Like RAM but on the graphics card. Vulkan calls a block of GPU memory a
+      <code>VkDeviceMemory</code>. The CPU usually cannot read it directly.</dd>
+
+    <dt>VkImage</dt>
+    <dd>A 2D (or 3D) array of pixels that lives in GPU memory.
+      Think "GPU-side picture". Anything that gets rendered to lives in a
+      <code>VkImage</code>.</dd>
+
+    <dt>VkDevice</dt>
+    <dd>A connection to the GPU. Each independent component using Vulkan
+      typically has its own <code>VkDevice</code>. <strong>O3DE has one;
+      Qt has another</strong>; both talk to the same physical GPU but they
+      do not share Vulkan objects by default.</dd>
+
+    <dt>File descriptor (FD), Vulkan flavor</dt>
+    <dd>A small integer the Linux kernel uses to identify shared resources.
+      Vulkan's <code>VK_KHR_external_memory_fd</code> extension lets one
+      <code>VkDevice</code> say "here's an FD pointing at this GPU memory"
+      and another <code>VkDevice</code> (even in another process) can use that
+      FD to map the <em>same</em> memory. This is how we do zero-copy interop.
+      <a href="#fd">More on this below</a>.</dd>
+
+    <dt>Swapchain</dt>
+    <dd>The short ring of <code>VkImage</code>s the window-system-integration
+      (WSI) uses to present to the screen. Usually 2 or 3 images cycling.
+      <a href="#swapchain">More on this below</a>.</dd>
+
+    <dt>Render pass / FBO</dt>
+    <dd>A Vulkan render pass is a unit of drawing that targets a set of
+      "attachments" (color images, depth, ...). An offscreen render target
+      a.k.a. FBO (Framebuffer Object) is a render pass whose color attachment
+      is a regular <code>VkImage</code> you keep around (not directly shown
+      to the user).</dd>
+
+    <dt>QSG (Qt Scene Graph)</dt>
+    <dd>Qt's high-performance UI renderer. It builds a tree of nodes
+      (rectangles, text, images, &hellip;) and rasterizes them efficiently.
+      <a href="#qsg">More on this below</a>.</dd>
+
+    <dt>QRhi</dt>
+    <dd>Qt's internal Rendering Hardware Interface: an abstraction over
+      Vulkan / OpenGL / Metal / Direct3D. Each QSG node ultimately produces
+      QRhi calls; QRhi turns them into native API calls.</dd>
+  </dl>
+</div>
+
+<h2 id="layers">The three layers</h2>
+
+<p>
+  Three independent codebases. Each one owns part of the work; the
+  interesting question is the <em>seams</em> between them.
+</p>
+
+<svg viewBox="0 0 900 280" role="img" aria-label="Three-layer architecture diagram"
+     style="max-height: 320px;">
+  <!-- O3DE box -->
+  <rect x="20"  y="40" width="240" height="200" rx="10" fill="#1e1b22" stroke="#f7768e" stroke-width="2"/>
+  <text x="140" y="65" text-anchor="middle" fill="#f7768e" font-weight="700" font-size="15">O3DE / Atom</text>
+  <text x="140" y="84" text-anchor="middle" fill="#99a2b3" font-size="11">(vendored, in-tree)</text>
+  <text x="140" y="115" text-anchor="middle" fill="#d8dee9" font-size="12">The renderer.</text>
+  <text x="140" y="135" text-anchor="middle" fill="#d8dee9" font-size="12">Takes a scene description,</text>
+  <text x="140" y="151" text-anchor="middle" fill="#d8dee9" font-size="12">produces a VkImage of it.</text>
+  <text x="140" y="180" text-anchor="middle" fill="#99a2b3" font-size="11">Owns its own VkDevice.</text>
+  <text x="140" y="196" text-anchor="middle" fill="#99a2b3" font-size="11">Calls: only Vulkan.</text>
+
+  <!-- gz-rendering box -->
+  <rect x="330" y="40" width="240" height="200" rx="10" fill="#1b1f29" stroke="#7aa2f7" stroke-width="2"/>
+  <text x="450" y="65" text-anchor="middle" fill="#7aa2f7" font-weight="700" font-size="15">gz-rendering</text>
+  <text x="450" y="84" text-anchor="middle" fill="#99a2b3" font-size="11">(o3de plugin)</text>
+  <text x="450" y="115" text-anchor="middle" fill="#d8dee9" font-size="12">The engine-abstraction</text>
+  <text x="450" y="131" text-anchor="middle" fill="#d8dee9" font-size="12">layer gz-sim talks to.</text>
+  <text x="450" y="155" text-anchor="middle" fill="#d8dee9" font-size="12">Wraps Atom + exposes the</text>
+  <text x="450" y="171" text-anchor="middle" fill="#d8dee9" font-size="12">camera VkImage to gz-gui.</text>
+  <text x="450" y="200" text-anchor="middle" fill="#99a2b3" font-size="11">Calls: Atom C++ API + Vulkan</text>
+  <text x="450" y="216" text-anchor="middle" fill="#99a2b3" font-size="11">(for the FD export).</text>
+
+  <!-- gz-gui box -->
+  <rect x="640" y="40" width="240" height="200" rx="10" fill="#1b231d" stroke="#9ece6a" stroke-width="2"/>
+  <text x="760" y="65" text-anchor="middle" fill="#9ece6a" font-weight="700" font-size="15">gz-gui</text>
+  <text x="760" y="84" text-anchor="middle" fill="#99a2b3" font-size="11">(MinimalScene Vulkan path)</text>
+  <text x="760" y="115" text-anchor="middle" fill="#d8dee9" font-size="12">Owns the on-screen Qt</text>
+  <text x="760" y="131" text-anchor="middle" fill="#d8dee9" font-size="12">window. Imports the FD,</text>
+  <text x="760" y="147" text-anchor="middle" fill="#d8dee9" font-size="12">wraps the resulting VkImage</text>
+  <text x="760" y="163" text-anchor="middle" fill="#d8dee9" font-size="12">into a Qt scene graph node,</text>
+  <text x="760" y="179" text-anchor="middle" fill="#d8dee9" font-size="12">lets Qt present it.</text>
+  <text x="760" y="208" text-anchor="middle" fill="#99a2b3" font-size="11">Calls: Qt Quick + small Vulkan</text>
+  <text x="760" y="224" text-anchor="middle" fill="#99a2b3" font-size="11">for the FD import.</text>
+
+  <!-- arrows -->
+  <defs>
+    <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#d8dee9"/>
+    </marker>
+  </defs>
+  <line x1="260" y1="140" x2="330" y2="140" stroke="#d8dee9" stroke-width="1.5" marker-end="url(#ar)"/>
+  <line x1="570" y1="140" x2="640" y2="140" stroke="#d8dee9" stroke-width="1.5" marker-end="url(#ar)"/>
+
+  <text x="295" y="132" text-anchor="middle" fill="#99a2b3" font-size="10">drives</text>
+  <text x="605" y="132" text-anchor="middle" fill="#99a2b3" font-size="10">image</text>
+</svg>
+<div class="figcap">The three actors, left to right. Atom does the drawing,
+  gz-rendering shepherds the image across, gz-gui shows it.</div>
+
+<p>
+  Importantly: <strong>Atom and Qt each open a separate connection to the
+  GPU</strong> (their own <code>VkDevice</code>). That's why the seam between
+  them needs the file-descriptor handshake described in section 5.
+</p>
+
+<h2 id="journey">A pixel's journey, end to end</h2>
+
+<p>
+  Here is what happens, every frame, for the pixels you eventually see in
+  the gz-gui window. The dots animate left to right to show the data
+  flowing.
+</p>
+
+<svg viewBox="0 0 980 240" role="img" aria-label="Per-frame pixel journey"
+     style="max-height: 290px;">
+
+  <!-- 5 stages -->
+  <g font-family="ui-monospace, Menlo, monospace" font-size="11">
+    <!-- 1. Atom renders -->
+    <rect x="10"  y="20" width="160" height="160" rx="8" fill="#1e1b22" stroke="#f7768e" stroke-width="2"/>
+    <text x="90"  y="42" text-anchor="middle" fill="#f7768e" font-weight="700">1. Atom draws</text>
+    <text x="90"  y="62" text-anchor="middle" fill="#d8dee9">box, sphere, cylinder</text>
+    <text x="90"  y="78" text-anchor="middle" fill="#d8dee9">into a VkImage on</text>
+    <text x="90"  y="94" text-anchor="middle" fill="#d8dee9">Atom's VkDevice.</text>
+    <text x="90"  y="125" text-anchor="middle" fill="#99a2b3" font-size="10">vkCmdDraw, vkCmd*</text>
+    <text x="90"  y="142" text-anchor="middle" fill="#99a2b3" font-size="10">VkImage = "Atom A"</text>
+    <text x="90"  y="170" text-anchor="middle" fill="#7aa2f7" font-size="10">[in gz-rendering]</text>
+
+    <!-- 2. FD export -->
+    <rect x="200" y="20" width="160" height="160" rx="8" fill="#241f15" stroke="#e0af68" stroke-width="2"/>
+    <text x="280" y="42" text-anchor="middle" fill="#e0af68" font-weight="700">2. Export FD</text>
+    <text x="280" y="62" text-anchor="middle" fill="#d8dee9">Ask Vulkan for an FD</text>
+    <text x="280" y="78" text-anchor="middle" fill="#d8dee9">pointing at the image's</text>
+    <text x="280" y="94" text-anchor="middle" fill="#d8dee9">GPU memory.</text>
+    <text x="280" y="125" text-anchor="middle" fill="#99a2b3" font-size="10">vkGetMemoryFdKHR</text>
+    <text x="280" y="142" text-anchor="middle" fill="#99a2b3" font-size="10">fd = 219 (an integer)</text>
+    <text x="280" y="170" text-anchor="middle" fill="#7aa2f7" font-size="10">[in gz-rendering]</text>
+
+    <!-- 3. FD import -->
+    <rect x="390" y="20" width="160" height="160" rx="8" fill="#241f15" stroke="#e0af68" stroke-width="2"/>
+    <text x="470" y="42" text-anchor="middle" fill="#e0af68" font-weight="700">3. Import FD</text>
+    <text x="470" y="62" text-anchor="middle" fill="#d8dee9">On Qt's VkDevice, ask</text>
+    <text x="470" y="78" text-anchor="middle" fill="#d8dee9">Vulkan: "give me a</text>
+    <text x="470" y="94" text-anchor="middle" fill="#d8dee9">VkImage backed by fd 219".</text>
+    <text x="470" y="125" text-anchor="middle" fill="#99a2b3" font-size="10">vkAllocateMemory</text>
+    <text x="470" y="142" text-anchor="middle" fill="#99a2b3" font-size="10">VkImage = "Qt B"</text>
+    <text x="470" y="170" text-anchor="middle" fill="#9ece6a" font-size="10">[in gz-gui]</text>
+
+    <!-- 4. QSG wrap + scene -->
+    <rect x="580" y="20" width="160" height="160" rx="8" fill="#1b231d" stroke="#9ece6a" stroke-width="2"/>
+    <text x="660" y="42" text-anchor="middle" fill="#9ece6a" font-weight="700">4. Qt SG node</text>
+    <text x="660" y="62" text-anchor="middle" fill="#d8dee9">Wrap "Qt B" as a</text>
+    <text x="660" y="78" text-anchor="middle" fill="#d8dee9">QSGTexture. Put it in</text>
+    <text x="660" y="94" text-anchor="middle" fill="#d8dee9">a QSGSimpleTextureNode.</text>
+    <text x="660" y="125" text-anchor="middle" fill="#99a2b3" font-size="10">QSGVulkanTexture::</text>
+    <text x="660" y="142" text-anchor="middle" fill="#99a2b3" font-size="10">  fromNative()</text>
+    <text x="660" y="170" text-anchor="middle" fill="#9ece6a" font-size="10">[in gz-gui]</text>
+
+    <!-- 5. Present -->
+    <rect x="770" y="20" width="200" height="160" rx="8" fill="#1b231d" stroke="#9ece6a" stroke-width="2"/>
+    <text x="870" y="42" text-anchor="middle" fill="#9ece6a" font-weight="700">5. Qt presents</text>
+    <text x="870" y="62" text-anchor="middle" fill="#d8dee9">Qt rasterizes the scene</text>
+    <text x="870" y="78" text-anchor="middle" fill="#d8dee9">graph (including our node)</text>
+    <text x="870" y="94" text-anchor="middle" fill="#d8dee9">and hands a swapchain image</text>
+    <text x="870" y="110" text-anchor="middle" fill="#d8dee9">to the WSI: you see it.</text>
+    <text x="870" y="140" text-anchor="middle" fill="#99a2b3" font-size="10">vkQueuePresentKHR</text>
+    <text x="870" y="170" text-anchor="middle" fill="#9ece6a" font-size="10">[in gz-gui / Qt]</text>
+  </g>
+
+  <!-- moving packets -->
+  <g class="pkt"        transform="translate(0,0)"><circle cx="170" cy="100" r="6" fill="#8be9fd"/></g>
+  <g class="pkt pkt-2"  transform="translate(0,0)"><circle cx="170" cy="100" r="6" fill="#8be9fd"/></g>
+  <g class="pkt pkt-3"  transform="translate(0,0)"><circle cx="170" cy="100" r="6" fill="#8be9fd"/></g>
+
+  <!-- arrows between stages -->
+  <g stroke="#444c5e" stroke-width="1.5" fill="none">
+    <path d="M 170 100 L 200 100" marker-end="url(#ar)"/>
+    <path d="M 360 100 L 390 100" marker-end="url(#ar)"/>
+    <path d="M 550 100 L 580 100" marker-end="url(#ar)"/>
+    <path d="M 740 100 L 770 100" marker-end="url(#ar)"/>
+  </g>
+</svg>
+<div class="figcap">Per-frame data flow. The little cyan dots are
+  packets &mdash; in reality they're just file descriptors and pointers
+  changing hands.</div>
+
+<p>
+  A point worth pausing on: at step 3, the import does <strong>not copy any
+  pixels</strong>. Both Atom's <code>VkImage</code> "A" and Qt's <code>VkImage</code> "B"
+  share <em>the same physical bytes of GPU memory</em>. When Atom finishes
+  rendering, Qt can immediately read what Atom drew. That's the "zero-copy"
+  in "zero-copy interop".
+</p>
+
+<p>
+  The seam between steps 3 and 4 is also unusual: <em>Qt did not allocate
+  that <code>VkImage</code></em>. Qt is being told "here is a foreign-owned
+  image; please treat it as a texture". The Qt API for this is
+  <code>QSGVulkanTexture::fromNative(VkImage, layout, window, size)</code>.
+</p>
+
+<h2 id="swapchain">What is a "swapchain"?</h2>
+
+<p>
+  The screen refresh and the GPU don't naturally agree on timing. The
+  swapchain is Vulkan's solution: it owns a small ring of
+  <code>VkImage</code>s, typically 2 or 3. At any moment, one is being
+  shown to the user, one is being rendered into, and the others are queued.
+  Calling <code>vkQueuePresentKHR(image_index)</code> says "the image I
+  just rendered into is image_index; please show it next".
+</p>
+
+<svg viewBox="0 0 600 260" role="img" aria-label="Swapchain rotation diagram"
+     style="max-height: 280px;">
+  <!-- frame -->
+  <rect x="370" y="40" width="200" height="170" rx="6" fill="#1b231d" stroke="#9ece6a" stroke-width="1.5"/>
+  <text x="470" y="60" text-anchor="middle" fill="#9ece6a" font-weight="700" font-size="13">screen</text>
+  <rect x="395" y="78" width="150" height="118" rx="4" fill="#0d1014" stroke="#444c5e"/>
+  <text x="470" y="140" text-anchor="middle" fill="#99a2b3" font-size="11">currently showing</text>
+  <text x="470" y="158" text-anchor="middle" fill="#99a2b3" font-size="11">whichever swapchain</text>
+  <text x="470" y="174" text-anchor="middle" fill="#99a2b3" font-size="11">image is on top</text>
+
+  <!-- rotating ring -->
+  <g class="swap-ring">
+    <circle cx="200" cy="130" r="80" fill="none" stroke="#444c5e" stroke-dasharray="3 4"/>
+    <!-- 3 images positioned at 0, 120, 240 deg -->
+    <g transform="translate(200,50)">
+      <rect x="-30" y="-22" width="60" height="44" rx="4" fill="#1e1b22" stroke="#f7768e"/>
+      <text x="0" y="4" text-anchor="middle" fill="#f7768e" font-size="11" font-weight="700">img 0</text>
+    </g>
+    <g transform="translate(269,170)">
+      <rect x="-30" y="-22" width="60" height="44" rx="4" fill="#1e1b22" stroke="#f7768e"/>
+      <text x="0" y="4" text-anchor="middle" fill="#f7768e" font-size="11" font-weight="700">img 1</text>
+    </g>
+    <g transform="translate(131,170)">
+      <rect x="-30" y="-22" width="60" height="44" rx="4" fill="#1e1b22" stroke="#f7768e"/>
+      <text x="0" y="4" text-anchor="middle" fill="#f7768e" font-size="11" font-weight="700">img 2</text>
+    </g>
+  </g>
+  <text x="200" y="235" text-anchor="middle" fill="#99a2b3" font-size="11">swapchain (3 images cycling)</text>
+
+  <!-- arrow -->
+  <path d="M 290 130 L 360 130" stroke="#d8dee9" stroke-width="1.5" fill="none" marker-end="url(#ar)"/>
+  <text x="325" y="123" text-anchor="middle" fill="#99a2b3" font-size="10">vkQueuePresentKHR</text>
+</svg>
+<div class="figcap">Swapchain images cycle through &lsquo;rendering&rsquo;
+  &rarr; &lsquo;queued&rsquo; &rarr; &lsquo;on screen&rsquo;. Qt fills the
+  next one; the WSI shows it.</div>
+
+<p>
+  The reason the swapchain matters for this story: Qt does <em>not</em>
+  render directly into the swapchain in the natural-looking way you might
+  imagine. After Qt's window resizes (e.g. when the gz-gui window goes to
+  full size), Qt's pipeline becomes:
+</p>
+
+<ol>
+  <li>Render the scene graph (your textured nodes, QML rectangles, &hellip;)
+    into a <em>private offscreen image</em> &mdash; call it the "FBO".</li>
+  <li>To present, start a render pass on the next free swapchain image,
+    clear it to black, then draw <em>one fullscreen triangle</em> that
+    samples the FBO across the whole screen.</li>
+  <li>Hand the swapchain image to <code>vkQueuePresentKHR</code>.</li>
+</ol>
+
+<p>
+  Step 2's "one fullscreen triangle that samples a texture" is a standard
+  GPU trick: a triangle that's larger than the screen but gets clipped to
+  the viewport, so every pixel of the swapchain runs the same texture-sample
+  shader. The point is: whatever ends up in the FBO is exactly what the
+  swapchain (and your screen) will show.
+</p>
+
+<h2 id="fd">What's "FD" in Vulkan land?</h2>
+
+<p>
+  In Linux generally, a file descriptor (FD) is a small integer the kernel
+  uses to identify an opened resource (a file, a socket, &hellip;). It's
+  cheap to pass around &mdash; just an <code>int</code> &mdash; but it
+  refers to something big the kernel knows about.
+</p>
+
+<p>
+  Vulkan's <code>VK_KHR_external_memory_fd</code> extension lets you do
+  the same trick for GPU memory:
+</p>
+
+<pre><code>// O3DE side (in gz-rendering):
+int fd;
+vkGetMemoryFdKHR(&amp;getFdInfo, &amp;fd);   // fd = some integer like 219
+
+// hand &lsquo;fd&rsquo; to gz-gui via a normal C++ API call.
+
+// Qt side (in gz-gui):
+VkImportMemoryFdInfoKHR import{};
+import.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+import.fd         = fd;
+VkMemoryAllocateInfo alloc{ .pNext = &amp;import, ... };
+vkAllocateMemory(qtDevice, &amp;alloc, nullptr, &amp;qtMemory);
+// vkBindImageMemory(...) attaches a fresh VkImage to that memory.
+// Now Atom and Qt share the same physical GPU bytes.</code></pre>
+
+<p>
+  This is the "zero-copy" path. Without the FD trick, you would have to
+  copy pixels from Atom's <code>VkImage</code> to CPU RAM, then upload them
+  to Qt's <code>VkImage</code> &mdash; doable, but slow. With the FD trick,
+  the bytes never move.
+</p>
+
+<svg viewBox="0 0 900 200" role="img" aria-label="FD handoff diagram"
+     style="max-height: 220px;">
+  <!-- GPU memory in the middle -->
+  <rect x="320" y="60" width="260" height="100" rx="10" fill="#181222" stroke="#bd93f9" stroke-width="2"/>
+  <text x="450" y="85" text-anchor="middle" fill="#bd93f9" font-weight="700" font-size="14">GPU memory (one block of bytes)</text>
+  <text x="450" y="108" text-anchor="middle" fill="#d8dee9" font-size="11">the actual pixel data lives here</text>
+  <text x="450" y="124" text-anchor="middle" fill="#d8dee9" font-size="11">VkDeviceMemory (Atom side) and</text>
+  <text x="450" y="140" text-anchor="middle" fill="#d8dee9" font-size="11">VkDeviceMemory (Qt side) point at it</text>
+
+  <!-- Atom side -->
+  <rect x="20"  y="60" width="180" height="100" rx="10" fill="#1e1b22" stroke="#f7768e" stroke-width="2"/>
+  <text x="110" y="85" text-anchor="middle" fill="#f7768e" font-weight="700" font-size="13">Atom's VkDevice</text>
+  <text x="110" y="108" text-anchor="middle" fill="#d8dee9" font-size="11">VkImage A</text>
+  <text x="110" y="128" text-anchor="middle" fill="#99a2b3" font-size="11">vkGetMemoryFdKHR &rarr;</text>
+  <text x="110" y="145" text-anchor="middle" fill="#e0af68" font-size="13" font-weight="700">fd = 219</text>
+
+  <!-- Qt side -->
+  <rect x="700" y="60" width="180" height="100" rx="10" fill="#1b231d" stroke="#9ece6a" stroke-width="2"/>
+  <text x="790" y="85" text-anchor="middle" fill="#9ece6a" font-weight="700" font-size="13">Qt's VkDevice</text>
+  <text x="790" y="108" text-anchor="middle" fill="#d8dee9" font-size="11">VkImage B</text>
+  <text x="790" y="128" text-anchor="middle" fill="#99a2b3" font-size="11">&larr; vkAllocateMemory</text>
+  <text x="790" y="145" text-anchor="middle" fill="#99a2b3" font-size="11">with VkImportMemoryFdInfoKHR</text>
+
+  <!-- arrows -->
+  <path d="M 200 110 L 320 110" stroke="#bd93f9" stroke-width="2" fill="none" marker-end="url(#ar)"/>
+  <path d="M 580 110 L 700 110" stroke="#bd93f9" stroke-width="2" fill="none" marker-end="url(#ar)"/>
+
+  <text x="260" y="100" text-anchor="middle" fill="#99a2b3" font-size="10">backs</text>
+  <text x="640" y="100" text-anchor="middle" fill="#99a2b3" font-size="10">backs</text>
+
+  <!-- FD path - small integer crossing the top -->
+  <path d="M 110 60 Q 450 -10 790 60" stroke="#e0af68" stroke-width="1.5" stroke-dasharray="3 3" fill="none"/>
+  <text x="450" y="20" text-anchor="middle" fill="#e0af68" font-size="11">fd = 219 travels through a normal C++ call</text>
+</svg>
+<div class="figcap">The FD itself is just a tiny integer crossing the
+  software seam. The GPU memory it refers to is large and stays put.</div>
+
+<p class="note">
+  Caveat that bit us: on NVIDIA's proprietary driver, an
+  <code>OPAQUE_FD</code> image used cross-device <strong>must</strong> be a
+  dedicated allocation (chained with <code>VkMemoryDedicatedAllocateInfo</code>)
+  and bound at offset 0. That's how the gz-rendering code does it; without it,
+  the importing device samples wrong addresses (the driver bakes assumptions
+  into its texture units that only hold when the image owns its allocation).
+  See the findings doc for the gory detail.
+</p>
+
+<h2 id="qsg">What is QSG?</h2>
+
+<p>
+  Qt has two parallel rendering stacks: one for traditional widgets
+  (<code>QPainter</code>), and one for declarative <code>.qml</code>
+  scenes &mdash; the <strong>Qt Scene Graph</strong>, abbreviated QSG.
+  QSG is heavily optimized: instead of "draw this rectangle, then draw
+  this text, then draw this image" one call at a time, the QML engine
+  builds a tree of <strong>QSGNode</strong> instances that describe the
+  whole scene, and the QSG renderer batches it into GPU draw calls.
+</p>
+
+<svg viewBox="0 0 900 280" role="img" aria-label="QSG node tree"
+     style="max-height: 320px;">
+  <!-- QML on the left -->
+  <rect x="20" y="40" width="240" height="200" rx="8" fill="#1b231d" stroke="#9ece6a" stroke-width="2"/>
+  <text x="140" y="65" text-anchor="middle" fill="#9ece6a" font-weight="700" font-size="14">your QML</text>
+  <text x="50" y="95" fill="#d8dee9" font-family="monospace" font-size="11">Rectangle {</text>
+  <text x="60" y="113" fill="#d8dee9" font-family="monospace" font-size="11">color: "black"</text>
+  <text x="60" y="131" fill="#d8dee9" font-family="monospace" font-size="11">Image {</text>
+  <text x="70" y="149" fill="#d8dee9" font-family="monospace" font-size="11">source: theBox</text>
+  <text x="60" y="167" fill="#d8dee9" font-family="monospace" font-size="11">}</text>
+  <text x="60" y="185" fill="#d8dee9" font-family="monospace" font-size="11">Text {</text>
+  <text x="70" y="203" fill="#d8dee9" font-family="monospace" font-size="11">text: "FPS: 60"</text>
+  <text x="60" y="221" fill="#d8dee9" font-family="monospace" font-size="11">}</text>
+
+  <!-- arrow -->
+  <path d="M 270 140 L 320 140" stroke="#d8dee9" stroke-width="1.5" fill="none" marker-end="url(#ar)"/>
+  <text x="295" y="132" text-anchor="middle" fill="#99a2b3" font-size="10">becomes</text>
+
+  <!-- QSG tree in the middle -->
+  <g font-family="ui-monospace, monospace" font-size="11">
+    <rect x="330" y="40" width="260" height="200" rx="8" fill="#1b231d" stroke="#9ece6a" stroke-width="2"/>
+    <text x="460" y="65" text-anchor="middle" fill="#9ece6a" font-weight="700" font-size="14">QSG node tree</text>
+
+    <!-- root -->
+    <rect x="420" y="80" width="80" height="26" rx="3" fill="#101417" stroke="#9ece6a"/>
+    <text x="460" y="98" text-anchor="middle" fill="#d8dee9" font-size="10">root</text>
+
+    <!-- children -->
+    <line x1="460" y1="106" x2="380" y2="135" stroke="#9ece6a"/>
+    <line x1="460" y1="106" x2="460" y2="135" stroke="#9ece6a"/>
+    <line x1="460" y1="106" x2="540" y2="135" stroke="#9ece6a"/>
+
+    <rect x="345" y="135" width="80" height="26" rx="3" fill="#101417" stroke="#9ece6a"/>
+    <text x="385" y="153" text-anchor="middle" fill="#d8dee9" font-size="10">Rect</text>
+
+    <rect x="425" y="135" width="80" height="40" rx="3" fill="#101417" stroke="#f7768e" stroke-width="2"/>
+    <text x="465" y="151" text-anchor="middle" fill="#f7768e" font-size="10">SimpleTexture</text>
+    <text x="465" y="166" text-anchor="middle" fill="#f7768e" font-size="10">Node (us!)</text>
+
+    <rect x="510" y="135" width="80" height="26" rx="3" fill="#101417" stroke="#9ece6a"/>
+    <text x="550" y="153" text-anchor="middle" fill="#d8dee9" font-size="10">Text</text>
+
+    <text x="460" y="225" text-anchor="middle" fill="#99a2b3" font-size="10">tree of QSGNodes</text>
+  </g>
+
+  <!-- arrow 2 -->
+  <path d="M 600 140 L 650 140" stroke="#d8dee9" stroke-width="1.5" fill="none" marker-end="url(#ar)"/>
+  <text x="625" y="132" text-anchor="middle" fill="#99a2b3" font-size="10">renderer</text>
+
+  <!-- GPU calls on the right -->
+  <rect x="660" y="40" width="220" height="200" rx="8" fill="#241f15" stroke="#e0af68" stroke-width="2"/>
+  <text x="770" y="65" text-anchor="middle" fill="#e0af68" font-weight="700" font-size="14">Vulkan calls</text>
+  <g font-family="ui-monospace, monospace" font-size="10" fill="#d8dee9">
+    <text x="680" y="92">vkCmdBeginRenderPass</text>
+    <text x="680" y="110">vkCmdBindPipeline</text>
+    <text x="680" y="128">vkCmdBindDescriptorSets</text>
+    <text x="680" y="146">vkCmdDraw verts=6   (Rect)</text>
+    <text x="680" y="164">vkCmdDraw verts=6   (Texture)</text>
+    <text x="680" y="182">vkCmdDraw verts=6   (Text)</text>
+    <text x="680" y="200">vkCmdEndRenderPass</text>
+    <text x="680" y="222">vkQueuePresentKHR</text>
+  </g>
+</svg>
+<div class="figcap">QML &rarr; QSG node tree &rarr; Vulkan draw calls.
+  Our box-from-Atom is the pink <code>QSGSimpleTextureNode</code> in the
+  middle.</div>
+
+<p>
+  <code>QSGSimpleTextureNode</code> is the simplest QSG node that draws a
+  textured quad. Our gz-gui MinimalScene puts one of these in the QSG tree
+  every frame; the texture it uses is the <code>fromNative</code> wrap of
+  the Atom-rendered <code>VkImage</code>. That's our hand-off to Qt's
+  scene graph.
+</p>
+
+<h2 id="apis">Who calls which API</h2>
+
+<p>
+  Pulling the previous sections together: when a frame happens, here is who
+  calls what.
+</p>
+
+<table>
+  <thead>
+    <tr><th style="width:18%">Layer</th><th style="width:42%">What it does</th><th>APIs it actually calls</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><span class="tag o3de">O3DE / Atom</span></td>
+      <td>Renders the scene (box, sphere, cylinder) into a VkImage on its
+        own VkDevice. Knows nothing about Qt.</td>
+      <td>Vulkan core: <code>vkCmd*</code>, <code>vkQueueSubmit</code>,
+        <code>vkCreateImage</code> with <code>VkExternalMemoryImageCreateInfo</code>,
+        <code>vkAllocateMemory</code> with <code>VkExportMemoryAllocateInfo</code>.</td>
+    </tr>
+    <tr>
+      <td><span class="tag gz">gz-rendering</span></td>
+      <td>The O3DE plugin (<code>o3de/src/O3deBackend.cc</code>,
+        <code>O3deCamera.cc</code>) sets the Atom side up to export, then
+        reaches across to gz-gui with the FD + size + VkImage handle.</td>
+      <td>Atom's C++ API (creating scenes, lights, cameras, drawing
+        primitives) <em>plus</em>
+        <code>vkGetMemoryFdKHR</code> for the export.</td>
+    </tr>
+    <tr>
+      <td><span class="tag gz">gz-rendering</span></td>
+      <td>The CPU-readback fallback path (<code>O3deRenderTarget::Copy</code>)
+        for engines that don't want zero-copy.</td>
+      <td>Atom's <code>AttachmentReadback</code> + a buffer copy to a
+        <code>gz::common::Image</code>.</td>
+    </tr>
+    <tr>
+      <td><span class="tag gui">gz-gui</span></td>
+      <td>The Vulkan path in <code>plugins/minimal_scene/
+        MinimalSceneRhiVulkan.cc</code>: import the FD, wrap the resulting
+        VkImage as a QSGTexture, install it in the QSG tree.</td>
+      <td>A small bit of Vulkan: <code>vkAllocateMemory</code> with
+        <code>VkImportMemoryFdInfoKHR</code>, layout transitions /
+        QFOT-acquire. Then Qt: <code>QNativeInterface::QSGVulkanTexture::
+        fromNative</code>, <code>QSGSimpleTextureNode</code>, the QQuickItem
+        scene-graph protocol.</td>
+    </tr>
+    <tr>
+      <td><span class="tag gui">gz-gui (Qt)</span></td>
+      <td>Qt's QSG/QRhi internals: rasterize the tree, present.</td>
+      <td>Vulkan again, but called by Qt itself:
+        <code>vkCmdBeginRenderPass</code>, <code>vkCmdBindPipeline</code>,
+        <code>vkCmdBindDescriptorSets</code>, <code>vkCmdDraw</code>,
+        <code>vkQueuePresentKHR</code>.</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>
+  So <strong>Vulkan is called from all three layers</strong>, but each
+  layer calls a small, specific subset:
+</p>
+
+<div class="grid cols-3">
+  <div class="card">
+    <h3><span class="dot o3de"></span>O3DE / Atom</h3>
+    <p>Heavy Vulkan: full render pipeline. Owns one
+      <code>VkInstance</code> + <code>VkDevice</code>.</p>
+  </div>
+  <div class="card">
+    <h3><span class="dot gz"></span>gz-rendering's o3de plugin</h3>
+    <p>Light Vulkan: just enough to export GPU memory as an FD.
+      Mostly calls Atom's C++ API.</p>
+  </div>
+  <div class="card">
+    <h3><span class="dot gui"></span>gz-gui's MinimalScene</h3>
+    <p>Light Vulkan: import the FD, set image layouts. Most of its work is
+      Qt scene-graph plumbing. <em>Qt itself</em> issues the heavy Vulkan
+      to draw + present.</p>
+  </div>
+</div>
+
+<h2 id="bug">Where the current bug is</h2>
+
+<p>
+  The "uniform grey 148 on screen" symptom is in section 5 of the journey
+  &mdash; <em>but specifically in the step where Qt's scene graph renders
+  into the offscreen FBO before composing it onto the swapchain</em>.
+</p>
+
+<svg viewBox="0 0 980 240" role="img" aria-label="Where the bug is"
+     style="max-height: 290px;">
+  <g font-family="ui-monospace, Menlo, monospace" font-size="11">
+    <rect x="10"  y="20" width="160" height="160" rx="8" fill="#1e1b22" stroke="#f7768e" stroke-width="2"/>
+    <text x="90"  y="42" text-anchor="middle" fill="#f7768e" font-weight="700">1. Atom</text>
+    <text x="90"  y="62" text-anchor="middle" fill="#d8dee9">renders correctly</text>
+    <text x="90"  y="78" text-anchor="middle" fill="#d8dee9">(verified: 67 colours,</text>
+    <text x="90"  y="94" text-anchor="middle" fill="#d8dee9">shapes present)</text>
+    <text x="90"  y="160" text-anchor="middle" fill="#9ece6a">OK &check;</text>
+
+    <rect x="200" y="20" width="160" height="160" rx="8" fill="#241f15" stroke="#e0af68" stroke-width="2"/>
+    <text x="280" y="42" text-anchor="middle" fill="#e0af68" font-weight="700">2&ndash;3. Export+import</text>
+    <text x="280" y="62" text-anchor="middle" fill="#d8dee9">FD handshake works,</text>
+    <text x="280" y="78" text-anchor="middle" fill="#d8dee9">Qt's VkImage shares</text>
+    <text x="280" y="94" text-anchor="middle" fill="#d8dee9">Atom's memory.</text>
+    <text x="280" y="160" text-anchor="middle" fill="#9ece6a">OK &check;</text>
+
+    <rect x="390" y="20" width="160" height="160" rx="8" fill="#1b231d" stroke="#9ece6a" stroke-width="2"/>
+    <text x="470" y="42" text-anchor="middle" fill="#9ece6a" font-weight="700">4. fromNative + node</text>
+    <text x="470" y="62" text-anchor="middle" fill="#d8dee9">QSGTexture wraps the</text>
+    <text x="470" y="78" text-anchor="middle" fill="#d8dee9">correct VkImage handle.</text>
+    <text x="470" y="94" text-anchor="middle" fill="#d8dee9">Compute-shader probe</text>
+    <text x="470" y="110" text-anchor="middle" fill="#d8dee9">reads shapes back fine.</text>
+    <text x="470" y="160" text-anchor="middle" fill="#9ece6a">OK &check;</text>
+
+    <rect x="580" y="20" width="160" height="160" rx="8" fill="#1b231d" stroke="#9ece6a" stroke-width="2"/>
+    <rect x="580" y="20" width="160" height="160" rx="8" fill="none" class="bug-pulse"/>
+    <text x="660" y="42" text-anchor="middle" fill="#f7768e" font-weight="700">5a. QSG &rarr; FBO</text>
+    <text x="660" y="62" text-anchor="middle" fill="#d8dee9">Qt's scene graph draws</text>
+    <text x="660" y="78" text-anchor="middle" fill="#d8dee9">into the offscreen FBO.</text>
+    <text x="660" y="94" text-anchor="middle" fill="#d8dee9">Expected: shapes.</text>
+    <text x="660" y="110" text-anchor="middle" fill="#d8dee9">Actual: uniform 148.</text>
+    <text x="660" y="160" text-anchor="middle" fill="#f7768e" font-weight="700">BUG &times;</text>
+
+    <rect x="770" y="20" width="200" height="160" rx="8" fill="#1b231d" stroke="#9ece6a" stroke-width="2"/>
+    <text x="870" y="42" text-anchor="middle" fill="#9ece6a" font-weight="700">5b. Compose+present</text>
+    <text x="870" y="62" text-anchor="middle" fill="#d8dee9">Clear swapchain to black,</text>
+    <text x="870" y="78" text-anchor="middle" fill="#d8dee9">one fullscreen triangle</text>
+    <text x="870" y="94" text-anchor="middle" fill="#d8dee9">samples the FBO into it,</text>
+    <text x="870" y="110" text-anchor="middle" fill="#d8dee9">vkQueuePresentKHR.</text>
+    <text x="870" y="130" text-anchor="middle" fill="#d8dee9">Faithful to its input</text>
+    <text x="870" y="146" text-anchor="middle" fill="#d8dee9">&rarr; you see uniform 148.</text>
+    <text x="870" y="170" text-anchor="middle" fill="#9ece6a">OK &check;</text>
+  </g>
+
+  <g stroke="#444c5e" stroke-width="1.5" fill="none">
+    <path d="M 170 100 L 200 100" marker-end="url(#ar)"/>
+    <path d="M 360 100 L 390 100" marker-end="url(#ar)"/>
+    <path d="M 550 100 L 580 100" marker-end="url(#ar)"/>
+    <path d="M 740 100 L 770 100" marker-end="url(#ar)"/>
+  </g>
+</svg>
+<div class="figcap">The same journey from above, annotated with what we
+  proved. The red pulsing box is the failure point.</div>
+
+<div class="bug">
+  <b>So what is the failure, in one sentence?</b><br>
+  Qt's <code>QSGSimpleTextureNode</code>, holding a <code>fromNative</code>
+  wrap of a foreign-owned <code>VkImage</code> that is known-correct on
+  Qt's own VkDevice, does not deliver the texture's pixels into the
+  offscreen FBO when QSG rasterizes the scene. The FBO ends up filled
+  with the QML background colour (148, Atom's clear), and Qt's faithful
+  fullscreen-triangle composite then writes 148 across the whole
+  swapchain.
+</div>
+
+<h3>How we verified each piece</h3>
+
+<ul>
+  <li><b>Atom's image is correct:</b> two independent in-tree tools
+    (<code>GZ_O3DE_DUMP_PNG</code> and <code>GZ_O3DE_SAMPLE_PROBE</code>)
+    read the imported <code>VkImage</code> on Qt's device and produce
+    byte-identical PPMs containing the shapes.</li>
+  <li><b>fromNative wraps the right handle:</b> we added gated diagnostic
+    prints (<code>GZ_GUI_VULKAN_DIAG=1</code>) in MinimalSceneRhiVulkan
+    that log the <code>VkImage</code> handle every frame; it matches the
+    producer's.</li>
+  <li><b>The swapchain present path is empty&hellip;ish:</b> the
+    <code>VK_LAYER_GZ_swapchain_dump</code> Vulkan layer
+    (gz-gui <code>test/regression/swapchain_dump_layer/</code>) hooks
+    <code>vkQueuePresentKHR</code> and dumps the about-to-be-presented
+    image to PPM. With its <code>GZ_SWAPCHAIN_DRAW_TRACE=1</code> mode
+    enabled, the layer traces every render-pass and draw. Post-resize,
+    the swapchain pass is "clear to black + one fullscreen triangle
+    samples one texture + end" &mdash; faithful to whatever that texture
+    contains. So the 148 must be in the texture (= the FBO).</li>
+</ul>
+
+<h2>Pointers</h2>
+
+<ul>
+  <li><a href="zero-copy-interop-findings.md">gz-rendering/o3de/docs/zero-copy-interop-findings.md</a>
+    &mdash; the running diagnostic log; the source of truth for every
+    fact above.</li>
+  <li><span class="mono">gz-gui/test/regression/swapchain_dump_layer/README.md</span>
+    &mdash; how to use the in-tree Vulkan layer in any process.</li>
+  <li><span class="mono">gz-gui/test/regression/qsg_simple_texture_node_vulkan.cc</span>
+    &mdash; the five regression tests pinning down what works and what
+    doesn't.</li>
+  <li><span class="mono">/home/jrivero/.claude/plans/compiled-napping-quail.md</span>
+    &mdash; the original PoC plan with milestones.</li>
+</ul>
+
+</div>
+</body>
+</html>
