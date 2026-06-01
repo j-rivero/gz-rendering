@@ -102,6 +102,11 @@ namespace
       if (!o3deVisual)
         continue;
 
+      // Honour SetVisible(false): gz-gui plugins (e.g. InteractiveViewControl)
+      // hide their reference visuals when not interacting.
+      if (!o3deVisual->Visible())
+        continue;
+
       const math::Pose3d wp = o3deVisual->WorldPose();
       const math::Vector3d ws = o3deVisual->WorldScale();
 

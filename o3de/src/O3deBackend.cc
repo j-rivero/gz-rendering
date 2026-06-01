@@ -2251,7 +2251,13 @@ bool O3deBackend::Impl::BootstrapOnThread()
 // (RenderFrameForInterop) paths.
 static void MaybeInjectDemoShapes(std::vector<O3deShapeData> &_shapes)
 {
-  if (!_shapes.empty() || !std::getenv("GZ_O3DE_DEMO_SHAPES"))
+  // GZ_O3DE_DEMO_SHAPES is a demo-only flag that stands in for gz-sim content.
+  // Inject regardless of what GatherFrame already collected: gz-gui plugins such
+  // as InteractiveViewControl add their own visuals (e.g. the orbit reference
+  // sphere) the moment the user interacts, and an "_shapes.empty()" gate would
+  // then suppress the whole demo as soon as one such visual appears -- which is
+  // exactly the "everything vanishes when I orbit/zoom" symptom.
+  if (!std::getenv("GZ_O3DE_DEMO_SHAPES"))
     return;
 
   // Seconds since the first call -- drives the simple per-frame animation

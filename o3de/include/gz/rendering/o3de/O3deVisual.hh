@@ -49,11 +49,27 @@ namespace gz
       // Documentation inherited.
       protected: virtual void Init() override;
 
+      // Documentation inherited.
+      // Stores the flag (honoured by O3deRenderTarget::GatherFrame, which skips
+      // hidden visuals) instead of emitting BaseVisual's "not supported" error.
+      // gz-gui plugins such as InteractiveViewControl toggle the visibility of
+      // their reference visuals every interaction, so the base error would spam
+      // the console.
+      public: virtual void SetVisible(bool _visible) override;
+
+      /// \brief Whether this visual is currently visible. Visuals default to
+      /// visible; GatherFrame uses this to decide whether to draw the visual.
+      /// \return True if the visual should be drawn.
+      public: bool Visible() const;
+
       /// \brief Get a shared pointer to this
       private: O3deVisualPtr SharedThis();
 
       /// \brief Pointer to the attached geometries
       protected: O3deGeometryStorePtr geometries;
+
+      /// \brief Whether this visual is drawn (see SetVisible).
+      protected: bool visible = true;
 
       /// \brief Make the scene our friend so it can create visuals
       private: friend class O3deScene;

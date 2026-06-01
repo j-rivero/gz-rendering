@@ -81,6 +81,18 @@ void O3deVisual::Init()
 }
 
 //////////////////////////////////////////////////
+void O3deVisual::SetVisible(bool _visible)
+{
+  this->visible = _visible;
+}
+
+//////////////////////////////////////////////////
+bool O3deVisual::Visible() const
+{
+  return this->visible;
+}
+
+//////////////////////////////////////////////////
 O3deVisualPtr O3deVisual::SharedThis()
 {
   ObjectPtr object = shared_from_this();
