@@ -73,6 +73,8 @@
 #include <Atom/Feature/Mesh/MeshFeatureProcessorInterface.h>
 #include <Atom/RPI.Reflect/Asset/AssetUtils.h>
 #include <Atom/RPI.Reflect/Model/ModelAsset.h>
+#include <Atom/RPI.Reflect/Material/MaterialAsset.h>
+#include <Atom/RPI.Public/Material/Material.h>
 #include <Atom/Feature/CoreLights/PhotometricValue.h>
 #include <Atom/RPI.Public/Image/AttachmentImage.h>
 #include <Atom/RPI.Public/Image/AttachmentImagePool.h>
@@ -1556,12 +1558,37 @@ void O3deBackend::Impl::AcquireDemoMeshes()
         AZ::Vector3(1.0f, 0.0f, 1.0f),
         AZ::Vector3(0.5f, 0.5f, 0.5f),
         "sphere-caster" },
-      // Plane receiver: at z=0, scaled 8x to fill the demo viewport.
-      { "models/occlusioncullingplane.fbx.azmodel",
+      // Ground receiver: sphere.fbx.azmodel squashed flat (scale Z=0.1) so
+      // it sits at z=0 as a wide lens. Reuses the already-loaded sphere
+      // asset (the occlusion-culling-plane was a transparent occlusion-
+      // debug asset and rendered invisible -- couldn't show lighting or
+      // shadows). With a real solid Mesh surface here, the M6 spot's cone
+      // footprint and M7's shadow projector both have somewhere to land.
+      { "models/sphere.fbx.azmodel",
         AZ::Vector3(0.0f, 0.0f, 0.0f),
-        AZ::Vector3(8.0f, 8.0f, 1.0f),
-        "plane-receiver" },
+        AZ::Vector3(10.0f, 10.0f, 0.1f),
+        "flat-sphere-receiver" },
   };
+
+  // Load the shared mid-grey PBR material once -- the sphere asset's
+  // default-baked material has a near-white albedo that washes out the
+  // spot's coloured contribution AND makes any cast shadow nearly
+  // invisible against the bright reflected ambient. basic_grey gives
+  // us a mid-tone albedo so the spot tint + sphere shadow register.
+  auto greyMaterialAsset = AZ::RPI::AssetUtils::LoadCriticalAsset<
+      AZ::RPI::MaterialAsset>("materials/basic_grey.azmaterial",
+          AZ::RPI::AssetUtils::TraceLevel::Warning);
+  AZ::Data::Instance<AZ::RPI::Material> greyMaterial;
+  if (greyMaterialAsset.IsReady())
+  {
+    greyMaterial = AZ::RPI::Material::FindOrCreate(greyMaterialAsset);
+  }
+  if (!greyMaterial)
+  {
+    std::fprintf(stderr,
+        "[gz-o3de] M7 basic_grey material unavailable -- meshes will use "
+        "their baked default material (likely near-white)\n");
+  }
 
   for (const auto &d : demos)
   {
@@ -1575,7 +1602,9 @@ void O3deBackend::Impl::AcquireDemoMeshes()
           d.kind, d.assetPath);
       continue;
     }
-    AZ::Render::MeshHandleDescriptor desc(modelAsset);
+    AZ::Render::MeshHandleDescriptor desc = greyMaterial
+        ? AZ::Render::MeshHandleDescriptor(modelAsset, greyMaterial)
+        : AZ::Render::MeshHandleDescriptor(modelAsset);
     auto handle = this->meshFp->AcquireMesh(desc);
     if (!handle.IsValid())
     {
@@ -1687,6 +1716,21 @@ void O3deBackend::Impl::SubmitLights()
           std::fprintf(stderr,
               "[gz-o3de] M6 spot light acquired: id=0x%X (total spot=%zu)\n",
               light.id, this->spotLightHandles.size());
+          // M7 Phase A3: enable shadows on the spot itself. The SimpleSpot
+          // FP has its own self-contained shadow path (depth map allocated
+          // automatically on enable); the separate ProjectedShadowFP we
+          // wire in Phase A2 is a parallel projector system used elsewhere
+          // (decals, static projected shadows). Tune for the demo: 1024^2
+          // atlas + PCF filtering for soft edges.
+          this->spotLightFp->SetShadowsEnabled(it->second, true);
+          this->spotLightFp->SetShadowmapMaxResolution(it->second,
+              AZ::Render::ShadowmapSize::Size1024);
+          this->spotLightFp->SetShadowFilterMethod(it->second,
+              AZ::Render::ShadowFilterMethod::Pcf);
+          this->spotLightFp->SetFilteringSampleCount(it->second, 16);
+          std::fprintf(stderr,
+              "[gz-o3de] M7 spot shadows enabled on LightHandle: id=0x%X\n",
+              light.id);
         }
         this->spotLightFp->SetRgbIntensity(it->second,
             AZ::Render::PhotometricColor<AZ::Render::PhotometricUnit::Candela>(
@@ -2390,37 +2434,46 @@ static void MaybeInjectDemoLights(std::vector<O3deLightData> &_lights)
   if (!_lights.empty() || !std::getenv("GZ_O3DE_DEMO_SHAPES"))
     return;
 
-  // Point light: warm white, ~3 m above the origin so it lights the bobbing
-  // sphere column and the orbiting cylinder. Intensity is in candela (the
-  // SimplePointLightFP unit) -- 200 cd reads as a bright bulb against the
-  // default scene tonemap.
+  // Point light: warm white, 4 m above the origin so it lights the bobbing
+  // sphere column and the orbiting cylinder. Intensity in candela
+  // (SimplePointLightFP unit). Bumped to 800 cd (from 200) after manual
+  // verification: at 200 cd the warm tint was invisible against Atom's
+  // default IBL ambient; 800 cd makes the upward-facing surfaces (top of
+  // the box, the white sphere caster) noticeably warmer.
   O3deLightData point;
   point.type = O3deLightData::Type::POINT;
   point.id = 0xD0001u;
-  point.pos[0] = 0.0; point.pos[1] = 0.0; point.pos[2] = 3.0;
+  point.pos[0] = 0.0; point.pos[1] = 0.0; point.pos[2] = 4.0;
   point.diffuseColor[0] = 1.0; point.diffuseColor[1] = 0.85;
   point.diffuseColor[2] = 0.7;
-  point.intensity = 200.0;  // candela
-  point.attenRange = 10.0;
+  point.intensity = 800.0;  // candela
+  point.attenRange = 12.0;
   _lights.push_back(point);
 
-  // Spot light: cool blue, mounted high to the side near the cyan frustum
-  // widget. The simple-spot path is verified by the AcquireLight + per-frame
-  // SetTransform / SetConeAngles call sequence; precise orientation against
-  // the scene is deferred to M7, when shadow maps make the cone footprint
-  // visible.
+  // Spot light: cool blue, mounted high to the upper-left back of the scene
+  // at (-3, 3, 4) and AIMED at the world origin so the cone footprint lands
+  // squarely on the demo grid + meshes. Atom's SimpleSpotLight shines down
+  // local -Z, so the quaternion below rotates (0,0,-1) onto the unit vector
+  // (3,-3,-4)/sqrt(34) ~= (0.514, -0.514, -0.686). gz quat order is (w,x,y,z);
+  // GzQuat() in SubmitLights just reorders to AZ's (x,y,z,w) without any
+  // axis remap, so these literals ARE the Atom quaternion. After manual
+  // verification at quat=identity (which made the cone shine straight down
+  // off-frame) the spot was invisible; aiming + 5x intensity bump make it
+  // clear.
   O3deLightData spot;
   spot.type = O3deLightData::Type::SPOT;
   spot.id = 0xD0002u;
-  spot.pos[0] = -2.0; spot.pos[1] = 2.0; spot.pos[2] = 2.0;
-  spot.quat[0] = 1.0; spot.quat[1] = 0.0;
-  spot.quat[2] = 0.0; spot.quat[3] = 0.0;
+  spot.pos[0] = -3.0; spot.pos[1] = 3.0; spot.pos[2] = 4.0;
+  spot.quat[0] = 0.918;   // w   (= cos(angle/2),     angle ~= 0.815 rad)
+  spot.quat[1] = -0.281;  // x   (axis x = -1/sqrt(2))
+  spot.quat[2] = -0.281;  // y   (axis y = -1/sqrt(2))
+  spot.quat[3] = 0.0;     // z
   spot.diffuseColor[0] = 0.3; spot.diffuseColor[1] = 0.5;
   spot.diffuseColor[2] = 1.0;
-  spot.intensity = 300.0;  // candela
-  spot.attenRange = 8.0;
-  spot.innerAngle = 0.3;  // ~17 deg
-  spot.outerAngle = 0.6;  // ~34 deg
+  spot.intensity = 1500.0;  // candela (was 300; spot footprint was invisible)
+  spot.attenRange = 10.0;
+  spot.innerAngle = 0.35;   // ~20 deg
+  spot.outerAngle = 0.7;    // ~40 deg (wider cone, clearer falloff)
   _lights.push_back(spot);
 }
 
