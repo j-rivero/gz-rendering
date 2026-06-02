@@ -32,6 +32,7 @@
 #include "gz/rendering/WireBox.hh"
 #include "gz/rendering/o3de/O3deCamera.hh"
 #include "gz/rendering/o3de/O3deGeometry.hh"
+#include "gz/rendering/o3de/O3deMesh.hh"  // M9-B: detect real mesh geometries
 #include "gz/rendering/o3de/O3deLight.hh"
 #include "gz/rendering/o3de/O3deMaterial.hh"
 #include "gz/rendering/o3de/O3deRenderTarget.hh"
@@ -78,7 +79,8 @@ namespace
   /// Shared by Copy() (CPU readback) and Render() (native interop).
   void GatherFrame(O3deCamera *_camera, O3deCameraData &_camData,
       std::vector<O3deShapeData> &_shapes,
-      std::vector<O3deLightData> &_lights)
+      std::vector<O3deLightData> &_lights,
+      std::vector<O3deMeshData> &_meshes)
   {
     const math::Pose3d camPose = _camera->WorldPose();
     _camData.pos[0] = camPose.Pos().X();
@@ -153,6 +155,38 @@ namespace
             o3deVisual->GeometryByIndex(j));
         if (!geom)
           continue;
+
+        // M9-B: a real mesh geometry renders via the MeshFeatureProcessor, not
+        // AuxGeom. Its geometry was registered with the backend at create time
+        // (O3deScene::CreateMeshImpl -> RegisterMesh) keyed by the mesh's id;
+        // here we only emit the per-frame world transform + tint. Meshes have
+        // GeometryType OTHER, so they fall through ToBackendType below -- detect
+        // the concrete type instead.
+        if (auto o3deMesh = std::dynamic_pointer_cast<O3deMesh>(geom))
+        {
+          O3deMeshData md;
+          md.id = o3deMesh->Id();
+          md.pos[0] = wp.Pos().X();
+          md.pos[1] = wp.Pos().Y();
+          md.pos[2] = wp.Pos().Z();
+          md.quat[0] = wp.Rot().W();
+          md.quat[1] = wp.Rot().X();
+          md.quat[2] = wp.Rot().Y();
+          md.quat[3] = wp.Rot().Z();
+          md.scale[0] = ws.X();
+          md.scale[1] = ws.Y();
+          md.scale[2] = ws.Z();
+          if (MaterialPtr mat = o3deMesh->Material())
+          {
+            const math::Color c = mat->Diffuse();
+            md.color[0] = c.R();
+            md.color[1] = c.G();
+            md.color[2] = c.B();
+            md.color[3] = c.A();
+          }
+          _meshes.push_back(md);
+          continue;
+        }
 
         O3deShapeData shape;
         if (!ToBackendType(geom->Type(), shape.type))
@@ -305,8 +339,10 @@ void O3deRenderTarget::Render()
   O3deCameraData camData;
   std::vector<O3deShapeData> shapes;
   std::vector<O3deLightData> lights;
-  GatherFrame(this->camera, camData, shapes, lights);
-  O3deBackend::Instance().RenderFrameForInterop(camData, shapes, lights, w, h);
+  std::vector<O3deMeshData> meshes;
+  GatherFrame(this->camera, camData, shapes, lights, meshes);
+  O3deBackend::Instance().RenderFrameForInterop(
+      camData, shapes, lights, meshes, w, h);
 }
 
 //////////////////////////////////////////////////
@@ -337,15 +373,16 @@ void O3deRenderTarget::Copy(Image &_image) const
   O3deCameraData camData;
   std::vector<O3deShapeData> shapes;
   std::vector<O3deLightData> lights;
-  GatherFrame(this->camera, camData, shapes, lights);
+  std::vector<O3deMeshData> meshes;
+  GatherFrame(this->camera, camData, shapes, lights, meshes);
 
   const unsigned int channels = (_image.Format() == PF_R8G8B8) ? 3u : 4u;
 
   // The backend produces tightly packed RGBA8888.
   if (channels == 4u)
   {
-    if (!O3deBackend::Instance().RenderFrame(camData, shapes, lights, w, h,
-        data))
+    if (!O3deBackend::Instance().RenderFrame(camData, shapes, lights, meshes,
+        w, h, data))
     {
       // Leave the caller's buffer untouched on failure.
       return;
@@ -374,8 +411,8 @@ void O3deRenderTarget::Copy(Image &_image) const
     // PF_R8G8B8: render into a temporary RGBA buffer, then drop alpha.
     std::vector<std::uint8_t> rgba(
         static_cast<std::size_t>(w) * h * 4u, 0u);
-    if (!O3deBackend::Instance().RenderFrame(camData, shapes, lights, w, h,
-        rgba.data()))
+    if (!O3deBackend::Instance().RenderFrame(camData, shapes, lights, meshes,
+        w, h, rgba.data()))
       return;
     for (std::size_t i = 0; i < static_cast<std::size_t>(w) * h; ++i)
     {

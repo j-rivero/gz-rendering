@@ -30,6 +30,10 @@
 // gz-rendering flags and talks to Atom only through this interface.
 namespace gz
 {
+  namespace common
+  {
+    class Mesh;
+  }
   namespace rendering
   {
     /// \brief One primitive to draw this frame, in gz world coordinates.
@@ -159,6 +163,23 @@ namespace gz
       double outerAngle = 0.5;       //!< Spot outer cone angle (rad).
     };
 
+    /// \brief One mesh instance to draw this frame, in gz world coordinates
+    /// (M9). Plain data: it carries only a stable id plus the world transform +
+    /// colour, NOT the geometry. The geometry is registered once, out of band,
+    /// via O3deBackend::RegisterMesh(id, ...); the backend builds the Atom model
+    /// on its render thread on first sighting of the id and round-trips the
+    /// MeshFeatureProcessor handle across frames (acquire on first sight, update
+    /// the transform each frame, release when the id disappears) -- the same
+    /// id-keyed lifecycle the lights use.
+    struct O3deMeshData
+    {
+      uint64_t id = 0u;                      //!< Stable gz object id (== RegisterMesh id).
+      double pos[3] = {0.0, 0.0, 0.0};       //!< World position (gz frame).
+      double quat[4] = {1.0, 0.0, 0.0, 0.0}; //!< World orientation w,x,y,z.
+      double scale[3] = {1.0, 1.0, 1.0};     //!< World scale.
+      float color[4] = {0.8f, 0.8f, 0.8f, 1.0f}; //!< RGBA diffuse tint.
+    };
+
     /// \brief Camera pose + projection for one frame, in gz world coordinates.
     struct O3deCameraData
     {
@@ -216,6 +237,7 @@ namespace gz
       public: bool RenderFrame(const O3deCameraData &_camera,
                   const std::vector<O3deShapeData> &_shapes,
                   const std::vector<O3deLightData> &_lights,
+                  const std::vector<O3deMeshData> &_meshes,
                   uint32_t _width, uint32_t _height, uint8_t *_outRgba);
 
       /// \brief Drive one offscreen frame of the given camera + primitives and
@@ -231,7 +253,23 @@ namespace gz
       public: bool RenderFrameForInterop(const O3deCameraData &_camera,
                   const std::vector<O3deShapeData> &_shapes,
                   const std::vector<O3deLightData> &_lights,
+                  const std::vector<O3deMeshData> &_meshes,
                   uint32_t _width, uint32_t _height);
+
+      /// \brief Register (or replace) the geometry for a mesh id (M9). Called
+      /// once per mesh from the gz thread (O3deScene::CreateMeshImpl). Only the
+      /// plain vertex/index data is extracted + cached here; the Atom model is
+      /// built lazily on the render thread the first time a matching
+      /// O3deMeshData id is rendered (Atom asset construction must stay on the
+      /// render thread). Safe to call while rendering. A null or empty mesh
+      /// unregisters the id.
+      /// \param[in] _id    Stable gz object id, matched against O3deMeshData::id.
+      /// \param[in] _mesh  Source geometry (its triangle submeshes are merged).
+      public: void RegisterMesh(uint64_t _id, const gz::common::Mesh *_mesh);
+
+      /// \brief Drop a mesh id's cached geometry/model and release its Atom
+      /// handle on the next render tick (M9). No-op for an unknown id.
+      public: void UnregisterMesh(uint64_t _id);
 
       /// \brief Get import handles for the exportable interop colour image
       /// (M4 zero-copy path). Only valid when the plugin was built with

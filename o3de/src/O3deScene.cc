@@ -26,6 +26,7 @@
 #include "gz/rendering/o3de/O3deLight.hh"
 #include "gz/rendering/o3de/O3deMaterial.hh"
 #include "gz/rendering/o3de/O3deMesh.hh"
+#include "O3deBackend.hh"  // M9-B: register mesh geometry with the Atom backend
 #include "gz/rendering/o3de/O3deRayQuery.hh"
 #include "gz/rendering/o3de/O3deRenderEngine.hh"
 #include "gz/rendering/o3de/O3deScene.hh"
@@ -285,16 +286,27 @@ GeometryPtr O3deScene::CreateSphereImpl(unsigned int _id,
 
 //////////////////////////////////////////////////
 MeshPtr O3deScene::CreateMeshImpl(unsigned int _id,
-    const std::string &_name, const MeshDescriptor &/*_desc*/)
+    const std::string &_name, const MeshDescriptor &_desc)
 {
-  // M5 Phase B: return a valid no-op Mesh so callers funnelling through
-  // Scene::CreateMesh -- in particular BaseArrowVisual::Init's rotation
-  // ring -- can attach a mesh geometry without crashing. The mesh contributes
-  // no AuxGeom draws (geometry type stays OTHER, so the per-frame gather
-  // skips it). Real mesh import is M9 in the post-beta1 roadmap.
   O3deMeshPtr mesh(new O3deMesh);
   bool result = this->InitObject(mesh, _id, _name);
-  return (result) ? mesh : nullptr;
+  if (!result)
+    return nullptr;
+
+  // M9-B: register the source geometry with the Atom backend, keyed by this
+  // mesh's id, so the render thread builds and draws a real MeshFeatureProcessor
+  // model (O3deRenderTarget::GatherFrame emits an O3deMeshData with the same id
+  // each frame). _desc may carry the common::Mesh directly or only a name;
+  // Load() resolves the name via the MeshManager. Callers with no geometry at
+  // all (e.g. BaseArrowVisual's rotation ring builds its mesh by name) simply
+  // register nothing and keep the old no-op behaviour.
+  MeshDescriptor desc = _desc;
+  if (desc.mesh == nullptr && !desc.meshName.empty())
+    desc.Load();
+  if (desc.mesh != nullptr)
+    O3deBackend::Instance().RegisterMesh(_id, desc.mesh);
+
+  return mesh;
 }
 
 //////////////////////////////////////////////////

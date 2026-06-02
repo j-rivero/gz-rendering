@@ -244,6 +244,24 @@ namespace
   };
 }
 
+/// \brief Plain CPU-side geometry for one mesh id (M9), extracted from a
+/// gz::common::Mesh on the gz thread by RegisterMesh and consumed on the render
+/// thread to build the Atom model. Holds the merged, Atom-ready interleaved
+/// streams (one element per vertex: positions x3, normals x3, tangents x4,
+/// bitangents x3, uvs x2) plus the index list, already re-wound for Atom's
+/// front-face convention. No Atom/AzCore types -- safe to build off-thread.
+struct MeshGeometryCpu
+{
+  std::vector<uint32_t> indices;
+  std::vector<float> positions;
+  std::vector<float> normals;
+  std::vector<float> tangents;
+  std::vector<float> bitangents;
+  std::vector<float> uvs;
+
+  bool Empty() const { return this->positions.empty() || this->indices.empty(); }
+};
+
 /// \brief Private Atom-owning data for O3deBackend.
 ///
 /// All O3DE/Atom calls (bootstrap AND every tick) happen on a single dedicated
@@ -365,6 +383,7 @@ class O3deBackend::Impl
   public: O3deCameraData pendingCamera;
   public: std::vector<O3deShapeData> pendingShapes;
   public: std::vector<O3deLightData> pendingLights;
+  public: std::vector<O3deMeshData> pendingMeshes;  // M9
   public: uint32_t pendingWidth = 0u;
   public: uint32_t pendingHeight = 0u;
   public: bool haveInput = false;
@@ -379,6 +398,7 @@ class O3deBackend::Impl
   public: O3deCameraData camera;
   public: std::vector<O3deShapeData> shapes;
   public: std::vector<O3deLightData> lights;
+  public: std::vector<O3deMeshData> meshes;  // M9
   public: uint32_t reqWidth = 0u;
   public: uint32_t reqHeight = 0u;
 
@@ -427,6 +447,27 @@ class O3deBackend::Impl
   public: AZ::Render::MeshFeatureProcessorInterface *meshFp = nullptr;
   public: AZStd::vector<
       AZ::Render::MeshFeatureProcessorInterface::MeshHandle> demoMeshHandles;
+
+  // ---- M9 mesh instances (public CreateMesh path) -------------------------
+  // CPU geometry registered out of band by RegisterMesh (gz thread), keyed by
+  // gz id. Guarded by `mutex`: the gz thread writes here while the render
+  // thread reads/erases it. The render thread builds the Atom model the first
+  // time it sees the id (Atom asset construction must stay render-side).
+  public: std::unordered_map<uint64_t, MeshGeometryCpu> meshGeometry;
+  // Ids the gz thread asked to drop; the render thread releases their handles
+  // in SubmitMeshes and clears this list. Guarded by `mutex`.
+  public: std::vector<uint64_t> meshUnregister;
+  // Render-thread-only caches: built model + live MeshFP handle per id.
+  public: std::unordered_map<uint64_t,
+      AZ::Data::Asset<AZ::RPI::ModelAsset>> meshModels;
+  public: std::unordered_map<uint64_t,
+      AZ::Render::MeshFeatureProcessorInterface::MeshHandle> meshHandles;
+  // Shared grey material for M9 meshes, loaded once on the render thread (the
+  // per-mesh O3deMeshData::color tint is a follow-up; see SubmitMeshes).
+  public: AZ::Data::Instance<AZ::RPI::Material> meshMaterial;
+  /// \brief M9: acquire/update/release Atom mesh handles for this->meshes,
+  /// mirroring SubmitLights()'s id-keyed lifecycle (render thread only).
+  public: void SubmitMeshes();
 
   // Capture scratch (render thread only), refilled each RenderOneFrame().
   public: AZStd::vector<uint8_t> captureBuffer;
@@ -704,6 +745,7 @@ bool O3deBackend::Impl::SetupScene(uint32_t _width, uint32_t _height)
     for (int i = 0; i < 5; ++i)
     {
       this->SubmitLights();
+      this->SubmitMeshes();
       this->SubmitPrimitives();
       this->app->PumpSystemEventLoopUntilEmpty();
       this->app->TickSystem();
@@ -1632,19 +1674,15 @@ namespace
     return asset;
   }
 
-  AZ::Data::Asset<AZ::RPI::ModelAsset> BuildModelAssetFromCommonMesh(
-      const gz::common::Mesh *_mesh, const AZ::Name &_name)
+  // Extract the merged, Atom-ready CPU geometry from a gz::common::Mesh. No
+  // Atom/AzCore calls -- safe on the gz thread (RegisterMesh). See
+  // MeshGeometryCpu + BuildModelAssetFromGeometry for the two halves of the M9
+  // converter.
+  MeshGeometryCpu ExtractMeshGeometry(const gz::common::Mesh *_mesh)
   {
-    AZ::Data::Asset<AZ::RPI::ModelAsset> nullAsset;
+    MeshGeometryCpu g;
     if (_mesh == nullptr || _mesh->SubMeshCount() == 0)
-      return nullAsset;
-
-    AZStd::vector<uint32_t> indices;
-    AZStd::vector<float> positions;   // 3 floats/vertex
-    AZStd::vector<float> normals;     // 3 floats/vertex
-    AZStd::vector<float> tangents;    // 4 floats/vertex (w = handedness)
-    AZStd::vector<float> bitangents;  // 3 floats/vertex
-    AZStd::vector<float> uvs;         // 2 floats/vertex
+      return g;
 
     for (unsigned int s = 0; s < _mesh->SubMeshCount(); ++s)
     {
@@ -1655,7 +1693,7 @@ namespace
       if (subMesh->SubMeshPrimitiveType() != gz::common::SubMesh::TRIANGLES)
         continue;
 
-      const uint32_t vbase = static_cast<uint32_t>(positions.size() / 3);
+      const uint32_t vbase = static_cast<uint32_t>(g.positions.size() / 3);
       const unsigned int vcount = subMesh->VertexCount();
       const bool hasNormals = subMesh->NormalCount() == vcount;
       const bool hasUVs = subMesh->TexCoordCount() == vcount;
@@ -1663,38 +1701,38 @@ namespace
       for (unsigned int v = 0; v < vcount; ++v)
       {
         const gz::math::Vector3d p = subMesh->Vertex(v);
-        positions.push_back(static_cast<float>(p.X()));
-        positions.push_back(static_cast<float>(p.Y()));
-        positions.push_back(static_cast<float>(p.Z()));
+        g.positions.push_back(static_cast<float>(p.X()));
+        g.positions.push_back(static_cast<float>(p.Y()));
+        g.positions.push_back(static_cast<float>(p.Z()));
 
         gz::math::Vector3d n(0.0, 0.0, 1.0);
         if (hasNormals)
           n = subMesh->Normal(v);
-        normals.push_back(static_cast<float>(n.X()));
-        normals.push_back(static_cast<float>(n.Y()));
-        normals.push_back(static_cast<float>(n.Z()));
+        g.normals.push_back(static_cast<float>(n.X()));
+        g.normals.push_back(static_cast<float>(n.Y()));
+        g.normals.push_back(static_cast<float>(n.Z()));
 
         // Placeholder tangent frame -- sufficient for the flat-shaded grey
         // material at this milestone; real tangents arrive with textured
-        // materials (M9-B / M10).
-        tangents.push_back(1.0f);
-        tangents.push_back(0.0f);
-        tangents.push_back(0.0f);
-        tangents.push_back(1.0f);
-        bitangents.push_back(0.0f);
-        bitangents.push_back(1.0f);
-        bitangents.push_back(0.0f);
+        // materials (M10).
+        g.tangents.push_back(1.0f);
+        g.tangents.push_back(0.0f);
+        g.tangents.push_back(0.0f);
+        g.tangents.push_back(1.0f);
+        g.bitangents.push_back(0.0f);
+        g.bitangents.push_back(1.0f);
+        g.bitangents.push_back(0.0f);
 
         if (hasUVs)
         {
           const gz::math::Vector2d uv = subMesh->TexCoord(v);
-          uvs.push_back(static_cast<float>(uv.X()));
-          uvs.push_back(static_cast<float>(uv.Y()));
+          g.uvs.push_back(static_cast<float>(uv.X()));
+          g.uvs.push_back(static_cast<float>(uv.Y()));
         }
         else
         {
-          uvs.push_back(0.0f);
-          uvs.push_back(0.0f);
+          g.uvs.push_back(0.0f);
+          g.uvs.push_back(0.0f);
         }
       }
 
@@ -1706,28 +1744,46 @@ namespace
       const unsigned int icount = subMesh->IndexCount();
       for (unsigned int i = 0; i + 2 < icount; i += 3)
       {
-        indices.push_back(vbase + static_cast<uint32_t>(subMesh->Index(i)));
-        indices.push_back(vbase + static_cast<uint32_t>(subMesh->Index(i + 2)));
-        indices.push_back(vbase + static_cast<uint32_t>(subMesh->Index(i + 1)));
+        g.indices.push_back(vbase + static_cast<uint32_t>(subMesh->Index(i)));
+        g.indices.push_back(vbase + static_cast<uint32_t>(subMesh->Index(i + 2)));
+        g.indices.push_back(vbase + static_cast<uint32_t>(subMesh->Index(i + 1)));
       }
       for (unsigned int i = (icount / 3) * 3; i < icount; ++i)
       {
-        indices.push_back(vbase + static_cast<uint32_t>(subMesh->Index(i)));
+        g.indices.push_back(vbase + static_cast<uint32_t>(subMesh->Index(i)));
       }
     }
 
-    if (positions.empty() || indices.empty())
+    return g;
+  }
+
+  // Build a Ready Atom ModelAsset from extracted CPU geometry. Atom asset
+  // construction -- MUST run on the render thread (see the AssetManager note on
+  // O3deBackend::Impl).
+  AZ::Data::Asset<AZ::RPI::ModelAsset> BuildModelAssetFromGeometry(
+      const MeshGeometryCpu &_geom, const AZ::Name &_name)
+  {
+    AZ::Data::Asset<AZ::RPI::ModelAsset> nullAsset;
+    if (_geom.Empty())
       return nullAsset;
 
-    const uint32_t vertexCount = static_cast<uint32_t>(positions.size() / 3);
-    const uint32_t indexCount = static_cast<uint32_t>(indices.size());
+    const uint32_t vertexCount =
+        static_cast<uint32_t>(_geom.positions.size() / 3);
+    const uint32_t indexCount = static_cast<uint32_t>(_geom.indices.size());
 
     AZ::Aabb aabb = AZ::Aabb::CreateNull();
-    for (uint32_t i = 0; i + 2 < positions.size(); i += 3)
+    for (size_t i = 0; i + 2 < _geom.positions.size(); i += 3)
     {
-      aabb.AddPoint(
-          AZ::Vector3(positions[i], positions[i + 1], positions[i + 2]));
+      aabb.AddPoint(AZ::Vector3(
+          _geom.positions[i], _geom.positions[i + 1], _geom.positions[i + 2]));
     }
+
+    const auto &positions = _geom.positions;
+    const auto &normals = _geom.normals;
+    const auto &tangents = _geom.tangents;
+    const auto &bitangents = _geom.bitangents;
+    const auto &uvs = _geom.uvs;
+    const auto &indices = _geom.indices;
 
     AZ::RPI::ModelLodAssetCreator lodCreator;
     lodCreator.Begin(AZ::Uuid::CreateRandom());
@@ -1784,6 +1840,14 @@ namespace
       return nullAsset;
 
     return modelAsset;
+  }
+
+  // Convenience for the render thread: extract + build in one call (used by the
+  // M9-A demo gate, which already runs on the render thread).
+  AZ::Data::Asset<AZ::RPI::ModelAsset> BuildModelAssetFromCommonMesh(
+      const gz::common::Mesh *_mesh, const AZ::Name &_name)
+  {
+    return BuildModelAssetFromGeometry(ExtractMeshGeometry(_mesh), _name);
   }
 }  // namespace
 
@@ -1939,6 +2003,130 @@ void O3deBackend::Impl::AcquireDemoMeshes()
         aznumeric_cast<float>(d.scale.GetY()),
         aznumeric_cast<float>(d.scale.GetZ()),
         this->demoMeshHandles.size());
+  }
+}
+
+//////////////////////////////////////////////////
+void O3deBackend::Impl::SubmitMeshes()
+{
+  if (!this->meshFp)
+    return;
+
+  // Process pending unregistrations first: release the Atom handle and drop the
+  // cached model/geometry. Done render-side so MeshFP teardown stays on-thread.
+  {
+    std::vector<uint64_t> toDrop;
+    {
+      std::lock_guard<std::mutex> lock(this->mutex);
+      toDrop.swap(this->meshUnregister);
+    }
+    for (uint64_t id : toDrop)
+    {
+      auto hIt = this->meshHandles.find(id);
+      if (hIt != this->meshHandles.end())
+      {
+        this->meshFp->ReleaseMesh(hIt->second);
+        this->meshHandles.erase(hIt);
+      }
+      this->meshModels.erase(id);
+      std::lock_guard<std::mutex> lock(this->mutex);
+      this->meshGeometry.erase(id);
+    }
+  }
+
+  // Nothing to draw and nothing left to release -- skip the material load.
+  if (this->meshes.empty() && this->meshHandles.empty())
+    return;
+
+  // Lazily load the shared grey material once (mirrors AcquireDemoMeshes). A
+  // mid-grey albedo keeps the lit mesh legible; per-mesh O3deMeshData::color
+  // tinting is a follow-up (would need a per-colour Material instance).
+  if (!this->meshMaterial)
+  {
+    auto greyAsset = AZ::RPI::AssetUtils::LoadCriticalAsset<
+        AZ::RPI::MaterialAsset>("materials/basic_grey.azmaterial",
+            AZ::RPI::AssetUtils::TraceLevel::Warning);
+    if (greyAsset.IsReady())
+      this->meshMaterial = AZ::RPI::Material::FindOrCreate(greyAsset);
+  }
+
+  // Acquire-on-first-sight + per-frame transform for every mesh present this
+  // frame; release handles whose id has gone (same lifecycle as SubmitLights).
+  std::unordered_set<uint64_t> present;
+  for (const O3deMeshData &m : this->meshes)
+  {
+    present.insert(m.id);
+
+    auto hIt = this->meshHandles.find(m.id);
+    if (hIt == this->meshHandles.end())
+    {
+      // Build the Atom model on first sight from the registered CPU geometry.
+      auto modelIt = this->meshModels.find(m.id);
+      if (modelIt == this->meshModels.end())
+      {
+        MeshGeometryCpu geom;
+        {
+          std::lock_guard<std::mutex> lock(this->mutex);
+          auto gIt = this->meshGeometry.find(m.id);
+          if (gIt != this->meshGeometry.end())
+            geom = gIt->second;
+        }
+        if (geom.Empty())
+          continue;  // geometry not registered (yet) for this id
+        auto model = BuildModelAssetFromGeometry(geom,
+            AZ::Name(AZStd::string::format("gz_mesh_%llu",
+                static_cast<unsigned long long>(m.id))));
+        if (!model.IsReady())
+        {
+          std::fprintf(stderr,
+              "[gz-o3de] M9 mesh id=%llu model build FAILED\n",
+              static_cast<unsigned long long>(m.id));
+          continue;
+        }
+        modelIt = this->meshModels.emplace(m.id, std::move(model)).first;
+      }
+
+      AZ::Render::MeshHandleDescriptor desc = this->meshMaterial
+          ? AZ::Render::MeshHandleDescriptor(modelIt->second, this->meshMaterial)
+          : AZ::Render::MeshHandleDescriptor(modelIt->second);
+      auto handle = this->meshFp->AcquireMesh(desc);
+      if (!handle.IsValid())
+      {
+        std::fprintf(stderr,
+            "[gz-o3de] M9 mesh id=%llu AcquireMesh FAILED\n",
+            static_cast<unsigned long long>(m.id));
+        continue;
+      }
+      hIt = this->meshHandles.emplace(m.id, std::move(handle)).first;
+    }
+
+    // Per-frame world transform (gz quat is w,x,y,z; AZ wants x,y,z,w).
+    const AZ::Quaternion rot(
+        aznumeric_cast<float>(m.quat[1]), aznumeric_cast<float>(m.quat[2]),
+        aznumeric_cast<float>(m.quat[3]), aznumeric_cast<float>(m.quat[0]));
+    AZ::Transform xform = AZ::Transform::CreateFromQuaternionAndTranslation(
+        rot, AZ::Vector3(aznumeric_cast<float>(m.pos[0]),
+            aznumeric_cast<float>(m.pos[1]),
+            aznumeric_cast<float>(m.pos[2])));
+    this->meshFp->SetTransform(hIt->second, xform,
+        AZ::Vector3(aznumeric_cast<float>(m.scale[0]),
+            aznumeric_cast<float>(m.scale[1]),
+            aznumeric_cast<float>(m.scale[2])));
+  }
+
+  // Release handles for ids that disappeared from the gathered set.
+  for (auto it = this->meshHandles.begin(); it != this->meshHandles.end(); )
+  {
+    if (present.count(it->first) == 0u)
+    {
+      this->meshFp->ReleaseMesh(it->second);
+      this->meshModels.erase(it->first);
+      it = this->meshHandles.erase(it);
+    }
+    else
+    {
+      ++it;
+    }
   }
 }
 
@@ -2359,6 +2547,7 @@ void O3deBackend::Impl::RenderThreadMain()
         this->camera = this->pendingCamera;
         this->shapes = this->pendingShapes;
         this->lights = this->pendingLights;
+        this->meshes = this->pendingMeshes;
         this->reqWidth = this->pendingWidth;
         this->reqHeight = this->pendingHeight;
         this->haveInput = false;
@@ -2842,10 +3031,52 @@ static void MaybeInjectDemoLights(std::vector<O3deLightData> &_lights)
   }
 }
 
+// Demo aid (M9-B): exercise the FULL public-mesh pipeline end to end without
+// gz-sim. When GZ_O3DE_DEMO_MESH_PIPE is set, register a built-in gz-common box
+// once (gz-thread geometry extraction via RegisterMesh) and inject one
+// O3deMeshData per frame -- so the snapshot crosses the thread boundary and the
+// render thread builds the model, acquires the MeshFP handle, and updates the
+// transform exactly as it would for a real gz-sim mesh visual gathered in
+// O3deRenderTarget. The id is in the 0xD009x demo range. Runs on the caller's
+// (gz) thread.
+static void MaybeInjectDemoMeshData(std::vector<O3deMeshData> &_meshes)
+{
+  if (!std::getenv("GZ_O3DE_DEMO_MESH_PIPE"))
+    return;
+
+  constexpr uint64_t kDemoMeshId = 0xD0091u;
+
+  // Register the geometry exactly once (RegisterMesh is idempotent-safe but the
+  // extraction is wasted work every frame otherwise).
+  static bool registered = false;
+  if (!registered)
+  {
+    auto *meshMgr = gz::common::MeshManager::Instance();
+    const std::string boxName = "gz_o3de_pipe_box";
+    if (meshMgr->MeshByName(boxName) == nullptr)
+      meshMgr->CreateBox(boxName, gz::math::Vector3d(1.0, 1.0, 1.0),
+          gz::math::Vector2d(1.0, 1.0));
+    O3deBackend::Instance().RegisterMesh(
+        kDemoMeshId, meshMgr->MeshByName(boxName));
+    registered = true;
+    std::fprintf(stderr,
+        "[gz-o3de] M9-B DEMO_MESH_PIPE: registered demo box id=0x%llx\n",
+        static_cast<unsigned long long>(kDemoMeshId));
+  }
+
+  O3deMeshData m;
+  m.id = kDemoMeshId;
+  m.pos[0] = 0.0; m.pos[1] = 0.0; m.pos[2] = 1.0;
+  m.scale[0] = 1.0; m.scale[1] = 1.0; m.scale[2] = 1.0;
+  m.color[0] = 0.7f; m.color[1] = 0.7f; m.color[2] = 0.7f; m.color[3] = 1.0f;
+  _meshes.push_back(m);
+}
+
 //////////////////////////////////////////////////
 bool O3deBackend::RenderFrame(const O3deCameraData &_camera,
     const std::vector<O3deShapeData> &_shapes,
     const std::vector<O3deLightData> &_lights,
+    const std::vector<O3deMeshData> &_meshes,
     uint32_t _width, uint32_t _height, uint8_t *_outRgba)
 {
   Impl &d = *this->dataPtr;
@@ -2858,6 +3089,8 @@ bool O3deBackend::RenderFrame(const O3deCameraData &_camera,
   MaybeInjectDemoShapes(shapes);
   std::vector<O3deLightData> lights = _lights;
   MaybeInjectDemoLights(lights);
+  std::vector<O3deMeshData> meshes = _meshes;
+  MaybeInjectDemoMeshData(meshes);
 
   // Post the input to the render thread and wait for a frame rendered after it.
   uint64_t startSeq = 0u;
@@ -2866,6 +3099,7 @@ bool O3deBackend::RenderFrame(const O3deCameraData &_camera,
     d.pendingCamera = _camera;
     d.pendingShapes = std::move(shapes);
     d.pendingLights = std::move(lights);
+    d.pendingMeshes = std::move(meshes);
     d.pendingWidth = _width;
     d.pendingHeight = _height;
     d.haveInput = true;
@@ -2902,6 +3136,7 @@ bool O3deBackend::RenderFrame(const O3deCameraData &_camera,
 bool O3deBackend::RenderFrameForInterop(const O3deCameraData &_camera,
     const std::vector<O3deShapeData> &_shapes,
     const std::vector<O3deLightData> &_lights,
+    const std::vector<O3deMeshData> &_meshes,
     uint32_t _width, uint32_t _height)
 {
   Impl &d = *this->dataPtr;
@@ -2916,6 +3151,8 @@ bool O3deBackend::RenderFrameForInterop(const O3deCameraData &_camera,
   MaybeInjectDemoShapes(shapes);
   std::vector<O3deLightData> lights = _lights;
   MaybeInjectDemoLights(lights);
+  std::vector<O3deMeshData> meshes = _meshes;
+  MaybeInjectDemoMeshData(meshes);
 
   // Post the input to the render thread and wait for a frame rendered after it
   // (the frame is published into the shared image by RenderOneFrame()).
@@ -2925,6 +3162,7 @@ bool O3deBackend::RenderFrameForInterop(const O3deCameraData &_camera,
     d.pendingCamera = _camera;
     d.pendingShapes = std::move(shapes);
     d.pendingLights = std::move(lights);
+    d.pendingMeshes = std::move(meshes);
     d.pendingWidth = _width;
     d.pendingHeight = _height;
     d.haveInput = true;
@@ -2943,6 +3181,37 @@ bool O3deBackend::RenderFrameForInterop(const O3deCameraData &_camera,
         static_cast<unsigned long long>(startSeq),
         static_cast<unsigned long long>(d.frameSeq));
   return got;
+}
+
+//////////////////////////////////////////////////
+void O3deBackend::RegisterMesh(uint64_t _id, const gz::common::Mesh *_mesh)
+{
+  Impl &d = *this->dataPtr;
+  // Extract on the caller's (gz) thread -- no Atom calls -- then hand the plain
+  // geometry to the render thread, which builds the Atom model lazily. A null
+  // or geometry-less mesh is treated as an unregister.
+  MeshGeometryCpu geom = ExtractMeshGeometry(_mesh);
+  std::lock_guard<std::mutex> lock(d.mutex);
+  if (geom.Empty())
+  {
+    d.meshGeometry.erase(_id);
+    d.meshUnregister.push_back(_id);
+    return;
+  }
+  // Each mesh has a unique gz id and is registered once (CreateMeshImpl), so we
+  // just stage the geometry; the render thread builds the model on first sight.
+  // Re-registering the same id with new geometry is not a supported case here
+  // (it would keep the already-built model); UnregisterMesh first if needed.
+  d.meshGeometry[_id] = std::move(geom);
+}
+
+//////////////////////////////////////////////////
+void O3deBackend::UnregisterMesh(uint64_t _id)
+{
+  Impl &d = *this->dataPtr;
+  std::lock_guard<std::mutex> lock(d.mutex);
+  d.meshGeometry.erase(_id);
+  d.meshUnregister.push_back(_id);
 }
 
 //////////////////////////////////////////////////
@@ -2994,6 +3263,7 @@ bool O3deBackend::Impl::RenderOneFrame()
       for (int i = 0; i < 5; ++i)
       {
         this->SubmitLights();
+        this->SubmitMeshes();
         this->SubmitPrimitives();
         this->app->PumpSystemEventLoopUntilEmpty();
         this->app->TickSystem();
@@ -3009,6 +3279,7 @@ bool O3deBackend::Impl::RenderOneFrame()
     for (int k = 0; k < 3; ++k)
     {
       this->SubmitLights();
+      this->SubmitMeshes();
       this->SubmitPrimitives();
       // #26: import the fence-signal scope on exactly the last render tick, so
       // its SignalFence runs once per frame after the scene is drawn into the
@@ -3125,6 +3396,7 @@ bool O3deBackend::Impl::RenderOneFrame()
     for (int k = 0; k < 3; ++k)
     {
       this->SubmitLights();
+      this->SubmitMeshes();
       this->SubmitPrimitives();
       this->app->PumpSystemEventLoopUntilEmpty();
       this->app->TickSystem();
@@ -3193,6 +3465,7 @@ bool O3deBackend::Impl::RenderOneFrame()
   for (; iters < maxFrames && !finishListener.finished; ++iters)
   {
     this->SubmitLights();
+    this->SubmitMeshes();
     this->SubmitPrimitives();
     this->app->PumpSystemEventLoopUntilEmpty();
     this->app->TickSystem();
