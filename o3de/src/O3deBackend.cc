@@ -75,6 +75,20 @@
 #include <Atom/Feature/Mesh/MeshFeatureProcessorInterface.h>
 #include <Atom/RPI.Reflect/Asset/AssetUtils.h>
 #include <Atom/RPI.Reflect/Model/ModelAsset.h>
+// M9: procedural model construction from raw vertex/index buffers, used to turn
+// a gz::common::Mesh (from a gz-rendering MeshDescriptor) into an Atom model at
+// runtime without going through the offline Asset Processor / .azmodel cooking.
+// CreateBufferAsset (from ModelAssetHelpers) wraps the raw buffers; the LOD/model
+// creators assemble + finalise the asset (their End() marks it Ready, which
+// MeshFeatureProcessor::AcquireMesh requires -- ModelAssetHelpers::CreateModel
+// alone leaves the model non-Ready).
+#include <Atom/RPI.Reflect/Model/ModelAssetHelpers.h>
+#include <Atom/RPI.Reflect/Model/ModelAssetCreator.h>
+#include <Atom/RPI.Reflect/Model/ModelLodAssetCreator.h>
+#include <Atom/RPI.Reflect/Buffer/BufferAssetCreator.h>
+#include <Atom/RPI.Reflect/ResourcePoolAssetCreator.h>
+#include <Atom/RHI.Reflect/BufferViewDescriptor.h>
+#include <Atom/RHI.Reflect/ShaderSemantic.h>
 #include <Atom/RPI.Reflect/Material/MaterialAsset.h>
 #include <Atom/RPI.Public/Material/Material.h>
 #include <Atom/Feature/CoreLights/PhotometricValue.h>
@@ -116,6 +130,13 @@
 // Only included for interop builds (-DGZ_O3DE_INTEROP=ON), which require the patch.
 #include <Atom/RHI.Interface/Vulkan/RHIVulkanInterface.h>
 #endif
+
+// M9: gz-common mesh geometry source. SubMesh exposes per-vertex
+// position/normal/UV and the index list that the Atom ModelAssetHelpers builder
+// consumes; MeshManager supplies a built-in primitive for the demo gate.
+#include <gz/common/Mesh.hh>
+#include <gz/common/SubMesh.hh>
+#include <gz/common/MeshManager.hh>
 
 #include "O3deBackend.hh"
 #include "O3deGlInterop.hh"  // plain-types declaration; no GL headers leak here
@@ -1551,12 +1572,283 @@ void O3deBackend::Impl::SubmitPrimitives()
 }
 
 //////////////////////////////////////////////////
+// M9: build a runtime Atom ModelAsset from a gz::common::Mesh.
+//
+// Every triangle submesh of the source mesh is merged into a single Atom
+// mesh/LOD (vertex base + index offsets adjusted) so the whole geometry renders
+// under one MeshFeatureProcessor handle. Atom's mesh pipeline expects the full
+// POSITION/NORMAL/TANGENT/BITANGENT/UV stream set, so any channel the source
+// lacks is synthesised (a flat +X tangent / +Y bitangent frame and zero UVs) to
+// keep every stream at exactly one element per vertex. Returns a Ready model on
+// success, or a null asset when the mesh has no triangle geometry.
+namespace
+{
+  // Wrap a raw CPU data buffer in a host-visible Atom BufferAsset. This mirrors
+  // the private ModelAssetHelpers::CreateBufferAsset (not accessible from here):
+  // a one-off InputAssembly buffer pool + a structured buffer view over a copy
+  // of the data. One pool per buffer is wasteful but fine at scene-setup scale.
+  AZ::Data::Asset<AZ::RPI::BufferAsset> MakeBufferAsset(
+      const void *_data, uint32_t _elementCount, uint32_t _elementSize)
+  {
+    AZ::Data::Asset<AZ::RPI::ResourcePoolAsset> poolAsset;
+    {
+      const AZ::Data::AssetId poolId = AZ::Uuid::CreateRandom();
+      poolAsset = AZ::Data::AssetManager::Instance().CreateAsset(
+          poolId, azrtti_typeid<AZ::RPI::ResourcePoolAsset>(),
+          AZ::Data::AssetLoadBehavior::PreLoad);
+
+      auto poolDesc = AZStd::make_unique<AZ::RHI::BufferPoolDescriptor>();
+      poolDesc->m_bindFlags = AZ::RHI::BufferBindFlags::InputAssembly;
+      poolDesc->m_heapMemoryLevel = AZ::RHI::HeapMemoryLevel::Host;
+
+      AZ::RPI::ResourcePoolAssetCreator creator;
+      creator.Begin(poolId);
+      creator.SetPoolDescriptor(AZStd::move(poolDesc));
+      creator.SetPoolName("GzO3deMeshBufferPool");
+      creator.End(poolAsset);
+    }
+
+    AZ::Data::Asset<AZ::RPI::BufferAsset> asset;
+    {
+      const AZ::Data::AssetId bufferId = AZ::Uuid::CreateRandom();
+      asset = AZ::Data::AssetManager::Instance().CreateAsset(
+          bufferId, azrtti_typeid<AZ::RPI::BufferAsset>(),
+          AZ::Data::AssetLoadBehavior::PreLoad);
+
+      AZ::RHI::BufferDescriptor bufferDescriptor;
+      bufferDescriptor.m_bindFlags = AZ::RHI::BufferBindFlags::InputAssembly;
+      bufferDescriptor.m_byteCount =
+          static_cast<uint64_t>(_elementCount) * _elementSize;
+
+      AZ::RPI::BufferAssetCreator creator;
+      creator.Begin(bufferId);
+      creator.SetPoolAsset(poolAsset);
+      creator.SetBuffer(_data, bufferDescriptor.m_byteCount, bufferDescriptor);
+      creator.SetBufferViewDescriptor(
+          AZ::RHI::BufferViewDescriptor::CreateStructured(
+              0, _elementCount, _elementSize));
+      creator.End(asset);
+    }
+    return asset;
+  }
+
+  AZ::Data::Asset<AZ::RPI::ModelAsset> BuildModelAssetFromCommonMesh(
+      const gz::common::Mesh *_mesh, const AZ::Name &_name)
+  {
+    AZ::Data::Asset<AZ::RPI::ModelAsset> nullAsset;
+    if (_mesh == nullptr || _mesh->SubMeshCount() == 0)
+      return nullAsset;
+
+    AZStd::vector<uint32_t> indices;
+    AZStd::vector<float> positions;   // 3 floats/vertex
+    AZStd::vector<float> normals;     // 3 floats/vertex
+    AZStd::vector<float> tangents;    // 4 floats/vertex (w = handedness)
+    AZStd::vector<float> bitangents;  // 3 floats/vertex
+    AZStd::vector<float> uvs;         // 2 floats/vertex
+
+    for (unsigned int s = 0; s < _mesh->SubMeshCount(); ++s)
+    {
+      auto subMesh = _mesh->SubMeshByIndex(s).lock();
+      if (!subMesh)
+        continue;
+      // Only indexed triangle lists map onto Atom's indexed-triangle mesh.
+      if (subMesh->SubMeshPrimitiveType() != gz::common::SubMesh::TRIANGLES)
+        continue;
+
+      const uint32_t vbase = static_cast<uint32_t>(positions.size() / 3);
+      const unsigned int vcount = subMesh->VertexCount();
+      const bool hasNormals = subMesh->NormalCount() == vcount;
+      const bool hasUVs = subMesh->TexCoordCount() == vcount;
+
+      for (unsigned int v = 0; v < vcount; ++v)
+      {
+        const gz::math::Vector3d p = subMesh->Vertex(v);
+        positions.push_back(static_cast<float>(p.X()));
+        positions.push_back(static_cast<float>(p.Y()));
+        positions.push_back(static_cast<float>(p.Z()));
+
+        gz::math::Vector3d n(0.0, 0.0, 1.0);
+        if (hasNormals)
+          n = subMesh->Normal(v);
+        normals.push_back(static_cast<float>(n.X()));
+        normals.push_back(static_cast<float>(n.Y()));
+        normals.push_back(static_cast<float>(n.Z()));
+
+        // Placeholder tangent frame -- sufficient for the flat-shaded grey
+        // material at this milestone; real tangents arrive with textured
+        // materials (M9-B / M10).
+        tangents.push_back(1.0f);
+        tangents.push_back(0.0f);
+        tangents.push_back(0.0f);
+        tangents.push_back(1.0f);
+        bitangents.push_back(0.0f);
+        bitangents.push_back(1.0f);
+        bitangents.push_back(0.0f);
+
+        if (hasUVs)
+        {
+          const gz::math::Vector2d uv = subMesh->TexCoord(v);
+          uvs.push_back(static_cast<float>(uv.X()));
+          uvs.push_back(static_cast<float>(uv.Y()));
+        }
+        else
+        {
+          uvs.push_back(0.0f);
+          uvs.push_back(0.0f);
+        }
+      }
+
+      // gz::common triangle winding is the opposite of Atom's front-face
+      // convention, so emit each triangle's indices reversed (v0, v2, v1).
+      // Without this the lit exterior faces are back-face-culled and only the
+      // unlit interior is visible (mesh renders black). Trailing indices that
+      // do not complete a triangle are copied verbatim.
+      const unsigned int icount = subMesh->IndexCount();
+      for (unsigned int i = 0; i + 2 < icount; i += 3)
+      {
+        indices.push_back(vbase + static_cast<uint32_t>(subMesh->Index(i)));
+        indices.push_back(vbase + static_cast<uint32_t>(subMesh->Index(i + 2)));
+        indices.push_back(vbase + static_cast<uint32_t>(subMesh->Index(i + 1)));
+      }
+      for (unsigned int i = (icount / 3) * 3; i < icount; ++i)
+      {
+        indices.push_back(vbase + static_cast<uint32_t>(subMesh->Index(i)));
+      }
+    }
+
+    if (positions.empty() || indices.empty())
+      return nullAsset;
+
+    const uint32_t vertexCount = static_cast<uint32_t>(positions.size() / 3);
+    const uint32_t indexCount = static_cast<uint32_t>(indices.size());
+
+    AZ::Aabb aabb = AZ::Aabb::CreateNull();
+    for (uint32_t i = 0; i + 2 < positions.size(); i += 3)
+    {
+      aabb.AddPoint(
+          AZ::Vector3(positions[i], positions[i + 1], positions[i + 2]));
+    }
+
+    AZ::RPI::ModelLodAssetCreator lodCreator;
+    lodCreator.Begin(AZ::Uuid::CreateRandom());
+    lodCreator.BeginMesh();
+    lodCreator.SetMeshAabb(AZ::Aabb(aabb));
+    lodCreator.SetMeshMaterialSlot(0);
+    lodCreator.SetMeshIndexBuffer(
+        { MakeBufferAsset(indices.data(), indexCount, sizeof(uint32_t)),
+          AZ::RHI::BufferViewDescriptor::CreateTyped(
+              0, indexCount, AZ::RHI::Format::R32_UINT) });
+    lodCreator.AddMeshStreamBuffer(
+        AZ::RHI::ShaderSemantic(AZ::Name("POSITION")), AZ::Name(),
+        { MakeBufferAsset(positions.data(), vertexCount, sizeof(float) * 3),
+          AZ::RHI::BufferViewDescriptor::CreateTyped(
+              0, vertexCount, AZ::RHI::Format::R32G32B32_FLOAT) });
+    lodCreator.AddMeshStreamBuffer(
+        AZ::RHI::ShaderSemantic(AZ::Name("NORMAL")), AZ::Name(),
+        { MakeBufferAsset(normals.data(), vertexCount, sizeof(float) * 3),
+          AZ::RHI::BufferViewDescriptor::CreateTyped(
+              0, vertexCount, AZ::RHI::Format::R32G32B32_FLOAT) });
+    lodCreator.AddMeshStreamBuffer(
+        AZ::RHI::ShaderSemantic(AZ::Name("TANGENT")), AZ::Name(),
+        { MakeBufferAsset(tangents.data(), vertexCount, sizeof(float) * 4),
+          AZ::RHI::BufferViewDescriptor::CreateTyped(
+              0, vertexCount, AZ::RHI::Format::R32G32B32A32_FLOAT) });
+    lodCreator.AddMeshStreamBuffer(
+        AZ::RHI::ShaderSemantic(AZ::Name("BITANGENT")), AZ::Name(),
+        { MakeBufferAsset(bitangents.data(), vertexCount, sizeof(float) * 3),
+          AZ::RHI::BufferViewDescriptor::CreateTyped(
+              0, vertexCount, AZ::RHI::Format::R32G32B32_FLOAT) });
+    lodCreator.AddMeshStreamBuffer(
+        AZ::RHI::ShaderSemantic(AZ::Name("UV")), AZ::Name(),
+        { MakeBufferAsset(uvs.data(), vertexCount, sizeof(float) * 2),
+          AZ::RHI::BufferViewDescriptor::CreateTyped(
+              0, vertexCount, AZ::RHI::Format::R32G32_FLOAT) });
+    lodCreator.EndMesh();
+    AZ::Data::Asset<AZ::RPI::ModelLodAsset> lodAsset;
+    if (!lodCreator.End(lodAsset))
+      return nullAsset;
+
+    AZ::RPI::ModelAssetCreator modelCreator;
+    modelCreator.Begin(AZ::Uuid::CreateRandom());
+    modelCreator.SetName(_name.GetStringView());
+    // One material slot (stableId 0) to satisfy the mesh's SetMeshMaterialSlot(0)
+    // reference. The actual appearance comes from the material supplied to
+    // AcquireMesh via MeshHandleDescriptor, not this empty default slot.
+    AZ::RPI::ModelMaterialSlot slot;
+    slot.m_stableId = 0;
+    slot.m_displayName = AZ::Name("default");
+    modelCreator.AddMaterialSlot(slot);
+    modelCreator.AddLodAsset(AZStd::move(lodAsset));
+    AZ::Data::Asset<AZ::RPI::ModelAsset> modelAsset;
+    if (!modelCreator.End(modelAsset))
+      return nullAsset;
+
+    return modelAsset;
+  }
+}  // namespace
+
+//////////////////////////////////////////////////
 void O3deBackend::Impl::AcquireDemoMeshes()
 {
   if (!this->meshFp)
     return;
   if (!this->demoMeshHandles.empty())
     return;  // already acquired in the other SetupScene path
+
+  // M9-A demo gate: prove the runtime gz::common::Mesh -> Atom ModelAsset path
+  // (BuildModelAssetFromCommonMesh) end to end, independently of the cooked
+  // .azmodel demo below. Builds a built-in gz-common box via MeshManager,
+  // converts it to an Atom model at runtime, and renders it through the same
+  // MeshFeatureProcessor the cooked assets use. When this gate is set we render
+  // ONLY the procedural box so the result is unambiguous to verify.
+  if (std::getenv("GZ_O3DE_DEMO_PROC_MESH"))
+  {
+    auto *meshMgr = gz::common::MeshManager::Instance();
+    const std::string boxName = "gz_o3de_proc_box";
+    if (meshMgr->MeshByName(boxName) == nullptr)
+      meshMgr->CreateBox(boxName, gz::math::Vector3d(1.0, 1.0, 1.0),
+          gz::math::Vector2d(1.0, 1.0));
+    const gz::common::Mesh *boxMesh = meshMgr->MeshByName(boxName);
+
+    auto modelAsset = BuildModelAssetFromCommonMesh(
+        boxMesh, AZ::Name("gz_o3de_proc_box"));
+    if (!modelAsset.IsReady())
+    {
+      std::fprintf(stderr,
+          "[gz-o3de] M9-A procedural box model build FAILED "
+          "(submeshes=%u) -- no mesh rendered\n",
+          boxMesh ? boxMesh->SubMeshCount() : 0u);
+      return;
+    }
+
+    AZ::Data::Instance<AZ::RPI::Material> greyMaterial;
+    auto greyAsset = AZ::RPI::AssetUtils::LoadCriticalAsset<
+        AZ::RPI::MaterialAsset>("materials/basic_grey.azmaterial",
+            AZ::RPI::AssetUtils::TraceLevel::Warning);
+    if (greyAsset.IsReady())
+      greyMaterial = AZ::RPI::Material::FindOrCreate(greyAsset);
+
+    AZ::Render::MeshHandleDescriptor desc = greyMaterial
+        ? AZ::Render::MeshHandleDescriptor(modelAsset, greyMaterial)
+        : AZ::Render::MeshHandleDescriptor(modelAsset);
+    auto handle = this->meshFp->AcquireMesh(desc);
+    if (!handle.IsValid())
+    {
+      std::fprintf(stderr,
+          "[gz-o3de] M9-A procedural box AcquireMesh FAILED\n");
+      return;
+    }
+    this->meshFp->SetTransform(handle,
+        AZ::Transform::CreateTranslation(AZ::Vector3(0.0f, 0.0f, 1.0f)),
+        AZ::Vector3(1.0f, 1.0f, 1.0f));
+    this->demoMeshHandles.emplace_back(std::move(handle));
+    std::fprintf(stderr,
+        "[gz-o3de] M9-A procedural box rendered: %u submesh(es) -> "
+        "1 Atom model @ (0,0,1)\n",
+        boxMesh->SubMeshCount());
+    return;
+  }
+
   if (!std::getenv("GZ_O3DE_DEMO_SHAPES"))
     return;
 
