@@ -113,6 +113,16 @@ if [ -d "$GZ_O3DE_WS/build/gz-gui/test/regression/swapchain_dump_layer" ]; then
   export VK_INSTANCE_LAYERS=VK_LAYER_GZ_swapchain_dump
   export GZ_SWAPCHAIN_DUMP_PATH=/tmp/gz_swapchain_prime
   export GZ_SWAPCHAIN_DUMP_MAX_FRAMES=4
+  # 2026-06-02: the 4-frame single-queue fence above proved INSUFFICIENT on cold
+  # starts -- the demo still greyed intermittently (the swapchain is written by a
+  # WSI/driver path the single-queue fence doesn't cover). GZ_SWAPCHAIN_FORCE_IDLE
+  # upgrades the prime to a full vkDeviceWaitIdle before the first 32 presents
+  # (FORCE_IDLE_FRAMES default), which covers that path. Bounded to startup so
+  # steady-state FPS is unaffected. NOTE: directionally supported (device-idle
+  # rendered 5/5 vs the queue-fence's intermittent grey) but NOT yet confirmed on
+  # a genuinely cold start -- the bug stopped reproducing once the GPU warmed up
+  # mid-session. See memory o3de-live-demo-grey-display.
+  export GZ_SWAPCHAIN_FORCE_IDLE=1
 fi
 
 echo "=============================================================="
