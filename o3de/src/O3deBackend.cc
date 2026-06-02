@@ -462,9 +462,14 @@ class O3deBackend::Impl
       AZ::Data::Asset<AZ::RPI::ModelAsset>> meshModels;
   public: std::unordered_map<uint64_t,
       AZ::Render::MeshFeatureProcessorInterface::MeshHandle> meshHandles;
-  // Shared grey material for M9 meshes, loaded once on the render thread (the
-  // per-mesh O3deMeshData::color tint is a follow-up; see SubmitMeshes).
-  public: AZ::Data::Instance<AZ::RPI::Material> meshMaterial;
+  // M10: per-mesh StandardPBR material instances, tinted from
+  // O3deMeshData::color. meshMaterialAsset is the shared StandardPBR base
+  // (basic_grey) loaded once; each mesh id gets its own Material::Create
+  // instance so its baseColor.color can be set independently. Kept alive here
+  // for as long as the handle exists; released alongside it.
+  public: AZ::Data::Asset<AZ::RPI::MaterialAsset> meshMaterialAsset;
+  public: std::unordered_map<uint64_t,
+      AZ::Data::Instance<AZ::RPI::Material>> meshMaterials;
   /// \brief M9: acquire/update/release Atom mesh handles for this->meshes,
   /// mirroring SubmitLights()'s id-keyed lifecycle (render thread only).
   public: void SubmitMeshes();
@@ -2029,6 +2034,7 @@ void O3deBackend::Impl::SubmitMeshes()
         this->meshHandles.erase(hIt);
       }
       this->meshModels.erase(id);
+      this->meshMaterials.erase(id);
       std::lock_guard<std::mutex> lock(this->mutex);
       this->meshGeometry.erase(id);
     }
@@ -2038,16 +2044,14 @@ void O3deBackend::Impl::SubmitMeshes()
   if (this->meshes.empty() && this->meshHandles.empty())
     return;
 
-  // Lazily load the shared grey material once (mirrors AcquireDemoMeshes). A
-  // mid-grey albedo keeps the lit mesh legible; per-mesh O3deMeshData::color
-  // tinting is a follow-up (would need a per-colour Material instance).
-  if (!this->meshMaterial)
+  // Lazily load the shared StandardPBR base material once (basic_grey). Each
+  // mesh gets its own Material::Create instance below so its baseColor.color
+  // can be tinted from O3deMeshData::color independently (M10).
+  if (!this->meshMaterialAsset.IsReady())
   {
-    auto greyAsset = AZ::RPI::AssetUtils::LoadCriticalAsset<
+    this->meshMaterialAsset = AZ::RPI::AssetUtils::LoadCriticalAsset<
         AZ::RPI::MaterialAsset>("materials/basic_grey.azmaterial",
             AZ::RPI::AssetUtils::TraceLevel::Warning);
-    if (greyAsset.IsReady())
-      this->meshMaterial = AZ::RPI::Material::FindOrCreate(greyAsset);
   }
 
   // Acquire-on-first-sight + per-frame transform for every mesh present this
@@ -2086,8 +2090,44 @@ void O3deBackend::Impl::SubmitMeshes()
         modelIt = this->meshModels.emplace(m.id, std::move(model)).first;
       }
 
-      AZ::Render::MeshHandleDescriptor desc = this->meshMaterial
-          ? AZ::Render::MeshHandleDescriptor(modelIt->second, this->meshMaterial)
+      // M10: a unique StandardPBR instance tinted by O3deMeshData::color, so
+      // each mesh shows its gz Visual's diffuse colour. Falls back to the
+      // shared base (or no material) if creation/tinting is unavailable.
+      AZ::Data::Instance<AZ::RPI::Material> material;
+      if (this->meshMaterialAsset.IsReady())
+      {
+        material = AZ::RPI::Material::Create(this->meshMaterialAsset);
+        if (material)
+        {
+          const AZ::RPI::MaterialPropertyIndex baseColorIdx =
+              material->FindPropertyIndex(AZ::Name("baseColor.color"));
+          bool setOk = false;
+          bool compileOk = false;
+          if (baseColorIdx.IsValid())
+          {
+            setOk = material->SetPropertyValue(baseColorIdx,
+                AZ::Color(m.color[0], m.color[1], m.color[2], m.color[3]));
+            compileOk = material->Compile();
+          }
+          std::fprintf(stderr,
+              "[gz-o3de] M10 mesh id=%llu tint=(%.2f,%.2f,%.2f) "
+              "created=1 propValid=%d set=%d compile=%d\n",
+              static_cast<unsigned long long>(m.id),
+              m.color[0], m.color[1], m.color[2],
+              baseColorIdx.IsValid() ? 1 : 0, setOk ? 1 : 0,
+              compileOk ? 1 : 0);
+          this->meshMaterials[m.id] = material;
+        }
+        else
+        {
+          std::fprintf(stderr,
+              "[gz-o3de] M10 mesh id=%llu Material::Create FAILED\n",
+              static_cast<unsigned long long>(m.id));
+        }
+      }
+
+      AZ::Render::MeshHandleDescriptor desc = material
+          ? AZ::Render::MeshHandleDescriptor(modelIt->second, material)
           : AZ::Render::MeshHandleDescriptor(modelIt->second);
       auto handle = this->meshFp->AcquireMesh(desc);
       if (!handle.IsValid())
@@ -2121,6 +2161,7 @@ void O3deBackend::Impl::SubmitMeshes()
     {
       this->meshFp->ReleaseMesh(it->second);
       this->meshModels.erase(it->first);
+      this->meshMaterials.erase(it->first);
       it = this->meshHandles.erase(it);
     }
     else
@@ -3068,7 +3109,13 @@ static void MaybeInjectDemoMeshData(std::vector<O3deMeshData> &_meshes)
   m.id = kDemoMeshId;
   m.pos[0] = 0.0; m.pos[1] = 0.0; m.pos[2] = 1.0;
   m.scale[0] = 1.0; m.scale[1] = 1.0; m.scale[2] = 1.0;
-  m.color[0] = 0.7f; m.color[1] = 0.7f; m.color[2] = 0.7f; m.color[3] = 1.0f;
+  // Distinctive cyan tint, sourced into a unique StandardPBR instance per mesh
+  // (see SubmitMeshes). NOTE: the demo's 800 cd overhead point light saturates
+  // the box's lit face to white and leaves the sides unlit, so the albedo is
+  // not visible in a screenshot -- the tint is confirmed by the one-shot
+  // "[gz-o3de] M10 mesh ... set=1 compile=1" telemetry, not the pixel colour.
+  // (The AuxGeom shapes show their colours only because they bypass lighting.)
+  m.color[0] = 0.0f; m.color[1] = 0.85f; m.color[2] = 0.9f; m.color[3] = 1.0f;
   _meshes.push_back(m);
 }
 
