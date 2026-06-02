@@ -37,6 +37,13 @@ device-loss cause was a consumer-side use-after-free on resize (freeing an impor
 VkImage under Qt's in-flight frame), fixed by retiring old imports. See the findings
 doc's "Actual root cause" + "The fix" sections.
 
+## Post-M4 investigations
+
+| # | Task | Status | Notes |
+|---|------|--------|-------|
+| 27 | Intermittent grey viewport — characterise + mitigate | ✅ done (workaround) | Per-launch, COLD-START WSI present race; input-independent (greys 1- and 2-light, with/without shadows/directional alike). Mitigated by `GZ_SWAPCHAIN_FORCE_IDLE` (bounded `vkDeviceWaitIdle` primer, gz-gui `fa385042` + `0a5d66f0`). Measure via CENTRE viewport crop, not full frame. |
+| 28 | Proper gz-gui RHI fix for the grey | ❌ not possible in gz-gui | Ruled out both candidates: (1) a present-time fence — Qt's `endFrame` submits+presents atomically and exposes NO signal between them; (2) make the composite target the swapchain — fails at any DPR/size (composite always → 1200×902 intermediate, swapchain always `draws=0`). Bug is in Qt 6.4.2 QRhi-Vulkan present. Fix = upgrade Qt ≥6.8 (deferred 2026-06-02) or keep the layer primer. See findings doc 2026-06-02. |
+
 ## See also
 
 - [zero-copy-interop-findings.md](zero-copy-interop-findings.md) — root-cause analysis

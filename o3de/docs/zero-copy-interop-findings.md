@@ -607,3 +607,76 @@ points at. Two paths:
 
 Path 1 gives a single decisive answer per frame. Path 2 is brute force
 but reuses the existing dump path. Both shippable.
+
+---
+
+## 2026-06-02 — Intermittent grey re-characterised + the "proper gz-gui RHI fix" ruled out
+
+Two related conclusions from a focused session on the *intermittent* grey
+viewport (distinct from the earlier, since-fixed HiDPI/static bugs).
+
+### The intermittent grey is a per-launch, cold-start WSI present race
+
+* **Measure the CENTRE viewport crop, not the full frame.** UI chrome keeps the
+  full-frame colour count at ~3000+ even when the 3D viewport is uniform grey
+  (148). Crop the centre and grey ⇒ `colors<=2`:
+  `convert dump.ppm -gravity center -crop 1200x900+0+0 +repage c.png; identify -format '%k' c.png`.
+  An initial "it renders" verdict off the full-frame count was WRONG; the centre
+  crop exposed the grey.
+* **Per launch, not per frame.** A given `gz gui` launch renders-or-greys for its
+  whole life (all dumped frames uniform within a launch). On-demand rendering
+  means a launch that loses the startup race never self-heals.
+* **Non-stationary / cold-start.** Greyed ~75 % of launches at session start
+  (cold GPU/driver/X), ~0 % after ~40 launches (warm). This non-stationarity is
+  why earlier single-observation conclusions (incl. "directional FP greys it",
+  "single light greys it") were all noise. ALWAYS interleave an A/B over N
+  launches.
+
+### Mitigation landed (workaround, not a fix)
+
+The existing `MAX_FRAMES=4` primer does a single-QUEUE fence wait; it proved
+insufficient on cold starts. `GZ_SWAPCHAIN_FORCE_IDLE` (gz-gui `fa385042`)
+upgrades it to a full `vkDeviceWaitIdle` before the first 32 presents — covers
+the WSI/driver write path the single-queue fence misses — bounded to startup so
+steady-state FPS is unaffected. Enabled in `live_demo.sh` (`0a5d66f0`).
+Directionally supported (device-idle rendered 5/5 vs the queue-fence's
+intermittent grey) but NOT confirmed on a genuinely cold start — the bug stopped
+reproducing once the GPU warmed up mid-session.
+
+### The proper fix is NOT achievable in gz-gui code — it is in Qt's RHI present path
+
+Both gz-gui-side candidate fixes were systematically eliminated:
+
+1. **A present-time fence in gz-gui — impossible via public Qt API.** gz-gui's
+   `TextureNodeRhiVulkan` only imports the Atom image (`QSGVulkanTexture::fromNative`)
+   and runs the producer→sample sync (`PrepareForExternalSampling`, which already
+   works). Qt's `QRhi::endFrame` submits the QSG composite AND calls
+   `vkQueuePresentKHR` atomically. Per the Qt 6 docs, the frame signals are
+   `beforeFrameBegin` → (`beforeRendering`…`afterRendering`, during recording) →
+   `afterFrameEnd` ("after submitted", last signal) → `frameSwapped`. **No signal
+   sits between submit and present**, so the dump layer's "wait on the composite's
+   semaphores, then present" cannot be replicated in gz-gui. (gz-gui *does* hold
+   Qt's `VkDevice`/`VkQueue` via `QSGRendererInterface`, so a `beforeFrameBegin`
+   device-drain is implementable, but it only approximates priming — it cannot
+   fix the actual racing present.)
+
+2. **Make the QSG composite target the swapchain directly — does not work; not
+   DPR- or size-driven.** DRAW_TRACE histograms (current binary):
+   - default: composite → **1200×902 non-swapchain** (`draws=1`); 2048×1536
+     SWAPCHAIN passes `draws=0`.
+   - `QT_ENABLE_HIGHDPI_SCALING=0`: swapchain → 1024×768 (DPR=1) but composite
+     STILL 1200×902 non-swap, swapchain STILL `draws=0`.
+   - config window = 1200×1000 (== `Main.qml` `ApplicationWindow` 1200×1000) +
+     DPR=1: swapchain 1200×1000, composite STILL 1200×902 non-swap, swapchain
+     STILL `draws=0`.
+   Qt's QSG on Qt 6.4.2 + NVIDIA 580 **always** renders the content to a 1200×902
+   intermediate and fills the swapchain via a path invisible to every Vulkan
+   command hook — regardless of DPR or window/composite size match. The old
+   `QT_SCALE_FACTOR=1` "HiDPI fix" was a timing palliative, not a structural one.
+
+**Conclusion.** The bug lives in Qt 6.4.2's QRhi-Vulkan `endFrame`/swapchain
+present, which gz-gui cannot reach from public API. Options: (a) upgrade Qt to
+≥6.8 (the `a15c3519` QRhi refactor) — best long-term; (b) patch Qt; (c) keep the
+driver-level dump-layer primer (now bounded `vkDeviceWaitIdle`), which works
+precisely because it sits at the `vkQueuePresentKHR` boundary gz-gui cannot
+reach. Decision (2026-06-02): defer the Qt upgrade; keep the layer primer.
