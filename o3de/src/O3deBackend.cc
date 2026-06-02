@@ -550,7 +550,7 @@ bool O3deBackend::Impl::SetupScene(uint32_t _width, uint32_t _height)
   // and letting SubmitLights() short-circuit the DIRECTIONAL branch when its
   // FP pointer is null. The directional case will land alongside the M7
   // shadow work that needs the same FP.) plus AuxGeom for our shapes.
-  const AZStd::vector<AZStd::string> featureProcessors = {
+  AZStd::vector<AZStd::string> featureProcessors = {
     "AZ::Render::TransformServiceFeatureProcessor",
     "AZ::Render::MeshFeatureProcessor",
     "AZ::Render::SimplePointLightFeatureProcessor",
@@ -569,6 +569,24 @@ bool O3deBackend::Impl::SetupScene(uint32_t _width, uint32_t _height)
     // does not regress the live-display path the way DirectionalLightFP did.
     "AZ::Render::ProjectedShadowFeatureProcessor",
   };
+
+  // M8: directional "sun" light, env-gated for A/B testing. The M6-A rollback
+  // omitted DirectionalLightFeatureProcessor because registering it "turned the
+  // live-display path entirely grey" -- but the 2026-06-02 single-light-grey
+  // investigation showed that grey is an INTERMITTENT QSG/present race,
+  // independent of which lights or FPs are registered (it strikes 1-light and
+  // 2-light launches alike). That makes the M6-A observation a likely
+  // misattribution of the same intermittent grey. Re-enable the FP behind
+  // GZ_O3DE_ENABLE_DIRECTIONAL so the grey rate can be measured WITH vs WITHOUT
+  // it (centre-viewport crop) instead of trusting a single observation. Default
+  // (env unset) is unchanged: FP omitted, SubmitLights short-circuits dir.
+  if (std::getenv("GZ_O3DE_ENABLE_DIRECTIONAL"))
+  {
+    featureProcessors.push_back("AZ::Render::DirectionalLightFeatureProcessor");
+    std::fprintf(stderr,
+        "[gz-o3de] M8: DirectionalLightFeatureProcessor registered "
+        "(GZ_O3DE_ENABLE_DIRECTIONAL set)\n");
+  }
 
   AZ::RPI::SceneDescriptor sceneDesc;
   sceneDesc.m_nameId = AZ::Name("GzO3deScene");
@@ -2492,6 +2510,25 @@ static void MaybeInjectDemoLights(std::vector<O3deLightData> &_lights)
   spot.innerAngle = 0.35;   // ~20 deg
   spot.outerAngle = 0.7;    // ~40 deg (wider cone, clearer falloff)
   _lights.push_back(spot);
+
+  // M8: directional "sun" light, gated by the same GZ_O3DE_ENABLE_DIRECTIONAL
+  // flag that registers the FP in SetupScene. Without the FP registered,
+  // SubmitLights short-circuits the DIRECTIONAL branch, so this instance is
+  // inert unless the flag is set. Aimed mostly down and tilted toward +X so it
+  // grazes the demo shapes. DirectionalLightFP intensity unit is lux.
+  if (std::getenv("GZ_O3DE_ENABLE_DIRECTIONAL"))
+  {
+    O3deLightData sun;
+    sun.type = O3deLightData::Type::DIRECTIONAL;
+    sun.id = 0xD0003u;
+    // Normalized (0.286, 0, -0.958): down with a forward tilt.
+    sun.dir[0] = 0.286; sun.dir[1] = 0.0; sun.dir[2] = -0.958;
+    sun.diffuseColor[0] = 1.0; sun.diffuseColor[1] = 0.98;
+    sun.diffuseColor[2] = 0.95;
+    sun.intensity = 5.0;  // lux (modest; tune up if washed out by IBL)
+    _lights.push_back(sun);
+    std::fprintf(stderr, "[gz-o3de] M8: directional sun injected (id=0xD0003)\n");
+  }
 
   // Diagnostic single-variable knob for the "single-light greys the whole
   // render" investigation (see memory o3de-single-light-greys-render). When
