@@ -20,10 +20,12 @@
 // against the prebuilt O3DE libraries. Everything it exposes to the rest of the
 // component goes through the plain-C++ O3deBackend interface.
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 
 // M4 interop (GZ_O3DE_INTEROP): runtime resolution of the Vulkan loader entry
 // points and FD ownership for the export proof.
@@ -1640,6 +1642,12 @@ void O3deBackend::Impl::SubmitLights()
   std::unordered_set<uint32_t> pointIds;
   std::unordered_set<uint32_t> spotIds;
 
+  // Diagnostic knob (see memory o3de-single-light-greys-render): when set, skip
+  // ALL spot shadow setup -- both the SimpleSpotLight self-shadow enable and the
+  // paired ProjectedShadowFP. Lets us run "spot only, no shadow" to separate a
+  // light-count effect from a shadow-setup effect. Read once.
+  static const bool noShadow = (std::getenv("GZ_O3DE_DEMO_NO_SHADOW") != nullptr);
+
   for (const O3deLightData &light : this->lights)
   {
     const AZ::Vector3 pos = GzVec(light.pos);
@@ -1722,15 +1730,18 @@ void O3deBackend::Impl::SubmitLights()
           // wire in Phase A2 is a parallel projector system used elsewhere
           // (decals, static projected shadows). Tune for the demo: 1024^2
           // atlas + PCF filtering for soft edges.
-          this->spotLightFp->SetShadowsEnabled(it->second, true);
-          this->spotLightFp->SetShadowmapMaxResolution(it->second,
-              AZ::Render::ShadowmapSize::Size1024);
-          this->spotLightFp->SetShadowFilterMethod(it->second,
-              AZ::Render::ShadowFilterMethod::Pcf);
-          this->spotLightFp->SetFilteringSampleCount(it->second, 16);
-          std::fprintf(stderr,
-              "[gz-o3de] M7 spot shadows enabled on LightHandle: id=0x%X\n",
-              light.id);
+          if (!noShadow)
+          {
+            this->spotLightFp->SetShadowsEnabled(it->second, true);
+            this->spotLightFp->SetShadowmapMaxResolution(it->second,
+                AZ::Render::ShadowmapSize::Size1024);
+            this->spotLightFp->SetShadowFilterMethod(it->second,
+                AZ::Render::ShadowFilterMethod::Pcf);
+            this->spotLightFp->SetFilteringSampleCount(it->second, 16);
+            std::fprintf(stderr,
+                "[gz-o3de] M7 spot shadows enabled on LightHandle: id=0x%X\n",
+                light.id);
+          }
         }
         this->spotLightFp->SetRgbIntensity(it->second,
             AZ::Render::PhotometricColor<AZ::Render::PhotometricUnit::Candela>(
@@ -1750,7 +1761,7 @@ void O3deBackend::Impl::SubmitLights()
         // map separately and the lighting pass samples it via the light's
         // world transform. We acquire one ShadowId per spot id and update
         // its descriptor every frame from the same source-of-truth pose.
-        if (this->projectedShadowFp)
+        if (this->projectedShadowFp && !noShadow)
         {
           auto sh = this->spotShadowHandles.find(light.id);
           if (sh == this->spotShadowHandles.end())
@@ -2481,6 +2492,25 @@ static void MaybeInjectDemoLights(std::vector<O3deLightData> &_lights)
   spot.innerAngle = 0.35;   // ~20 deg
   spot.outerAngle = 0.7;    // ~40 deg (wider cone, clearer falloff)
   _lights.push_back(spot);
+
+  // Diagnostic single-variable knob for the "single-light greys the whole
+  // render" investigation (see memory o3de-single-light-greys-render). When
+  // GZ_O3DE_DEMO_ONLY_LIGHT is set, drop one of the pair so SubmitLights runs
+  // with exactly one light. "point" keeps the point only (no spot => no shadow
+  // pass at all); "spot" keeps the spot only (shadow pass with a single light).
+  // Comparing the two, plus GZ_O3DE_DEMO_NO_SHADOW below, isolates whether the
+  // grey is a light-count effect or a shadow-setup effect.
+  if (const char *only = std::getenv("GZ_O3DE_DEMO_ONLY_LIGHT"))
+  {
+    const O3deLightData::Type keep = (std::string(only) == "spot")
+        ? O3deLightData::Type::SPOT : O3deLightData::Type::POINT;
+    _lights.erase(std::remove_if(_lights.begin(), _lights.end(),
+        [keep](const O3deLightData &l){ return l.type != keep; }),
+        _lights.end());
+    std::fprintf(stderr,
+        "[gz-o3de] DEMO_ONLY_LIGHT=%s -> %zu demo light(s)\n",
+        only, _lights.size());
+  }
 }
 
 //////////////////////////////////////////////////
