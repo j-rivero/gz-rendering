@@ -21,15 +21,22 @@ verify" validates the old binary. This has burned multi-hour debugging sessions.
 
 ```bash
 WS=/home/jrivero/code/gz/ws_o3de_rendering            # colcon workspace
+SO=libgz-rendering-o3de.so.11.0.0~pre1
+# ALWAYS remove the old libraries first, so a no-op/failed build cannot leave a
+# stale binary that silently loads. (Move them aside rather than deleting.)
+mkdir -p /tmp/o3de_so_old
+mv "$WS/build/gz-rendering/lib/$SO" \
+   "$WS/install/lib/$SO" \
+   "$WS/install/lib/gz-rendering/engine-plugins/$SO" /tmp/o3de_so_old/ 2>/dev/null
 # Rebuild (honour the gz-rendering -j5 convention):
 make -C "$WS/build/gz-rendering" -j5 gz-rendering-o3de
 # Freshness check: pick a string unique to your edit (or one you just REMOVED)
-# and grep the built .so. A hit on a removed string == STALE build.
-strings "$WS/build/gz-rendering/lib/libgz-rendering-o3de.so.11.0.0~pre1" | grep -c <your-marker>
+# and grep the built .so. A hit on a removed string == STALE build. The build
+# MUST have re-created the .so above (if it is missing, the target was wrong).
+strings "$WS/build/gz-rendering/lib/$SO" | grep -c <your-marker>
 # Install to BOTH paths (the live demo loads from engine-plugins/):
-SO="$WS/build/gz-rendering/lib/libgz-rendering-o3de.so.11.0.0~pre1"
-cp "$SO" "$WS/install/lib/libgz-rendering-o3de.so.11.0.0~pre1"
-cp "$SO" "$WS/install/lib/gz-rendering/engine-plugins/libgz-rendering-o3de.so.11.0.0~pre1"
+cp "$WS/build/gz-rendering/lib/$SO" "$WS/install/lib/$SO"
+cp "$WS/build/gz-rendering/lib/$SO" "$WS/install/lib/gz-rendering/engine-plugins/$SO"
 ```
 
 The object to watch is
