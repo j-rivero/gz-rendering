@@ -11,6 +11,31 @@ this file is to make them discoverable and reproducible later.
 > requires the O3DE gem patch in `o3de/patches/`). In a patch-free build they
 > are logged no-ops.
 
+## Rebuilding the plugin — verify it actually took effect
+
+Before trusting *any* run below, confirm the `.so` you are running contains the
+code you just edited. The plugin's CMake target is **`gz-rendering-o3de`** — NOT
+`o3de`. `cmake --build <build> --target o3de` exits 0 but compiles nothing
+relevant, so the `.so` silently keeps running stale code and every "rebuild +
+verify" validates the old binary. This has burned multi-hour debugging sessions.
+
+```bash
+WS=/home/jrivero/code/gz/ws_o3de_rendering            # colcon workspace
+# Rebuild (honour the gz-rendering -j5 convention):
+make -C "$WS/build/gz-rendering" -j5 gz-rendering-o3de
+# Freshness check: pick a string unique to your edit (or one you just REMOVED)
+# and grep the built .so. A hit on a removed string == STALE build.
+strings "$WS/build/gz-rendering/lib/libgz-rendering-o3de.so.11.0.0~pre1" | grep -c <your-marker>
+# Install to BOTH paths (the live demo loads from engine-plugins/):
+SO="$WS/build/gz-rendering/lib/libgz-rendering-o3de.so.11.0.0~pre1"
+cp "$SO" "$WS/install/lib/libgz-rendering-o3de.so.11.0.0~pre1"
+cp "$SO" "$WS/install/lib/gz-rendering/engine-plugins/libgz-rendering-o3de.so.11.0.0~pre1"
+```
+
+The object to watch is
+`build/gz-rendering/o3de/src/CMakeFiles/gz-rendering-o3de.dir/O3deBackend.cc.o`;
+its mtime must be newer than `o3de/src/O3deBackend.cc` after a build.
+
 ## Cheat sheet
 
 | Env var | Default | One-line purpose |
