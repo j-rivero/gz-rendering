@@ -5,11 +5,13 @@ this proof-of-concept without re-reading every commit. Read this top to
 bottom; everything else is reference linked from here.
 
 Last updated: **2026-06-03** by Opus 4.8. Last commit on the branch:
-`3cf2ad48` (M8 directional cascade shadows). All shadow work (spot + directional)
-is now complete; the demo was also polished to showcase shadows + mark light
-sources. Since the 2026-06-01 handoff:
-runtime-mesh-unlit RESOLVED + relight promoted to default; M7 spot light
-direction fixed (spot was emitting no light); single-light-greys disproven.
+`1060d5b1` (M11 Phase B base-color texture). **M11 real PBR materials & textures
+landed** (metallic/roughness factors + base-color texture on runtime meshes), and
+the long-standing **runtime-mesh-unlit bug is finally root-caused & fixed**
+(inverted shading normals vs reversed winding — commit `075caed7`). All shadow
+work (spot + directional cascade) was already complete. Since the 2026-06-01
+handoff: M7 spot light direction fixed; M8 cascade shadows; single-light-greys
+disproven; M11 PBR; runtime-mesh-unlit RESOLVED with the real cause.
 
 ---
 
@@ -131,6 +133,7 @@ that came after. Status as of 2026-06-01:
 | M6 | Atom `LightFeatureProcessor` integration (point + spot light handles, per-frame `Set*` sync) | ✓ A + C landed; B was folded into A |
 | M7 | Shadows: cache `ProjectedShadowFP`, paired projected-shadow handle per spot, cooked Mesh caster + receiver, `SetShadowsEnabled` on `SimpleSpotLight` | ✓ A1, A2, B, C landed. Spot **cone tint visible** (direction bug fixed `8e717897`). Cast **shadow RESOLVED** (`d4e468eb`): shadows DO render — a cooked sphere AND the runtime hero box both cast clear shadows when floated over open floor (`screenshots/m7-shadow-ab-both-cast.png`). The "not visible" was scene placement/occlusion, not a render bug; material-variant hypothesis refuted. Cleanup TODO: the manual A2 ProjectedShadow is redundant (SimpleSpotLight owns its own). |
 | M8 | Directional "sun" light (`DirectionalLightFeatureProcessor`) + **cascade shadows** | ✓ light landed `540471f1`; **cascade shadows landed** (`o3de: M8 — directional sun CASCADE shadows`). Per-frame `SetCameraConfiguration`+`SetCameraTransform` (cascades fit the live camera), one-time `SetShadowEnabled`/`SetShadowmapSize(1024)`/`SetCascadeCount(2)`/`SetShadowFarClipDistance(30 m)`/PCF. Verified in isolation (`screenshots/m8-directional-cascade-shadow.png`) and in the default demo alongside the spot shadow (`screenshots/demo-both-shadows-spot-and-sun.png`). Sun 14 lux, dir `(-0.35,0.15,-0.925)`. Perf: shadow pass scales with render res (~33 ms default window, ~85 ms maximized); `GZ_O3DE_DEMO_NO_SUN_SHADOW=1` drops just the sun shadow. **All shadow work is now complete.** |
+| M11 | **Real PBR materials & textures** on runtime meshes | ✓ **Phase A** (`075caed7`): `O3deMeshData` gains `metallic`/`roughness`; `SubmitMeshes` sets `metallic.factor`/`roughness.factor` per-mesh. Demo roughness sweep (5 spheres .05→.95) + gold/steel pair. **Also root-caused & FIXED the long-standing runtime-mesh-unlit bug** (see below). ✓ **Phase B** (`1060d5b1`): base-color texture — `DemoBaseColorImage()` builds a checkerboard `StreamingImage` via `CreateFromCpuData`, bound to `baseColor.textureMap`+`useTexture` on `textured=true` meshes; textured sphere UV-maps + shades correctly. Isolate with `GZ_O3DE_DEMO_PBR_ONLY=1`. Screenshots `m11-pbr-*.png`. **Caveat:** metals read dark (no IBL loaded yet — natural follow-on); real gz albedo maps are the same call with `gz::common::Image::Data()` as the pixel source. |
 
 ### Commit stack (most recent on top)
 
@@ -159,9 +162,9 @@ them before re-attempting either; both have hypothesis lists for the
 |---|---|
 | [`o3de-m7-spot-shadow-not-visible`](file:///home/jrivero/.claude/memory/project_o3de_m7_spot_shadow_not_visible.md) | **Light: RESOLVED** (commit `8e717897`). The spot emitted zero light — aimed local -Z but Atom's SimpleSpotLight emits along +Z (`transform.GetBasisZ()`); the cone pointed 180° away. Fixed with a code-computed look-at `q:(0,0,+1)->dir`; spot now lights a clear blue cone (`srgb(0,0,0)`->`srgb(195,212,233)`). The 6 old hypotheses were all wrong. **Cast SHADOW also RESOLVED** (commit `d4e468eb`): shadows DO render — a cooked sphere AND the runtime hero box both throw clear black cast shadows when floated over open, spot-lit floor (`GZ_O3DE_DEMO_ONLY_LIGHT=spot` + `GZ_O3DE_COOKED_CASTER`/`GZ_O3DE_CASTER_POS`/`GZ_O3DE_HERO_POS`; `screenshots/m7-shadow-ab-both-cast.png`). The "not visible" was scene placement/occlusion; the material-variant hypothesis is refuted (runtime mesh casts fine). Cleanup TODO: the backend's manual A2 ProjectedShadow is redundant (SimpleSpotLight owns its own shadow). |
 | [`o3de-single-light-greys-render`](file:///home/jrivero/.claude/memory/project_o3de_single_light_greys_render.md) | **DISPROVEN** (2026-06-02). Not a light-count bug — it's the intermittent QSG/present-race grey that strikes regardless of 1 vs 2 lights or shadow on/off. The capture harness now grey-detects (centre-crop colors==1) and retries. |
-| [`o3de-runtime-mesh-unlit`](file:///home/jrivero/.claude/memory/project_o3de_runtime_mesh_unlit.md) | **RESOLVED** (commits `0aa2ef9e`, `f4b9d7a8`). The runtime hero box rendering black under light was light-facing, not a renderer bug (proven via RenderDoc). Hero-box relight (2 opposed fills) promoted to demo default; emissive crutch dropped. |
+| [`o3de-runtime-mesh-unlit`](file:///home/jrivero/.claude/memory/project_o3de_runtime_mesh_unlit.md) | **RESOLVED — REAL ROOT CAUSE found** (commit `075caed7`). Runtime meshes shaded black because their **shading normals were INVERTED** relative to the reversed triangle winding: StandardPBR's pixel-stage front-face flip negated the (correct, outward) normal → `NdotL<0` → black + Fresnel rim. Fix = negate the vertex normal in `ExtractMeshGeometry` (opt out `GZ_O3DE_MESH_NO_FLIP_NORMALS`). Proven by isolated sphere A/B (`m11-runtime-mesh-unlit-fix-ab.png`). The earlier "light-facing / BOXFILL relight" verdict (`0aa2ef9e`, `f4b9d7a8`) was a workaround that masked this — a box has too few orientations to expose it; a sphere did. BOXFILL is now just cosmetic fill (cleanup TODO to drop it). The prior RenderDoc "normal is correct" read was the *post-VS* normal (pre-flip). |
 
-Remaining: the spot's cast shadow (see above). Everything else here is closed.
+Everything in this table is closed. Remaining cleanup TODOs: (1) the manual A2 ProjectedShadow (redundant); (2) the now-cosmetic BOXFILL relight; (3) the inert emissive crutch.
 
 ## How the demo scene maps to milestones (visual verify guide)
 
