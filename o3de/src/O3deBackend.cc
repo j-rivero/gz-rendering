@@ -3146,16 +3146,64 @@ static void MaybeInjectDemoLights(std::vector<O3deLightData> &_lights)
   spot.type = O3deLightData::Type::SPOT;
   spot.id = 0xD0002u;
   spot.pos[0] = -3.0; spot.pos[1] = 3.0; spot.pos[2] = 4.0;
-  spot.quat[0] = 0.918;   // w   (= cos(angle/2),     angle ~= 0.815 rad)
-  spot.quat[1] = -0.281;  // x   (axis x = -1/sqrt(2))
-  spot.quat[2] = -0.281;  // y   (axis y = -1/sqrt(2))
-  spot.quat[3] = 0.0;     // z
+  // Aim the spot at a TARGET point via a code-computed shortest-arc look-at
+  // instead of hand-written quaternion literals (which were error-prone -- the
+  // old (0.918,-0.281,-0.281,0) aimed the cone at the world origin, but the cone
+  // footprint there is occluded from the camera by the object row + backdrop
+  // wall, so the blue tint / cast shadow landed on floor we can never see; that
+  // is the real cause of "M7 spot shadow not visible", not any FP bug). Atom's
+  // Atom's SimpleSpotLightFeatureProcessor reads the cone direction from
+  // transform.GetBasisZ() -- i.e. the light emits along its local +Z, NOT -Z.
+  // (The old code aimed -Z at the target, so the cone pointed 180 deg AWAY into
+  // empty space and the spot lit nothing -- the real cause of "M7 spot shadow not
+  // visible".) So we compute the shortest arc q : (0,0,+1) -> dir(target).
+  // Target overridable via GZ_O3DE_SPOT_TARGET="x y z" for quick aiming tests.
+  double tgt[3] = { 1.5, 0.0, 0.0 };  // floor under the spinning hero-box caster
+  if (const char *t = std::getenv("GZ_O3DE_SPOT_TARGET"))
+    std::sscanf(t, "%lf %lf %lf", &tgt[0], &tgt[1], &tgt[2]);
+  {
+    double dx = tgt[0] - spot.pos[0], dy = tgt[1] - spot.pos[1],
+           dz = tgt[2] - spot.pos[2];
+    const double dl = std::sqrt(dx*dx + dy*dy + dz*dz);
+    if (dl > 1e-9) { dx /= dl; dy /= dl; dz /= dl; }
+    // shortest arc from (0,0,+1) to dir=(dx,dy,dz): axis = (0,0,+1) x dir,
+    // cos(angle) = (0,0,+1).dir = dz. Build the half-angle quaternion.
+    double ax = -dy;                    // ((0,0,1) x dir).x
+    double ay = dx;                     // ((0,0,1) x dir).y
+    double az = 0.0;                    // (0,0,1) x dir has zero z
+    const double axl = std::sqrt(ax*ax + ay*ay + az*az);
+    const double cosA = dz;             // dot((0,0,1),dir)
+    if (axl < 1e-9)
+    {
+      // dir is parallel to +/-Z: identity (+Z up) or 180-flip about X (-Z down)
+      spot.quat[0] = (cosA > 0.0) ? 1.0 : 0.0;
+      spot.quat[1] = (cosA > 0.0) ? 0.0 : 1.0;
+      spot.quat[2] = 0.0; spot.quat[3] = 0.0;
+    }
+    else
+    {
+      ax /= axl; ay /= axl; az /= axl;
+      const double angle = std::acos(std::max(-1.0, std::min(1.0, cosA)));
+      const double s = std::sin(angle * 0.5);
+      spot.quat[0] = std::cos(angle * 0.5);  // w
+      spot.quat[1] = ax * s;                 // x
+      spot.quat[2] = ay * s;                 // y
+      spot.quat[3] = az * s;                 // z
+    }
+  }
   spot.diffuseColor[0] = 0.3; spot.diffuseColor[1] = 0.5;
   spot.diffuseColor[2] = 1.0;
   spot.intensity = 1500.0;  // candela (was 300; spot footprint was invisible)
+  if (const char *si = std::getenv("GZ_O3DE_SPOT_INTENSITY"))
+    spot.intensity = std::atof(si);
   spot.attenRange = 10.0;
   spot.innerAngle = 0.35;   // ~20 deg
   spot.outerAngle = 0.7;    // ~40 deg (wider cone, clearer falloff)
+  std::fprintf(stderr,
+      "[gz-o3de] demo spot: target=(%.2f,%.2f,%.2f) quat=(%.3f,%.3f,%.3f,%.3f) "
+      "intensity=%.0f cd\n",
+      tgt[0], tgt[1], tgt[2], spot.quat[0], spot.quat[1], spot.quat[2],
+      spot.quat[3], spot.intensity);
   _lights.push_back(spot);
 
   // Scene reorg: front FILL point light on the camera side (-X). Placed LOW
