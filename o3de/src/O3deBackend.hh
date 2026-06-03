@@ -184,6 +184,11 @@ namespace gz
       // "leave the material default" so callers that don't care don't override.
       float metallic = -1.0f;   //!< StandardPBR metallic.factor (<0 = default).
       float roughness = -1.0f;  //!< StandardPBR roughness.factor (<0 = default).
+      // M11 Phase B: when true the per-mesh material binds a base-color texture
+      // (baseColor.textureMap + useTexture). The backend currently supplies a
+      // procedural RGBA checkerboard StreamingImage; the same path accepts a
+      // file-decoded albedo map (gz::common::Image) with no API change.
+      bool textured = false;    //!< Bind the demo base-color texture.
     };
 
     /// \brief Camera pose + projection for one frame, in gz world coordinates.

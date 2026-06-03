@@ -97,6 +97,8 @@
 #include <Atom/RPI.Public/Image/AttachmentImage.h>
 #include <Atom/RPI.Public/Image/AttachmentImagePool.h>
 #include <Atom/RPI.Public/Image/ImageSystemInterface.h>
+#include <Atom/RPI.Public/Image/StreamingImage.h>
+#include <Atom/RPI.Public/Image/StreamingImagePool.h>
 #include <Atom/RPI.Reflect/Image/AttachmentImageAssetCreator.h>
 #include <Atom/RPI.Reflect/System/SceneDescriptor.h>
 #include <Atom/RPI.Reflect/System/RenderPipelineDescriptor.h>
@@ -473,6 +475,11 @@ class O3deBackend::Impl
   public: AZ::Data::Asset<AZ::RPI::MaterialAsset> meshMaterialAsset;
   public: std::unordered_map<uint64_t,
       AZ::Data::Instance<AZ::RPI::Material>> meshMaterials;
+  // M11 Phase B: a procedural RGBA checkerboard StreamingImage built once on the
+  // render thread, bound as baseColor.textureMap for meshes with textured=true.
+  // (Same slot a file-decoded gz::common::Image albedo map would fill.)
+  public: AZ::Data::Instance<AZ::RPI::StreamingImage> demoBaseColorImage;
+  public: AZ::Data::Instance<AZ::RPI::StreamingImage> DemoBaseColorImage();
   /// \brief M9: acquire/update/release Atom mesh handles for this->meshes,
   /// mirroring SubmitLights()'s id-keyed lifecycle (render thread only).
   public: void SubmitMeshes();
@@ -2077,6 +2084,56 @@ void O3deBackend::Impl::AcquireDemoMeshes()
 }
 
 //////////////////////////////////////////////////
+// M11 Phase B: lazily build a procedural RGBA8 checkerboard StreamingImage and
+// cache it. Demonstrates the runtime CPU-data -> Atom texture path end to end:
+// the exact same CreateFromCpuData call binds a file-decoded albedo map
+// (gz::common::Image::Data()) when real gz materials are wired -- only the pixel
+// source changes. Must run on the render thread (Atom image creation). Returns a
+// null instance on failure (caller falls back to flat baseColor).
+AZ::Data::Instance<AZ::RPI::StreamingImage> O3deBackend::Impl::DemoBaseColorImage()
+{
+  if (this->demoBaseColorImage)
+    return this->demoBaseColorImage;
+
+  auto *imageSystem = AZ::RPI::ImageSystemInterface::Get();
+  if (!imageSystem)
+    return {};
+  const AZ::Data::Instance<AZ::RPI::StreamingImagePool> pool =
+      imageSystem->GetSystemStreamingPool();
+  if (!pool)
+    return {};
+
+  // 256x256 checkerboard: 8x8 tiles alternating two saturated colours so the UV
+  // mapping (and any wrap/flip) is unmistakable on the textured sphere.
+  constexpr uint32_t kDim = 256u;
+  constexpr uint32_t kTiles = 8u;
+  constexpr uint32_t kTilePx = kDim / kTiles;
+  std::vector<uint8_t> pixels(static_cast<size_t>(kDim) * kDim * 4u);
+  for (uint32_t y = 0; y < kDim; ++y)
+  {
+    for (uint32_t x = 0; x < kDim; ++x)
+    {
+      const bool odd = ((x / kTilePx) + (y / kTilePx)) & 1u;
+      uint8_t *p = &pixels[(static_cast<size_t>(y) * kDim + x) * 4u];
+      if (odd)
+      { p[0] = 230; p[1] = 60;  p[2] = 40;  }   // warm red tile
+      else
+      { p[0] = 30;  p[1] = 80;  p[2] = 220; }   // cool blue tile
+      p[3] = 255;
+    }
+  }
+
+  this->demoBaseColorImage = AZ::RPI::StreamingImage::CreateFromCpuData(
+      *pool, AZ::RHI::ImageDimension::Image2D,
+      AZ::RHI::Size(kDim, kDim, 1u),
+      AZ::RHI::Format::R8G8B8A8_UNORM_SRGB,
+      pixels.data(), pixels.size());
+  std::fprintf(stderr, "[gz-o3de] M11 Phase B: base-color checker image %s\n",
+      this->demoBaseColorImage ? "READY" : "FAILED");
+  return this->demoBaseColorImage;
+}
+
+//////////////////////////////////////////////////
 void O3deBackend::Impl::SubmitMeshes()
 {
   if (!this->meshFp)
@@ -2230,6 +2287,26 @@ void O3deBackend::Impl::SubmitMeshes()
             if (mIdx.IsValid())
               material->SetPropertyValue(mIdx,
                   std::clamp(m.metallic, 0.0f, 1.0f));
+          }
+
+          // M11 Phase B: bind the base-color texture (procedural checker for the
+          // demo; the same SetPropertyValue<Instance<Image>> path takes a
+          // file-decoded albedo map). baseColor.useTexture must be true for the
+          // StandardPBR shader to sample textureMap instead of the flat color.
+          if (m.textured)
+          {
+            const AZ::Data::Instance<AZ::RPI::StreamingImage> tex =
+                this->DemoBaseColorImage();
+            const auto texIdx =
+                material->FindPropertyIndex(AZ::Name("baseColor.textureMap"));
+            const auto useTexIdx =
+                material->FindPropertyIndex(AZ::Name("baseColor.useTexture"));
+            if (tex && texIdx.IsValid() && useTexIdx.IsValid())
+            {
+              material->SetPropertyValue(texIdx,
+                  AZ::Data::Instance<AZ::RPI::Image>(tex));
+              material->SetPropertyValue(useTexIdx, true);
+            }
           }
 
           // Emissive visibility workaround (see limitation note above). Gated by
@@ -3663,12 +3740,13 @@ static void MaybeInjectDemoMeshData(std::vector<O3deMeshData> &_meshes)
       const gz::common::Mesh *sph = meshMgr->MeshByName(sphName);
       // Register the shared sphere geometry under each row id (one-time CPU
       // extraction per id; the render thread builds one Atom model per id).
-      for (int i = 0; i < kRoughN + 2; ++i)
+      // kRoughN roughness spheres + 2 metallic + 1 textured = kRoughN + 3.
+      for (int i = 0; i < kRoughN + 3; ++i)
         O3deBackend::Instance().RegisterMesh(kPbrRowBase + i, sph);
       pbrRegistered = true;
       std::fprintf(stderr,
           "[gz-o3de] M11 PBR showcase: registered %d runtime spheres\n",
-          kRoughN + 2);
+          kRoughN + 3);
     }
 
     // Roughness sweep: 5 mid-grey dielectric spheres, roughness .05 -> .95.
@@ -3708,6 +3786,22 @@ static void MaybeInjectDemoMeshData(std::vector<O3deMeshData> &_meshes)
     steel.color[0] = 0.92f; steel.color[1] = 0.94f; steel.color[2] = 1.0f;
     steel.color[3] = 1.0f; steel.metallic = 1.0f; steel.roughness = 0.18f;
     _meshes.push_back(steel);
+
+    // M11 Phase B: a textured sphere -- base-color checkerboard sampled through
+    // the StandardPBR baseColor.textureMap (proves the runtime CPU->Atom texture
+    // path + UVs). Front-and-centre on open floor so the checker is legible.
+    O3deMeshData textured;
+    textured.id = kPbrRowBase + kRoughN + 2;
+    textured.pos[0] = pbrOnly ? 0.2 : 0.0;
+    textured.pos[1] = pbrOnly ? 0.0 : -1.7;
+    textured.pos[2] = pbrOnly ? 1.1 : 0.55;
+    textured.scale[0] = textured.scale[1] = textured.scale[2] =
+        pbrOnly ? 1.6 : 1.2;
+    textured.color[0] = 1.0f; textured.color[1] = 1.0f; textured.color[2] = 1.0f;
+    textured.color[3] = 1.0f;
+    textured.roughness = 0.55f;
+    textured.textured = true;
+    _meshes.push_back(textured);
   }
 }
 
