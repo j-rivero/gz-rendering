@@ -178,6 +178,12 @@ namespace gz
       double quat[4] = {1.0, 0.0, 0.0, 0.0}; //!< World orientation w,x,y,z.
       double scale[3] = {1.0, 1.0, 1.0};     //!< World scale.
       float color[4] = {0.8f, 0.8f, 0.8f, 1.0f}; //!< RGBA diffuse tint.
+      // M11: StandardPBR factors applied to the per-mesh material instance.
+      // metallic 0=dielectric, 1=metal (needs IBL to reflect convincingly);
+      // roughness 0=mirror-sharp specular, 1=fully diffuse. Sentinel < 0 means
+      // "leave the material default" so callers that don't care don't override.
+      float metallic = -1.0f;   //!< StandardPBR metallic.factor (<0 = default).
+      float roughness = -1.0f;  //!< StandardPBR roughness.factor (<0 = default).
     };
 
     /// \brief Camera pose + projection for one frame, in gz world coordinates.

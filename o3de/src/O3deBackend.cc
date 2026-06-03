@@ -1717,6 +1717,25 @@ namespace
         if (n.Length() < 1e-6)
           n = gz::math::Vector3d(0.0, 0.0, 1.0);
         n.Normalize();
+        // FIX (runtime-mesh-unlit, root-caused 2026-06-03): negate the vertex
+        // normal. gz::common winds triangles CCW-from-outside with OUTWARD
+        // vertex normals; Atom's front-face convention is the opposite, so the
+        // index winding is reversed below for correct back-face culling. That
+        // reversal makes Atom's geometric facing disagree with the unflipped
+        // outward normals, and StandardPBR shades from the geometry-aligned
+        // normal -- so the visible front hemisphere gets NdotL<0 and goes BLACK
+        // with only a Fresnel rim. That is the long-standing "runtime mesh
+        // renders unlit/black" symptom (mis-attributed to a world-normal-matrix
+        // defect and worked around per-object with fill lights). Flipping the
+        // vertex normal restores agreement: correct culling AND correct
+        // lighting. Proven by an isolated A/B (GZ_O3DE_DEMO_PBR_ONLY): unflipped
+        // = black spheres + Fresnel rim; flipped = clean diffuse with
+        // roughness-tracking speculars. Opt out with GZ_O3DE_MESH_NO_FLIP_NORMALS
+        // to restore the old (broken) behaviour for comparison.
+        static const bool noFlipN =
+            std::getenv("GZ_O3DE_MESH_NO_FLIP_NORMALS") != nullptr;
+        if (!noFlipN)
+          n = -n;
         g.normals.push_back(static_cast<float>(n.X()));
         g.normals.push_back(static_cast<float>(n.Y()));
         g.normals.push_back(static_cast<float>(n.Z()));
@@ -2139,40 +2158,25 @@ void O3deBackend::Impl::SubmitMeshes()
 
       // Per-mesh StandardPBR instance coloured from O3deMeshData::color.
       //
-      // KNOWN LIMITATION (runtime meshes render unlit): a model built at runtime
-      // by BuildModelAssetFromGeometry shades solid BLACK under scene lighting,
-      // even though its construction is byte-for-byte identical to Atom's own
-      // ModelAssetHelpers::CreateModel (same POSITION/NORMAL/TANGENT/BITANGENT/UV
-      // streams, formats and order), its CPU normals are correct, its material
-      // binds, and the mesh IS in the lit forward pass. The pixels come out
-      // exactly srgb(0,0,0) across diffuse + specular + IBL while EMISSIVE still
-      // shows -- i.e. the world-space vertex normal reads as zero in the shader
-      // for our runtime models specifically (cooked .azmodel assets, e.g. the
-      // demo floor, light correctly through the very same material + lights).
-      // This was isolated by elimination -- it is not the material path
-      // (FindOrCreate behaves the same), not the winding, not the tangent frame,
-      // not r_enablePerMeshShaderOptionFlags, not back-face culling, not an empty
-      // model material slot (assigning m_defaultMaterialAsset like WhiteBox does
-      // changed nothing), and the stream construction is byte-for-byte identical
-      // to Atom's own ModelAssetHelpers::CreateModel. The fix lives somewhere
-      // deeper in how this minimal Atom pipeline wires per-mesh normals for
-      // hand-built models.
+      // RESOLVED (runtime-mesh-unlit, 2026-06-03): runtime models built by
+      // BuildModelAssetFromGeometry used to shade solid BLACK under scene
+      // lighting (only a Fresnel rim survived), while cooked .azmodel assets lit
+      // correctly through the very same material + lights. ROOT CAUSE: the vertex
+      // normals faced INWARD in Atom's shading frame. gz::common winds triangles
+      // CCW-from-outside with outward normals; we reverse the index winding for
+      // Atom's opposite front-face/culling convention, which desynced the
+      // geometric facing from the unflipped outward normals, so StandardPBR shaded
+      // from an inward normal (NdotL<0 -> black). FIX: negate the vertex normal in
+      // the extractor (see ExtractMeshGeometry) so culling AND lighting agree. The
+      // earlier "world-normal-matrix degenerates" / DEBUG_NORMALS partition was a
+      // red herring -- the object-space NORMAL stream was always correct; it was
+      // the SIGN relative to the reversed winding that was wrong. Proven by an
+      // isolated A/B (GZ_O3DE_DEMO_PBR_ONLY): unflipped = black spheres + rim,
+      // flipped = clean diffuse with roughness-tracking speculars.
       //
-      // DECISIVE PARTITION (2026-06-03): the GZ_O3DE_MESH_DEBUG_NORMALS test below
-      // proved the OBJECT-space NORMAL stream reaches the pixel shader fully
-      // correct (box faces sampled as clean orthonormal axis normals: +Y front,
-      // -X left, -Z bottom). So construction/streams/data are NOT the bug. The
-      // DebugVertexStreams material outputs the normal UNTRANSFORMED and works;
-      // StandardPBR transforms it by the per-object normal matrix and yields zero
-      // lighting -> the defect is strictly in the WORLD-normal path for runtime
-      // models, not in the mesh. Next diagnostic: visualize the WORLD normal (or
-      // dump the ObjectSrg normal matrix) to confirm it degenerates for hand-built
-      // models while the position transform stays correct.
-      //
-      // Until that is fixed we drive the colour through EMISSIVE so the gz::common
-      // -> Atom runtime mesh is actually VISIBLE in the demo (and the M10 per-mesh
-      // tint is observable). baseColor is set too, so the mesh will shade
-      // correctly for free once the runtime-normal issue is resolved.
+      // The GZ_O3DE_MESH_EMISSIVE crutch below (drive colour through emissive so
+      // an unlit mesh is at least visible) is therefore no longer needed and is
+      // off by default; kept only as an opt-in self-lit look.
       AZ::Data::Instance<AZ::RPI::Material> material;
       // DIRECT-EVIDENCE DIAGNOSTIC (runtime-mesh-unlit): Atom's DebugVertexStreams
       // material reads `m_normal : NORMAL` UNCONDITIONALLY and outputs it as RGB
@@ -2205,6 +2209,29 @@ void O3deBackend::Impl::SubmitMeshes()
           if (baseColorIdx.IsValid())
             material->SetPropertyValue(baseColorIdx, color);
 
+          // M11: real StandardPBR metallic/roughness factors. Sentinel < 0 leaves
+          // the asset default untouched. roughness drives the analytic-light
+          // specular highlight spread (sharp at 0, broad at 1) and is clearly
+          // visible without IBL; metallic kills the diffuse term (metals reflect
+          // the environment only) so a full metal reads dark until an IBL cubemap
+          // is loaded -- both are plumbed here so the demo can sweep them.
+          if (m.roughness >= 0.0f)
+          {
+            const auto rIdx =
+                material->FindPropertyIndex(AZ::Name("roughness.factor"));
+            if (rIdx.IsValid())
+              material->SetPropertyValue(rIdx,
+                  std::clamp(m.roughness, 0.0f, 1.0f));
+          }
+          if (m.metallic >= 0.0f)
+          {
+            const auto mIdx =
+                material->FindPropertyIndex(AZ::Name("metallic.factor"));
+            if (mIdx.IsValid())
+              material->SetPropertyValue(mIdx,
+                  std::clamp(m.metallic, 0.0f, 1.0f));
+          }
+
           // Emissive visibility workaround (see limitation note above). Gated by
           // GZ_O3DE_MESH_EMISSIVE (the live demo sets it) so it is opt-in: once
           // the runtime-mesh-unlit bug is fixed the mesh will shade from baseColor
@@ -2235,9 +2262,10 @@ void O3deBackend::Impl::SubmitMeshes()
 
           const bool compileOk = material->Compile();
           std::fprintf(stderr,
-              "[gz-o3de] mesh id=%llu colour=(%.2f,%.2f,%.2f) %s compile=%d\n",
+              "[gz-o3de] mesh id=%llu colour=(%.2f,%.2f,%.2f) metal=%.2f "
+              "rough=%.2f %s compile=%d\n",
               static_cast<unsigned long long>(m.id),
-              m.color[0], m.color[1], m.color[2],
+              m.color[0], m.color[1], m.color[2], m.metallic, m.roughness,
               std::getenv("GZ_O3DE_MESH_EMISSIVE") ? "emissive" : "lit",
               compileOk ? 1 : 0);
           this->meshMaterials[m.id] = material;
@@ -3008,6 +3036,14 @@ static void MaybeInjectDemoShapes(std::vector<O3deShapeData> &_shapes)
   if (!std::getenv("GZ_O3DE_DEMO_SHAPES"))
     return;
 
+  // M11 verification aid: GZ_O3DE_DEMO_PBR_ONLY isolates the PBR sphere row by
+  // suppressing every AuxGeom demo primitive + light marker, so the metallic/
+  // roughness sweep can be judged against an empty floor (paired with the clean
+  // 2-light key+fill setup in MaybeInjectDemoLights and the hero-box skip in
+  // MaybeInjectDemoMeshData). Off by default.
+  if (std::getenv("GZ_O3DE_DEMO_PBR_ONLY"))
+    return;
+
   // Seconds since the first call -- drives the simple per-frame animation
   // below so the live demo proves it really is a live render and not one
   // captured frame on a Qt swapchain. Set GZ_O3DE_DEMO_ANIMATE=0 to freeze.
@@ -3285,6 +3321,34 @@ static void MaybeInjectDemoLights(std::vector<O3deLightData> &_lights)
 {
   if (!_lights.empty() || !std::getenv("GZ_O3DE_DEMO_SHAPES"))
     return;
+
+  // M11 PBR isolation lighting: one sharp key (for the roughness-dependent
+  // specular highlight) plus a soft opposing fill (so the sphere bodies show
+  // their albedo instead of falling to black on the unlit side). Clean,
+  // predictable, no spot/sun shadow cost. Off by default.
+  if (std::getenv("GZ_O3DE_DEMO_PBR_ONLY"))
+  {
+    O3deLightData key;
+    key.type = O3deLightData::Type::POINT;
+    key.id = 0xD0E01u;
+    key.pos[0] = -1.5; key.pos[1] = 1.5; key.pos[2] = 3.0;  // upper-left front
+    key.diffuseColor[0] = 1.0; key.diffuseColor[1] = 0.97;
+    key.diffuseColor[2] = 0.92;
+    key.intensity = 220.0;
+    key.attenRange = 18.0;
+    _lights.push_back(key);
+
+    O3deLightData fill;
+    fill.type = O3deLightData::Type::POINT;
+    fill.id = 0xD0E02u;
+    fill.pos[0] = -2.0; fill.pos[1] = -1.5; fill.pos[2] = 1.2;  // low-right front
+    fill.diffuseColor[0] = 0.6; fill.diffuseColor[1] = 0.7;
+    fill.diffuseColor[2] = 0.95;
+    fill.intensity = 70.0;
+    fill.attenRange = 16.0;
+    _lights.push_back(fill);
+    return;
+  }
 
   // Point light: warm white, 4 m above the origin so it lights the bobbing
   // sphere column and the orbiting cylinder. Intensity in candela
@@ -3572,7 +3636,79 @@ static void MaybeInjectDemoMeshData(std::vector<O3deMeshData> &_meshes)
   // is also confirmed by the one-shot "[gz-o3de] M10 mesh ... set=1 compile=1"
   // telemetry.
   m.color[0] = 0.0f; m.color[1] = 0.85f; m.color[2] = 0.9f; m.color[3] = 1.0f;
-  _meshes.push_back(m);
+  // PBR_ONLY isolation skips the hero box so only the sphere row remains.
+  const bool pbrOnly = std::getenv("GZ_O3DE_DEMO_PBR_ONLY") != nullptr;
+  if (!pbrOnly)
+    _meshes.push_back(m);
+
+  // M11 PBR showcase: a tidy row of runtime spheres sweeping StandardPBR
+  // roughness (left=mirror-sharp .05 -> right=fully-diffuse .95) plus a short
+  // metallic pair, all driven through the per-mesh material instance in
+  // SubmitMeshes. The row sits on open floor directly under the (0,0,4.5) key
+  // light so the analytic specular highlight is plainly visible and its spread
+  // tracks roughness. Default on with the demo; disable with
+  // GZ_O3DE_DEMO_NO_PBR=1. metallic spheres read dark until an IBL is loaded
+  // (no environment to reflect) -- expected, noted for the follow-on IBL step.
+  if (!std::getenv("GZ_O3DE_DEMO_NO_PBR"))
+  {
+    constexpr uint64_t kPbrRowBase = 0xD00A0u;
+    constexpr int kRoughN = 5;
+    static bool pbrRegistered = false;
+    auto *meshMgr = gz::common::MeshManager::Instance();
+    const std::string sphName = "gz_o3de_pbr_sphere";
+    if (!pbrRegistered)
+    {
+      if (meshMgr->MeshByName(sphName) == nullptr)
+        meshMgr->CreateSphere(sphName, 0.35, 32, 32);
+      const gz::common::Mesh *sph = meshMgr->MeshByName(sphName);
+      // Register the shared sphere geometry under each row id (one-time CPU
+      // extraction per id; the render thread builds one Atom model per id).
+      for (int i = 0; i < kRoughN + 2; ++i)
+        O3deBackend::Instance().RegisterMesh(kPbrRowBase + i, sph);
+      pbrRegistered = true;
+      std::fprintf(stderr,
+          "[gz-o3de] M11 PBR showcase: registered %d runtime spheres\n",
+          kRoughN + 2);
+    }
+
+    // Roughness sweep: 5 mid-grey dielectric spheres, roughness .05 -> .95.
+    // In PBR_ONLY isolation the row is lifted to camera height (z=1.1) and
+    // pushed slightly back on an empty floor so all five frame cleanly.
+    const float rowY0 = 2.2f;      // screen-left start (gz +Y = left)
+    const float rowDy = -1.1f;     // step toward screen-right
+    const double rowX = pbrOnly ? 0.8 : 0.3;
+    const double rowZ = pbrOnly ? 1.1 : 0.45;
+    for (int i = 0; i < kRoughN; ++i)
+    {
+      O3deMeshData s;
+      s.id = kPbrRowBase + i;
+      s.pos[0] = rowX; s.pos[1] = rowY0 + rowDy * i; s.pos[2] = rowZ;
+      s.quat[0] = 1.0; s.quat[1] = 0.0; s.quat[2] = 0.0; s.quat[3] = 0.0;
+      s.scale[0] = s.scale[1] = s.scale[2] = 1.0;
+      s.color[0] = 0.75f; s.color[1] = 0.75f; s.color[2] = 0.78f;
+      s.color[3] = 1.0f;
+      s.metallic = 0.0f;
+      s.roughness = 0.05f + (0.90f * i) / (kRoughN - 1);
+      _meshes.push_back(s);
+    }
+
+    // Metallic pair (gold + steel) one row back, so the metal/dielectric
+    // contrast is visible side by side. Dark without IBL, but the warm vs cool
+    // specular tint still distinguishes them.
+    const float metZ = pbrOnly ? 1.1f : 0.45f, metX = pbrOnly ? 2.6f : 1.9f;
+    O3deMeshData gold;
+    gold.id = kPbrRowBase + kRoughN;
+    gold.pos[0] = metX; gold.pos[1] = 0.7; gold.pos[2] = metZ;
+    gold.color[0] = 1.0f; gold.color[1] = 0.78f; gold.color[2] = 0.34f;
+    gold.color[3] = 1.0f; gold.metallic = 1.0f; gold.roughness = 0.25f;
+    _meshes.push_back(gold);
+    O3deMeshData steel;
+    steel.id = kPbrRowBase + kRoughN + 1;
+    steel.pos[0] = metX; steel.pos[1] = -0.7; steel.pos[2] = metZ;
+    steel.color[0] = 0.92f; steel.color[1] = 0.94f; steel.color[2] = 1.0f;
+    steel.color[3] = 1.0f; steel.metallic = 1.0f; steel.roughness = 0.18f;
+    _meshes.push_back(steel);
+  }
 }
 
 //////////////////////////////////////////////////
