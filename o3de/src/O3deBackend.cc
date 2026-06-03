@@ -3178,6 +3178,46 @@ static void MaybeInjectDemoLights(std::vector<O3deLightData> &_lights)
   fill.attenRange = 16.0;
   _lights.push_back(fill);
 
+  // RELIGHT (GZ_O3DE_DEMO_BOXFILL): RenderDoc proved the runtime hero box at
+  // (1.5,0,0.7) shades CORRECTLY (cyan albedo, valid unit normals, lit up-faces)
+  // but its camera-visible VERTICAL faces point ~+X/-Y/down -- away from all the
+  // scene lights (overhead +Z key, -X fill) and into the dark lower IBL hemisphere,
+  // so they read black. This adds dedicated fill lights so those faces catch a
+  // near-horizontal rake. Two intensities were probed and rejected on the way here:
+  // a RING of 3 fills (lit the box but washed the cyan to flat white), and a SINGLE
+  // fill (shaded nicely but strobed black whenever the spin rotated the lit face
+  // away). The shipped form below -- two OPPOSED fills, brighter camera-side key +
+  // dimmer far-side fill -- keeps the box cyan-shaded at every spin angle and never
+  // fully black. Env-gated so the committed demo is unchanged until promoted.
+  if (std::getenv("GZ_O3DE_DEMO_BOXFILL"))
+  {
+    // Two OPPOSED fills, not a ring and not a single light. A single light
+    // strobes the spinning box black whenever its camera-facing face rotates
+    // away; a full ring lights every face equally and washes the cyan to flat
+    // white. Two opposed lights -- a brighter camera-side KEY and a dimmer
+    // far-side FILL -- mean that as a face rotates out of the key it rotates
+    // into the fill (so it never goes fully black), while the key>fill gradient
+    // keeps a visible light->dark falloff across the cube (3D shading).
+    struct { double x, y, z, cd; uint64_t id; } fills[] = {
+        // camera-side key (camera ~(-4,0,1.2) looks +X): low, offset -Y, raking
+        { -0.8, -1.4, 1.7, 120.0, 0xD0005u},
+        // far-side fill (+X/+Y), dimmer -> lifts the away-faces off pure black
+        {  3.6,  1.5, 1.5,  55.0, 0xD0006u},
+    };
+    for (const auto &l : fills)
+    {
+      O3deLightData f;
+      f.type = O3deLightData::Type::POINT;
+      f.id = l.id;
+      f.pos[0] = l.x; f.pos[1] = l.y; f.pos[2] = l.z;
+      f.diffuseColor[0] = 0.85; f.diffuseColor[1] = 0.92; f.diffuseColor[2] = 1.0;
+      f.intensity = l.cd;
+      f.attenRange = 9.0;
+      _lights.push_back(f);
+    }
+    std::fprintf(stderr, "[gz-o3de] BOXFILL: opposed key+fill (120/55 cd)\n");
+  }
+
   // M8: directional "sun" light, gated by the same GZ_O3DE_ENABLE_DIRECTIONAL
   // flag that registers the FP in SetupScene. Without the FP registered,
   // SubmitLights short-circuits the DIRECTIONAL branch, so this instance is
