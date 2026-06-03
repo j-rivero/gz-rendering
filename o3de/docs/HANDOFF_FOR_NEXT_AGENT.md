@@ -128,6 +128,7 @@ that came after. Status as of 2026-06-01:
 | M5 | Capsule + Mesh-no-op + ArrowVisual + AxisVisual + FrustumVisual primitives | ✓ A/B/C/D all landed |
 | M6 | Atom `LightFeatureProcessor` integration (point + spot light handles, per-frame `Set*` sync) | ✓ A + C landed; B was folded into A |
 | M7 | Shadows: cache `ProjectedShadowFP`, paired projected-shadow handle per spot, cooked Mesh caster + receiver, `SetShadowsEnabled` on `SimpleSpotLight` | ✓ A1, A2, B, C landed. Spot **cone tint now visible** (direction bug fixed, `8e717897`). Cast **shadow** still not visually confirmed — the one remaining M7 follow-up. |
+| M8 | Directional "sun" light (`DirectionalLightFeatureProcessor`) | ✓ landed `540471f1`. Enabled by default (was deferred at M6-A for a grey-screen that proved to be the FP-independent present race). 8 lux warm sun; `GZ_O3DE_DEMO_NO_SUN=1` / `GZ_O3DE_SUN_INTENSITY=<lux>`. Directional **cascade shadows** not yet wired — a follow-up alongside the spot shadow. |
 
 ### Commit stack (most recent on top)
 
@@ -298,10 +299,15 @@ In rough order of "most useful next":
 3. After (2), revisit [`o3de-m7-spot-shadow-not-visible`] — if the
    1-light failure traces back to shadow plumbing, that may already
    explain why the receiver doesn't show the spot's contribution.
-4. **Decide M8**: directional sun light (which was rolled back during
-   M6-A because it grey-screened the demo). Worth a fresh look now
-   that `ProjectedShadowFP` is registered and we have a real Mesh
-   receiver — the failure mode may have been related.
+4. **Shadows (the remaining lighting work)**: neither the spot's cast
+   shadow nor directional cascade shadows are visually confirmed. The
+   spot/directional LIGHTS both work now; the shadow *passes* are the
+   open piece. Start with a clean caster+receiver (a single PBR caster
+   between the light and an otherwise-dim floor patch) and a RenderDoc
+   capture to confirm the caster draws into the shadowmap; check whether
+   runtime-built meshes register as shadow casters at all (cooked vs
+   runtime, echoing the runtime-mesh saga). M8 directional sun itself is
+   DONE (landed `540471f1`, on by default).
 5. **Eventually push to `j-rivero/gz-rendering`**: needs explicit
    confirmation before pushing per the memory rule. No PR has been
    opened yet; commits are local only.
