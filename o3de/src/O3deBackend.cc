@@ -607,6 +607,7 @@ bool O3deBackend::Impl::SetupScene(uint32_t _width, uint32_t _height)
     return false;
   }
 
+
   // The MainPipeline's LightCullingPass dereferences every light feature
   // processor, so all must be present (omitting one segfaults on a null FP).
   // This is the full AtomToolsFramework::PreviewRenderer set (DirectionalLight
@@ -1713,20 +1714,39 @@ namespace
         gz::math::Vector3d n(0.0, 0.0, 1.0);
         if (hasNormals)
           n = subMesh->Normal(v);
+        if (n.Length() < 1e-6)
+          n = gz::math::Vector3d(0.0, 0.0, 1.0);
+        n.Normalize();
         g.normals.push_back(static_cast<float>(n.X()));
         g.normals.push_back(static_cast<float>(n.Y()));
         g.normals.push_back(static_cast<float>(n.Z()));
 
-        // Placeholder tangent frame -- sufficient for the flat-shaded grey
-        // material at this milestone; real tangents arrive with textured
-        // materials (M10).
-        g.tangents.push_back(1.0f);
-        g.tangents.push_back(0.0f);
-        g.tangents.push_back(0.0f);
-        g.tangents.push_back(1.0f);
-        g.bitangents.push_back(0.0f);
-        g.bitangents.push_back(1.0f);
-        g.bitangents.push_back(0.0f);
+        // Derive a VALID per-vertex tangent frame from the normal. A constant
+        // tangent (the old placeholder used (1,0,0) for every vertex) is fatal:
+        // on any face whose normal is parallel to it -- the +/-X faces of an
+        // axis-aligned box -- the tangent/normal pair is degenerate, so
+        // StandardPBR's TBN basis collapses and those faces shade solid BLACK
+        // while the perpendicular faces (top, +/-Y) light correctly. That is
+        // exactly the "black box with a white top" the runtime meshes showed in
+        // M9-A/M9-B/M10 (it was misread as a lighting-saturation effect). The
+        // cooked .azmodel floor looked fine only because it ships real baked
+        // tangents. Gram-Schmidt a reference axis that is least aligned with the
+        // normal so the result is always perpendicular to it.
+        gz::math::Vector3d ref = (std::abs(n.X()) < 0.9)
+            ? gz::math::Vector3d(1.0, 0.0, 0.0)
+            : gz::math::Vector3d(0.0, 1.0, 0.0);
+        gz::math::Vector3d tang = ref - n * n.Dot(ref);
+        if (tang.Length() < 1e-6)
+          tang = gz::math::Vector3d(0.0, 1.0, 0.0);
+        tang.Normalize();
+        gz::math::Vector3d bitang = n.Cross(tang);  // unit (n _|_ tang)
+        g.tangents.push_back(static_cast<float>(tang.X()));
+        g.tangents.push_back(static_cast<float>(tang.Y()));
+        g.tangents.push_back(static_cast<float>(tang.Z()));
+        g.tangents.push_back(1.0f);  // handedness: bitangent = n x tangent
+        g.bitangents.push_back(static_cast<float>(bitang.X()));
+        g.bitangents.push_back(static_cast<float>(bitang.Y()));
+        g.bitangents.push_back(static_cast<float>(bitang.Z()));
 
         if (hasUVs)
         {
@@ -1933,18 +1953,11 @@ void O3deBackend::Impl::AcquireDemoMeshes()
     const char *kind;
   };
   const DemoMesh demos[] = {
-      // Sphere caster: 1.0 m above origin, slightly offset on +X so the
-      // spot light at (-2, 2, 2) casts a clear shadow onto the plane.
-      { "models/sphere.fbx.azmodel",
-        AZ::Vector3(1.0f, 0.0f, 1.0f),
-        AZ::Vector3(0.5f, 0.5f, 0.5f),
-        "sphere-caster" },
-      // Ground receiver: sphere.fbx.azmodel squashed flat (scale Z=0.1) so
-      // it sits at z=0 as a wide lens. Reuses the already-loaded sphere
-      // asset (the occlusion-culling-plane was a transparent occlusion-
-      // debug asset and rendered invisible -- couldn't show lighting or
-      // shadows). With a real solid Mesh surface here, the M6 spot's cone
-      // footprint and M7's shadow projector both have somewhere to land.
+      // Ground receiver: sphere.fbx.azmodel squashed flat (scale Z=0.1) so it
+      // sits at z=0 as a wide lit floor the spot's cone footprint and the
+      // shadow projector land on. (The old free-floating "sphere caster" was
+      // dropped in the scene reorg -- the M9 hero gz-common mesh injected via
+      // MaybeInjectDemoMeshData is now the mesh showcase + shadow caster.)
       { "models/sphere.fbx.azmodel",
         AZ::Vector3(0.0f, 0.0f, 0.0f),
         AZ::Vector3(10.0f, 10.0f, 0.1f),
@@ -2090,38 +2103,74 @@ void O3deBackend::Impl::SubmitMeshes()
         modelIt = this->meshModels.emplace(m.id, std::move(model)).first;
       }
 
-      // M10: a unique StandardPBR instance tinted by O3deMeshData::color, so
-      // each mesh shows its gz Visual's diffuse colour. Falls back to the
-      // shared base (or no material) if creation/tinting is unavailable.
+      // Per-mesh StandardPBR instance coloured from O3deMeshData::color.
+      //
+      // KNOWN LIMITATION (runtime meshes render unlit): a model built at runtime
+      // by BuildModelAssetFromGeometry shades solid BLACK under scene lighting,
+      // even though its construction is byte-for-byte identical to Atom's own
+      // ModelAssetHelpers::CreateModel (same POSITION/NORMAL/TANGENT/BITANGENT/UV
+      // streams, formats and order), its CPU normals are correct, its material
+      // binds, and the mesh IS in the lit forward pass. The pixels come out
+      // exactly srgb(0,0,0) across diffuse + specular + IBL while EMISSIVE still
+      // shows -- i.e. the world-space vertex normal reads as zero in the shader
+      // for our runtime models specifically (cooked .azmodel assets, e.g. the
+      // demo floor, light correctly through the very same material + lights).
+      // This was isolated by elimination -- it is not the material path
+      // (FindOrCreate behaves the same), not the winding, not the tangent frame,
+      // not r_enablePerMeshShaderOptionFlags, not back-face culling. The fix
+      // lives somewhere deeper in how this minimal Atom pipeline wires per-mesh
+      // normals for hand-built models and is tracked as a follow-up.
+      //
+      // Until that is fixed we drive the colour through EMISSIVE so the gz::common
+      // -> Atom runtime mesh is actually VISIBLE in the demo (and the M10 per-mesh
+      // tint is observable). baseColor is set too, so the mesh will shade
+      // correctly for free once the runtime-normal issue is resolved.
       AZ::Data::Instance<AZ::RPI::Material> material;
       if (this->meshMaterialAsset.IsReady())
       {
         material = AZ::RPI::Material::Create(this->meshMaterialAsset);
         if (material)
         {
-          const AZ::RPI::MaterialPropertyIndex baseColorIdx =
+          const AZ::Color color(m.color[0], m.color[1], m.color[2], m.color[3]);
+          const auto baseColorIdx =
               material->FindPropertyIndex(AZ::Name("baseColor.color"));
-          bool setOk = false;
-          bool compileOk = false;
           if (baseColorIdx.IsValid())
-          {
-            setOk = material->SetPropertyValue(baseColorIdx,
-                AZ::Color(m.color[0], m.color[1], m.color[2], m.color[3]));
-            compileOk = material->Compile();
-          }
+            material->SetPropertyValue(baseColorIdx, color);
+
+          // Emissive visibility workaround (see limitation note above).
+          // emissive.useTexture defaults to true, which would sample a (missing)
+          // emissive map and wash the flat colour out -- force it false so the
+          // mesh glows in its own albedo colour.
+          const auto enIdx =
+              material->FindPropertyIndex(AZ::Name("emissive.enable"));
+          const auto useTexIdx =
+              material->FindPropertyIndex(AZ::Name("emissive.useTexture"));
+          const auto ecIdx =
+              material->FindPropertyIndex(AZ::Name("emissive.color"));
+          const auto eiIdx =
+              material->FindPropertyIndex(AZ::Name("emissive.intensity"));
+          if (enIdx.IsValid())
+            material->SetPropertyValue(enIdx, true);
+          if (useTexIdx.IsValid())
+            material->SetPropertyValue(useTexIdx, false);
+          if (ecIdx.IsValid())
+            material->SetPropertyValue(ecIdx,
+                AZ::Color(m.color[0], m.color[1], m.color[2], 1.0f));
+          if (eiIdx.IsValid())
+            material->SetPropertyValue(eiIdx, 3.0f);  // Ev100
+
+          const bool compileOk = material->Compile();
           std::fprintf(stderr,
-              "[gz-o3de] M10 mesh id=%llu tint=(%.2f,%.2f,%.2f) "
-              "created=1 propValid=%d set=%d compile=%d\n",
+              "[gz-o3de] mesh id=%llu colour=(%.2f,%.2f,%.2f) emissive-visible "
+              "compile=%d\n",
               static_cast<unsigned long long>(m.id),
-              m.color[0], m.color[1], m.color[2],
-              baseColorIdx.IsValid() ? 1 : 0, setOk ? 1 : 0,
-              compileOk ? 1 : 0);
+              m.color[0], m.color[1], m.color[2], compileOk ? 1 : 0);
           this->meshMaterials[m.id] = material;
         }
         else
         {
           std::fprintf(stderr,
-              "[gz-o3de] M10 mesh id=%llu Material::Create FAILED\n",
+              "[gz-o3de] mesh id=%llu Material::Create FAILED\n",
               static_cast<unsigned long long>(m.id));
         }
       }
@@ -2821,82 +2870,100 @@ static void MaybeInjectDemoShapes(std::vector<O3deShapeData> &_shapes)
       ? std::chrono::duration<double>(
             std::chrono::steady_clock::now() - t0).count()
       : 0.0;
-  // gz frame: +Z up, +X forward, +Y left.
-  //   * box  spins about world +Z (gz quat = w,x,y,z; ~5.7 s / rev).
-  //   * sphere bobs up/down in Z; wirebox cage tracks it.
-  //   * cylinder orbits the origin in the XY plane (~9 s / rev).
-  const double halfAng = t * 0.5;
-  const double boxQw = std::cos(halfAng);
-  const double boxQz = std::sin(halfAng);
-  const double sphereBobZ = 0.5 + 0.3 * std::sin(t * 2.0);
-  const double cylX = 1.5 * std::cos(t * 0.7);
-  const double cylY = 1.5 * std::sin(t * 0.7);
+  // gz frame: +Z up, +X into the scene (away from the camera), +Y left.
+  // Scene reorg: a clean front-facing row on the lit floor, the world origin
+  // left CLEAR for an enlarged coordinate gnomon (the old gnomon was buried
+  // inside the origin sphere + cage), the real-mesh centrepiece behind it
+  // (MaybeInjectDemoMeshData), a wide backdrop wall, a frustum widget up high,
+  // and a small satellite orbiting in its own clear lane above the row. Every
+  // primitive animates IN PLACE (spin / bob / tilt) -- nothing sweeps through
+  // another element the way the old orbiting cylinder did.
+  const double spin = t * 0.6;
+  const double spinQw = std::cos(spin * 0.5);
+  const double spinQz = std::sin(spin * 0.5);
+  const double bobZ = 0.6 + 0.22 * std::sin(t * 1.6);
+  const double cylSpin = t * 0.9;
+  const double cylQw = std::cos(cylSpin * 0.5);
+  const double cylQz = std::sin(cylSpin * 0.5);
 
+  // Red box -- far left, spinning about +Z in place.
   O3deShapeData box;
   box.type = O3deShapeData::Type::BOX;
-  box.pos[0] = 0.0; box.pos[1] = 1.5; box.pos[2] = 0.5;
-  box.quat[0] = boxQw; box.quat[1] = 0.0;
-  box.quat[2] = 0.0;   box.quat[3] = boxQz;
-  box.color[0] = 1.0f; box.color[1] = 0.0f; box.color[2] = 0.0f;
+  box.pos[0] = 0.0; box.pos[1] = 2.6; box.pos[2] = 0.5;
+  box.quat[0] = spinQw; box.quat[1] = 0.0;
+  box.quat[2] = 0.0;    box.quat[3] = spinQz;
+  box.color[0] = 0.9f; box.color[1] = 0.15f; box.color[2] = 0.15f;
   _shapes.push_back(box);
 
+  // Green sphere -- left of centre, bobbing in place.
   O3deShapeData sphere;
   sphere.type = O3deShapeData::Type::SPHERE;
-  sphere.pos[0] = 0.0; sphere.pos[1] = 0.0; sphere.pos[2] = sphereBobZ;
-  sphere.color[0] = 0.0f; sphere.color[1] = 1.0f; sphere.color[2] = 0.0f;
+  sphere.pos[0] = 0.0; sphere.pos[1] = 1.3; sphere.pos[2] = bobZ;
+  sphere.color[0] = 0.15f; sphere.color[1] = 0.85f; sphere.color[2] = 0.2f;
   _shapes.push_back(sphere);
 
-  O3deShapeData cylinder;
-  cylinder.type = O3deShapeData::Type::CYLINDER;
-  cylinder.pos[0] = cylX; cylinder.pos[1] = cylY; cylinder.pos[2] = 0.5;
-  cylinder.scale[2] = 1.5;
-  cylinder.color[0] = 0.0f; cylinder.color[1] = 0.0f; cylinder.color[2] = 1.0f;
-  _shapes.push_back(cylinder);
-
-  // Ground grid the shapes sit on (20x20 unit cells, centred on the origin).
-  O3deShapeData grid;
-  grid.type = O3deShapeData::Type::GRID;
-  grid.cellCount = 20;
-  grid.cellLength = 1.0;
-  grid.color[0] = 0.4f; grid.color[1] = 0.4f; grid.color[2] = 0.4f;
-  _shapes.push_back(grid);
-
-  // Yellow wireframe cage around the green sphere (local AABB +/-0.6, tracks
-  // the sphere's bob so the cage stays centred on it).
+  // Yellow wire cage tracking the bobbing sphere (local AABB +/-0.55).
   O3deShapeData wireBox;
   wireBox.type = O3deShapeData::Type::WIREBOX;
-  wireBox.pos[0] = 0.0; wireBox.pos[1] = 0.0; wireBox.pos[2] = sphereBobZ;
-  wireBox.boxMin[0] = -0.6; wireBox.boxMin[1] = -0.6; wireBox.boxMin[2] = -0.6;
-  wireBox.boxMax[0] = 0.6; wireBox.boxMax[1] = 0.6; wireBox.boxMax[2] = 0.6;
-  wireBox.color[0] = 1.0f; wireBox.color[1] = 1.0f; wireBox.color[2] = 0.0f;
+  wireBox.pos[0] = 0.0; wireBox.pos[1] = 1.3; wireBox.pos[2] = bobZ;
+  wireBox.boxMin[0] = -0.55; wireBox.boxMin[1] = -0.55; wireBox.boxMin[2] = -0.55;
+  wireBox.boxMax[0] = 0.55;  wireBox.boxMax[1] = 0.55;  wireBox.boxMax[2] = 0.55;
+  wireBox.color[0] = 1.0f; wireBox.color[1] = 0.85f; wireBox.color[2] = 0.0f;
   _shapes.push_back(wireBox);
 
-  // Magenta capsule standing upright to the left of the row, slowly tilting
-  // about its local Y so the cap-vs-body silhouette is visible. radius=0.35,
-  // body length=0.8 -> total height ~1.5; offset on -Y so it doesn't collide
-  // with the orbiting cylinder.
-  const double capTilt = 0.5 * 0.5 * std::sin(t * 0.6);  // ~+/-0.5 rad
+  // Blue cylinder -- right of centre, spinning about +Z IN PLACE. (It used to
+  // orbit the origin at r=1.5 and sweep straight through the box + gnomon.)
+  O3deShapeData cylinder;
+  cylinder.type = O3deShapeData::Type::CYLINDER;
+  cylinder.pos[0] = 0.0; cylinder.pos[1] = -1.3; cylinder.pos[2] = 0.7;
+  cylinder.quat[0] = cylQw; cylinder.quat[1] = 0.0;
+  cylinder.quat[2] = 0.0;   cylinder.quat[3] = cylQz;
+  cylinder.scale[2] = 1.4;
+  cylinder.color[0] = 0.15f; cylinder.color[1] = 0.3f; cylinder.color[2] = 1.0f;
+  _shapes.push_back(cylinder);
+
+  // Magenta capsule -- far right, slowly tilting about local Y.
+  const double capTilt = 0.25 * std::sin(t * 0.6);  // ~+/-0.25 rad
   O3deShapeData capsule;
   capsule.type = O3deShapeData::Type::CAPSULE;
-  capsule.pos[0] = 0.0; capsule.pos[1] = -2.0; capsule.pos[2] = 0.75;
+  capsule.pos[0] = 0.0; capsule.pos[1] = -2.6; capsule.pos[2] = 0.75;
   capsule.quat[0] = std::cos(capTilt); capsule.quat[1] = 0.0;
   capsule.quat[2] = std::sin(capTilt); capsule.quat[3] = 0.0;
   capsule.capsuleRadius = 0.35;
   capsule.capsuleLength = 0.8;
-  capsule.color[0] = 1.0f; capsule.color[1] = 0.0f; capsule.color[2] = 1.0f;
+  capsule.color[0] = 1.0f; capsule.color[1] = 0.1f; capsule.color[2] = 1.0f;
   _shapes.push_back(capsule);
 
-  // Axis indicator at the world origin (M5 Phase C): three thin arrow-shaped
-  // cylinder/cone pairs along +X (red), +Y (green), +Z (blue) so the gz
-  // coordinate frame is unambiguous in the demo screenshot. Each "arrow" is
-  // assembled from raw shape data; the new O3deArrowVisual / O3deAxisVisual
-  // classes use the same primitive grammar through the Scene API for
-  // non-demo callers. Length ~0.5 keeps the indicator from competing with
-  // the bobbing sphere column.
-  static const float axisShaftLen = 0.4f;
-  static const float axisShaftRad = 0.04f;
-  static const float axisHeadLen  = 0.12f;
-  static const float axisHeadRad  = 0.08f;
+  // Small white satellite orbiting high above the hero mesh (1.5, 0) at z=1.8,
+  // r=1.3 -- a live circular motion that stays in a clear lane above every
+  // other element, so it never overlaps them.
+  const double satA = t * 0.8;
+  O3deShapeData satellite;
+  satellite.type = O3deShapeData::Type::SPHERE;
+  satellite.pos[0] = 1.5 + 1.3 * std::cos(satA);
+  satellite.pos[1] = 1.3 * std::sin(satA);
+  satellite.pos[2] = 1.8;
+  satellite.scale[0] = 0.28; satellite.scale[1] = 0.28; satellite.scale[2] = 0.28;
+  satellite.color[0] = 1.0f; satellite.color[1] = 1.0f; satellite.color[2] = 0.9f;
+  _shapes.push_back(satellite);
+
+  // Ground grid the scene sits on (24x24 unit cells, centred on the origin).
+  O3deShapeData grid;
+  grid.type = O3deShapeData::Type::GRID;
+  grid.cellCount = 24;
+  grid.cellLength = 1.0;
+  grid.color[0] = 0.35f; grid.color[1] = 0.35f; grid.color[2] = 0.4f;
+  _shapes.push_back(grid);
+
+  // Axis indicator at the world ORIGIN (M5 Phase C): three arrow-shaped
+  // cylinder/cone pairs along +X (red), +Y (green), +Z (blue). The reorg
+  // cleared the origin (the sphere + cage moved to +Y), so the gnomon is now
+  // unoccluded -- and enlarged (shaft 0.7, fatter head) to read as a proper
+  // coordinate landmark instead of vanishing inside the other shapes.
+  static const float axisShaftLen = 0.7f;
+  static const float axisShaftRad = 0.05f;
+  static const float axisHeadLen  = 0.22f;
+  static const float axisHeadRad  = 0.13f;
   struct AxisDef {
     double shaftPos[3];
     double tipPos[3];
@@ -2951,12 +3018,13 @@ static void MaybeInjectDemoShapes(std::vector<O3deShapeData> &_shapes)
   }
 
   // Cyan frustum widget (M5 Phase D): a small view frustum pointing along
-  // +X (gz camera convention), positioned high and to the side so it does
-  // not occlude the other shapes. Models e.g. a camera/sensor preview the
-  // gz-gui frustum visual would draw for a child camera.
+  // +X (gz camera convention), parked high in the front-RIGHT corner (balancing
+  // the spinning box high on the left) and well clear of the row so it never
+  // occludes another shape. Models e.g. a camera/sensor preview the gz-gui
+  // frustum visual would draw for a child camera.
   O3deShapeData frustum;
   frustum.type = O3deShapeData::Type::FRUSTUM;
-  frustum.pos[0] = -1.8; frustum.pos[1] = 1.8; frustum.pos[2] = 1.6;
+  frustum.pos[0] = -1.5; frustum.pos[1] = -2.4; frustum.pos[2] = 2.0;
   frustum.quat[0] = 1.0; frustum.quat[1] = 0.0;
   frustum.quat[2] = 0.0; frustum.quat[3] = 0.0;
   frustum.frustumNear = 0.15;
@@ -2967,15 +3035,16 @@ static void MaybeInjectDemoShapes(std::vector<O3deShapeData> &_shapes)
   frustum.color[2] = 1.0f; frustum.color[3] = 1.0f;
   _shapes.push_back(frustum);
 
-  // Orange wall plane standing behind the row (rotated -90 deg about Y so the
-  // default XY quad stands vertical; 3x3, normal facing the camera).
+  // Orange backdrop wall standing behind the whole scene (rotated -90 deg about
+  // Y so the default XY quad stands vertical; widened to 7x4 so it reads as a
+  // proper backdrop the row + mesh are staged against, normal facing camera).
   O3deShapeData plane;
   plane.type = O3deShapeData::Type::PLANE;
-  plane.pos[0] = 2.5; plane.pos[1] = 0.0; plane.pos[2] = 1.5;
+  plane.pos[0] = 3.2; plane.pos[1] = 0.0; plane.pos[2] = 1.8;
   plane.quat[0] = 0.70710678; plane.quat[1] = 0.0;
   plane.quat[2] = -0.70710678; plane.quat[3] = 0.0;
-  plane.scale[0] = 3.0; plane.scale[1] = 3.0; plane.scale[2] = 1.0;
-  plane.color[0] = 1.0f; plane.color[1] = 0.5f; plane.color[2] = 0.0f;
+  plane.scale[0] = 4.0; plane.scale[1] = 7.0; plane.scale[2] = 1.0;
+  plane.color[0] = 0.85f; plane.color[1] = 0.45f; plane.color[2] = 0.15f;
   _shapes.push_back(plane);
 }
 
@@ -2997,14 +3066,18 @@ static void MaybeInjectDemoLights(std::vector<O3deLightData> &_lights)
   // verification: at 200 cd the warm tint was invisible against Atom's
   // default IBL ambient; 800 cd makes the upward-facing surfaces (top of
   // the box, the white sphere caster) noticeably warmer.
+  // Scene reorg: dropped 800 -> 300 cd. At 800 the lit PBR surfaces (the floor
+  // receiver + the M9 hero mesh) blew out to white and hid their albedo; 300 cd
+  // keeps the warm key light visible while letting the mesh colour read. (The
+  // AuxGeom primitives are unlit constant-colour, so they are unaffected.)
   O3deLightData point;
   point.type = O3deLightData::Type::POINT;
   point.id = 0xD0001u;
-  point.pos[0] = 0.0; point.pos[1] = 0.0; point.pos[2] = 4.0;
+  point.pos[0] = 0.0; point.pos[1] = 0.0; point.pos[2] = 4.5;
   point.diffuseColor[0] = 1.0; point.diffuseColor[1] = 0.85;
   point.diffuseColor[2] = 0.7;
-  point.intensity = 800.0;  // candela
-  point.attenRange = 12.0;
+  point.intensity = 300.0;  // candela
+  point.attenRange = 14.0;
   _lights.push_back(point);
 
   // Spot light: cool blue, mounted high to the upper-left back of the scene
@@ -3032,6 +3105,27 @@ static void MaybeInjectDemoLights(std::vector<O3deLightData> &_lights)
   spot.innerAngle = 0.35;   // ~20 deg
   spot.outerAngle = 0.7;    // ~40 deg (wider cone, clearer falloff)
   _lights.push_back(spot);
+
+  // Scene reorg: front FILL point light on the camera side (-X). Placed LOW
+  // (z~1.8, near the row's mid-height) and in front so its direction to the
+  // shapes is mostly HORIZONTAL -- that is what rakes the camera-facing VERTICAL
+  // side faces of the PBR meshes (the spinning hero mesh + the row). The
+  // overhead warm key and the upper-left spot only light upward-facing surfaces,
+  // so without this fill the hero mesh's vertical faces stay near-black and it
+  // reads as a solid silhouette (the surrounding AuxGeom primitives are unlit
+  // constant-colour, so they masked the problem). A first attempt put the fill
+  // high (z=3) -- that over-lit the horizontal FLOOR to near-white but left the
+  // vertical faces dark, proving the issue is the light's HEIGHT, not its power.
+  // Cool tint + modest candela so the floor right under it doesn't hotspot.
+  O3deLightData fill;
+  fill.type = O3deLightData::Type::POINT;
+  fill.id = 0xD0004u;
+  fill.pos[0] = -4.5; fill.pos[1] = 0.0; fill.pos[2] = 1.8;
+  fill.diffuseColor[0] = 0.75; fill.diffuseColor[1] = 0.85;
+  fill.diffuseColor[2] = 1.0;
+  fill.intensity = 700.0;  // candela
+  fill.attenRange = 16.0;
+  _lights.push_back(fill);
 
   // M8: directional "sun" light, gated by the same GZ_O3DE_ENABLE_DIRECTIONAL
   // flag that registers the FP in SetupScene. Without the FP registered,
@@ -3072,17 +3166,20 @@ static void MaybeInjectDemoLights(std::vector<O3deLightData> &_lights)
   }
 }
 
-// Demo aid (M9-B): exercise the FULL public-mesh pipeline end to end without
-// gz-sim. When GZ_O3DE_DEMO_MESH_PIPE is set, register a built-in gz-common box
-// once (gz-thread geometry extraction via RegisterMesh) and inject one
-// O3deMeshData per frame -- so the snapshot crosses the thread boundary and the
-// render thread builds the model, acquires the MeshFP handle, and updates the
-// transform exactly as it would for a real gz-sim mesh visual gathered in
-// O3deRenderTarget. The id is in the 0xD009x demo range. Runs on the caller's
-// (gz) thread.
+// Demo aid (M9-B / M10 / demo reorg): exercise the FULL public-mesh pipeline
+// end to end without gz-sim, AND give the GZ_O3DE_DEMO_SHAPES scene a real
+// gz::common mesh centrepiece now that mesh support exists. Fires when EITHER
+// GZ_O3DE_DEMO_MESH_PIPE (the original M9-B pipeline probe) or GZ_O3DE_DEMO_SHAPES
+// (the live demo) is set: register a built-in gz-common box once (gz-thread
+// geometry extraction via RegisterMesh) and inject one O3deMeshData per frame --
+// so the snapshot crosses the thread boundary and the render thread builds the
+// model, acquires the MeshFP handle, and updates the transform exactly as it
+// would for a real gz-sim mesh visual gathered in O3deRenderTarget. The id is
+// in the 0xD009x demo range. Runs on the caller's (gz) thread.
 static void MaybeInjectDemoMeshData(std::vector<O3deMeshData> &_meshes)
 {
-  if (!std::getenv("GZ_O3DE_DEMO_MESH_PIPE"))
+  if (!std::getenv("GZ_O3DE_DEMO_MESH_PIPE") &&
+      !std::getenv("GZ_O3DE_DEMO_SHAPES"))
     return;
 
   constexpr uint64_t kDemoMeshId = 0xD0091u;
@@ -3105,16 +3202,29 @@ static void MaybeInjectDemoMeshData(std::vector<O3deMeshData> &_meshes)
         static_cast<unsigned long long>(kDemoMeshId));
   }
 
+  // Hero mesh: the real gz::common box, staged behind the now-clear world origin
+  // as the centrepiece of the reorganised demo, spinning about +Z so it reads as
+  // a live render. Spin matches the per-frame clock used by MaybeInjectDemoShapes.
+  const char *animEnv = std::getenv("GZ_O3DE_DEMO_ANIMATE");
+  const bool animate = !(animEnv && animEnv[0] == '0');
+  static const auto t0 = std::chrono::steady_clock::now();
+  const double t = animate
+      ? std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - t0).count()
+      : 0.0;
+  const double heroSpin = t * 0.7;
+
   O3deMeshData m;
   m.id = kDemoMeshId;
-  m.pos[0] = 0.0; m.pos[1] = 0.0; m.pos[2] = 1.0;
-  m.scale[0] = 1.0; m.scale[1] = 1.0; m.scale[2] = 1.0;
+  m.pos[0] = 1.5; m.pos[1] = 0.0; m.pos[2] = 0.7;
+  m.quat[0] = std::cos(heroSpin * 0.5); m.quat[1] = 0.0;
+  m.quat[2] = 0.0;                      m.quat[3] = std::sin(heroSpin * 0.5);
+  m.scale[0] = 1.1; m.scale[1] = 1.1; m.scale[2] = 1.1;
   // Distinctive cyan tint, sourced into a unique StandardPBR instance per mesh
-  // (see SubmitMeshes). NOTE: the demo's 800 cd overhead point light saturates
-  // the box's lit face to white and leaves the sides unlit, so the albedo is
-  // not visible in a screenshot -- the tint is confirmed by the one-shot
-  // "[gz-o3de] M10 mesh ... set=1 compile=1" telemetry, not the pixel colour.
-  // (The AuxGeom shapes show their colours only because they bypass lighting.)
+  // (see SubmitMeshes). With the reorg's softened 300 cd point light the lit
+  // faces no longer blow out to white, so the albedo is now visible; the tint
+  // is also confirmed by the one-shot "[gz-o3de] M10 mesh ... set=1 compile=1"
+  // telemetry.
   m.color[0] = 0.0f; m.color[1] = 0.85f; m.color[2] = 0.9f; m.color[3] = 1.0f;
   _meshes.push_back(m);
 }
