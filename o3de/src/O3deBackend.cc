@@ -1959,7 +1959,7 @@ void O3deBackend::Impl::AcquireDemoMeshes()
     AZ::Vector3 scale;
     const char *kind;
   };
-  const DemoMesh demos[] = {
+  std::vector<DemoMesh> demos = {
       // Ground receiver: sphere.fbx.azmodel squashed flat (scale Z=0.1) so it
       // sits at z=0 as a wide lit floor the spot's cone footprint and the
       // shadow projector land on. (The old free-floating "sphere caster" was
@@ -1970,6 +1970,34 @@ void O3deBackend::Impl::AcquireDemoMeshes()
         AZ::Vector3(10.0f, 10.0f, 0.1f),
         "flat-sphere-receiver" },
   };
+  // SHADOW A/B DIAGNOSTIC (GZ_O3DE_COOKED_CASTER): inject a *cooked* elevated
+  // sphere caster inside the spot beam. The cooked sphere wears basic_grey
+  // (a real Atom StandardPBR material that ships the shadowmap depth-pass
+  // shader variant), so it MUST draw into the spot shadowmap. The runtime
+  // gz-common hero box is the suspect caster. Decisive A/B: if this cooked
+  // ball throws a shadow on the lit cone but the runtime box does not, the
+  // runtime model's material is missing the shadow variant; if NEITHER casts,
+  // the shadow setup itself (bias/receiver/frustum) is the fault, not the
+  // material. Elevated at the spot's aim point (1.5,0,~1.3) so its shadow
+  // lands on the floor just beyond it, inside the lit footprint.
+  if (std::getenv("GZ_O3DE_COOKED_CASTER"))
+  {
+    // Float over OPEN, camera-visible, spot-lit floor away from the box/cylinder
+    // so the cast shadow lands on clear floor with nothing to occlude or confuse
+    // it. Position/scale overridable so the beam sweep needs no rebuild.
+    float cx = 2.5f, cy = -1.0f, cz = 1.5f, cs = 0.8f;
+    if (const char *p = std::getenv("GZ_O3DE_CASTER_POS"))
+      std::sscanf(p, "%f %f %f", &cx, &cy, &cz);
+    if (const char *s = std::getenv("GZ_O3DE_CASTER_SCALE"))
+      cs = std::atof(s);
+    demos.push_back({ "models/sphere.fbx.azmodel",
+        AZ::Vector3(cx, cy, cz),
+        AZ::Vector3(cs, cs, cs),
+        "cooked-sphere-caster" });
+    std::fprintf(stderr,
+        "[gz-o3de] SHADOW A/B: cooked sphere caster @ (%.2f,%.2f,%.2f) scale %.2f\n",
+        cx, cy, cz, cs);
+  }
 
   // Load the shared mid-grey PBR material once -- the sphere asset's
   // default-baked material has a near-white albedo that washes out the
@@ -2393,11 +2421,20 @@ void O3deBackend::Impl::SubmitLights()
             aznumeric_cast<float>(light.innerAngle),
             aznumeric_cast<float>(light.outerAngle));
 
-        // M7 Phase A2: paired projected shadow. SimpleSpotLight has no
-        // shadow path of its own -- the ProjectedShadowFP renders the depth
-        // map separately and the lighting pass samples it via the light's
-        // world transform. We acquire one ShadowId per spot id and update
-        // its descriptor every frame from the same source-of-truth pose.
+        // M7 Phase A2: paired projected shadow.
+        // CORRECTION (2026-06-03, verified against Atom source + runtime A/B):
+        // SimpleSpotLight DOES own a self-contained shadow path -- its
+        // SetShadowsEnabled() internally calls m_shadowFeatureProcessor->
+        // AcquireShadow() and frustum-configures it from the cone in
+        // UpdateShadow(). That internal shadow is what actually renders (proven:
+        // a cooked sphere AND the runtime hero box both throw clear cast shadows
+        // when floated over open floor -- see screenshots/m7-shadow-ab-both-cast
+        // .png). So THIS manual ProjectedShadow is REDUNDANT: a second, unlinked
+        // shadow handle that consumes an atlas slot and renders a depth map
+        // nothing samples. It is harmless (proven not to break shadows) but
+        // wasteful. TODO(cleanup): remove this block + the spotShadowHandles map
+        // + their release path, leaving SimpleSpotLight's own shadow. Kept for
+        // now to avoid an unverified behavior change; re-verify shadows after.
         if (this->projectedShadowFp && !noShadow)
         {
           auto sh = this->spotShadowHandles.find(light.id);
@@ -3361,6 +3398,14 @@ static void MaybeInjectDemoMeshData(std::vector<O3deMeshData> &_meshes)
   O3deMeshData m;
   m.id = kDemoMeshId;
   m.pos[0] = 1.5; m.pos[1] = 0.0; m.pos[2] = 0.7;
+  // Diagnostic: float the runtime hero box over open floor for a clean shadow
+  // A/B against the cooked caster (GZ_O3DE_HERO_POS="x y z"). No rebuild to move.
+  if (const char *hp = std::getenv("GZ_O3DE_HERO_POS"))
+  {
+    float hx = 1.5f, hy = 0.0f, hz = 0.7f;
+    std::sscanf(hp, "%f %f %f", &hx, &hy, &hz);
+    m.pos[0] = hx; m.pos[1] = hy; m.pos[2] = hz;
+  }
   m.quat[0] = std::cos(heroSpin * 0.5); m.quat[1] = 0.0;
   m.quat[2] = 0.0;                      m.quat[3] = std::sin(heroSpin * 0.5);
   m.scale[0] = 1.1; m.scale[1] = 1.1; m.scale[2] = 1.1;
