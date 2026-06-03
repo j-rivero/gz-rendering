@@ -2132,16 +2132,45 @@ void O3deBackend::Impl::SubmitMeshes()
       // changed nothing), and the stream construction is byte-for-byte identical
       // to Atom's own ModelAssetHelpers::CreateModel. The fix lives somewhere
       // deeper in how this minimal Atom pipeline wires per-mesh normals for
-      // hand-built models. Next diagnostic: wire a RenderDebug "normal" view pass
-      // to confirm the world normal is zero on screen, and A/B our builder
-      // against ModelAssetHelpers::CreateModel directly. Tracked as a follow-up.
+      // hand-built models.
+      //
+      // DECISIVE PARTITION (2026-06-03): the GZ_O3DE_MESH_DEBUG_NORMALS test below
+      // proved the OBJECT-space NORMAL stream reaches the pixel shader fully
+      // correct (box faces sampled as clean orthonormal axis normals: +Y front,
+      // -X left, -Z bottom). So construction/streams/data are NOT the bug. The
+      // DebugVertexStreams material outputs the normal UNTRANSFORMED and works;
+      // StandardPBR transforms it by the per-object normal matrix and yields zero
+      // lighting -> the defect is strictly in the WORLD-normal path for runtime
+      // models, not in the mesh. Next diagnostic: visualize the WORLD normal (or
+      // dump the ObjectSrg normal matrix) to confirm it degenerates for hand-built
+      // models while the position transform stays correct.
       //
       // Until that is fixed we drive the colour through EMISSIVE so the gz::common
       // -> Atom runtime mesh is actually VISIBLE in the demo (and the M10 per-mesh
       // tint is observable). baseColor is set too, so the mesh will shade
       // correctly for free once the runtime-normal issue is resolved.
       AZ::Data::Instance<AZ::RPI::Material> material;
-      if (this->meshMaterialAsset.IsReady())
+      // DIRECT-EVIDENCE DIAGNOSTIC (runtime-mesh-unlit): Atom's DebugVertexStreams
+      // material reads `m_normal : NORMAL` UNCONDITIONALLY and outputs it as RGB
+      // (normalize(n)*0.5+0.5). Applying it to the runtime mesh answered the open
+      // question: the box renders COLOURED with correct per-face normals, so the
+      // vertex NORMAL DOES reach the shader and the bug is downstream in the
+      // world-normal/lighting path (see the partition note above). Kept as a
+      // re-runnable diagnostic, gated by GZ_O3DE_MESH_DEBUG_NORMALS (off by
+      // default): set it to recolour runtime meshes by their object-space normal.
+      if (std::getenv("GZ_O3DE_MESH_DEBUG_NORMALS"))
+      {
+        auto dbgAsset = AZ::RPI::AssetUtils::LoadCriticalAsset<
+            AZ::RPI::MaterialAsset>(
+                "materials/special/debugvertexstreams.azmaterial",
+                AZ::RPI::AssetUtils::TraceLevel::Warning);
+        if (dbgAsset.IsReady())
+          material = AZ::RPI::Material::FindOrCreate(dbgAsset);
+        std::fprintf(stderr,
+            "[gz-o3de] DBG normals-view material ready=%d instance=%d\n",
+            dbgAsset.IsReady() ? 1 : 0, material ? 1 : 0);
+      }
+      else if (this->meshMaterialAsset.IsReady())
       {
         material = AZ::RPI::Material::Create(this->meshMaterialAsset);
         if (material)
