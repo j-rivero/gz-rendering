@@ -1786,7 +1786,8 @@ namespace
   // construction -- MUST run on the render thread (see the AssetManager note on
   // O3deBackend::Impl).
   AZ::Data::Asset<AZ::RPI::ModelAsset> BuildModelAssetFromGeometry(
-      const MeshGeometryCpu &_geom, const AZ::Name &_name)
+      const MeshGeometryCpu &_geom, const AZ::Name &_name,
+      const AZ::Data::Asset<AZ::RPI::MaterialAsset> &_defaultMaterial = {})
   {
     AZ::Data::Asset<AZ::RPI::ModelAsset> nullAsset;
     if (_geom.Empty())
@@ -1853,11 +1854,19 @@ namespace
     modelCreator.Begin(AZ::Uuid::CreateRandom());
     modelCreator.SetName(_name.GetStringView());
     // One material slot (stableId 0) to satisfy the mesh's SetMeshMaterialSlot(0)
-    // reference. The actual appearance comes from the material supplied to
-    // AcquireMesh via MeshHandleDescriptor, not this empty default slot.
+    // reference. Assign a DEFAULT MATERIAL ASSET to the slot so the model matches
+    // how cooked .azmodel slots (which carry their baked material) and the
+    // WhiteBox gem (which builds models at runtime and lights correctly) are set
+    // up -- a slot left empty is non-canonical. NOTE: this was tested as a fix
+    // for the runtime-mesh-unlit bug (see SubmitMeshes) and did NOT resolve it
+    // (the mesh still shades black under lighting), so it is kept only as correct
+    // construction, not as the fix. The MeshHandleDescriptor override still
+    // controls the final per-mesh appearance.
     AZ::RPI::ModelMaterialSlot slot;
     slot.m_stableId = 0;
     slot.m_displayName = AZ::Name("default");
+    if (_defaultMaterial.GetId().IsValid())
+      slot.m_defaultMaterialAsset = _defaultMaterial;
     modelCreator.AddMaterialSlot(slot);
     modelCreator.AddLodAsset(AZStd::move(lodAsset));
     AZ::Data::Asset<AZ::RPI::ModelAsset> modelAsset;
@@ -2092,7 +2101,8 @@ void O3deBackend::Impl::SubmitMeshes()
           continue;  // geometry not registered (yet) for this id
         auto model = BuildModelAssetFromGeometry(geom,
             AZ::Name(AZStd::string::format("gz_mesh_%llu",
-                static_cast<unsigned long long>(m.id))));
+                static_cast<unsigned long long>(m.id))),
+            this->meshMaterialAsset);
         if (!model.IsReady())
         {
           std::fprintf(stderr,
@@ -2117,9 +2127,14 @@ void O3deBackend::Impl::SubmitMeshes()
       // demo floor, light correctly through the very same material + lights).
       // This was isolated by elimination -- it is not the material path
       // (FindOrCreate behaves the same), not the winding, not the tangent frame,
-      // not r_enablePerMeshShaderOptionFlags, not back-face culling. The fix
-      // lives somewhere deeper in how this minimal Atom pipeline wires per-mesh
-      // normals for hand-built models and is tracked as a follow-up.
+      // not r_enablePerMeshShaderOptionFlags, not back-face culling, not an empty
+      // model material slot (assigning m_defaultMaterialAsset like WhiteBox does
+      // changed nothing), and the stream construction is byte-for-byte identical
+      // to Atom's own ModelAssetHelpers::CreateModel. The fix lives somewhere
+      // deeper in how this minimal Atom pipeline wires per-mesh normals for
+      // hand-built models. Next diagnostic: wire a RenderDebug "normal" view pass
+      // to confirm the world normal is zero on screen, and A/B our builder
+      // against ModelAssetHelpers::CreateModel directly. Tracked as a follow-up.
       //
       // Until that is fixed we drive the colour through EMISSIVE so the gz::common
       // -> Atom runtime mesh is actually VISIBLE in the demo (and the M10 per-mesh
@@ -2137,27 +2152,33 @@ void O3deBackend::Impl::SubmitMeshes()
           if (baseColorIdx.IsValid())
             material->SetPropertyValue(baseColorIdx, color);
 
-          // Emissive visibility workaround (see limitation note above).
+          // Emissive visibility workaround (see limitation note above). Gated by
+          // GZ_O3DE_MESH_EMISSIVE (the live demo sets it) so it is opt-in: once
+          // the runtime-mesh-unlit bug is fixed the mesh will shade from baseColor
+          // + scene lights and this crutch can simply be dropped from the demo.
           // emissive.useTexture defaults to true, which would sample a (missing)
           // emissive map and wash the flat colour out -- force it false so the
           // mesh glows in its own albedo colour.
-          const auto enIdx =
-              material->FindPropertyIndex(AZ::Name("emissive.enable"));
-          const auto useTexIdx =
-              material->FindPropertyIndex(AZ::Name("emissive.useTexture"));
-          const auto ecIdx =
-              material->FindPropertyIndex(AZ::Name("emissive.color"));
-          const auto eiIdx =
-              material->FindPropertyIndex(AZ::Name("emissive.intensity"));
-          if (enIdx.IsValid())
-            material->SetPropertyValue(enIdx, true);
-          if (useTexIdx.IsValid())
-            material->SetPropertyValue(useTexIdx, false);
-          if (ecIdx.IsValid())
-            material->SetPropertyValue(ecIdx,
-                AZ::Color(m.color[0], m.color[1], m.color[2], 1.0f));
-          if (eiIdx.IsValid())
-            material->SetPropertyValue(eiIdx, 3.0f);  // Ev100
+          if (std::getenv("GZ_O3DE_MESH_EMISSIVE"))
+          {
+            const auto enIdx =
+                material->FindPropertyIndex(AZ::Name("emissive.enable"));
+            const auto useTexIdx =
+                material->FindPropertyIndex(AZ::Name("emissive.useTexture"));
+            const auto ecIdx =
+                material->FindPropertyIndex(AZ::Name("emissive.color"));
+            const auto eiIdx =
+                material->FindPropertyIndex(AZ::Name("emissive.intensity"));
+            if (enIdx.IsValid())
+              material->SetPropertyValue(enIdx, true);
+            if (useTexIdx.IsValid())
+              material->SetPropertyValue(useTexIdx, false);
+            if (ecIdx.IsValid())
+              material->SetPropertyValue(ecIdx,
+                  AZ::Color(m.color[0], m.color[1], m.color[2], 1.0f));
+            if (eiIdx.IsValid())
+              material->SetPropertyValue(eiIdx, 3.0f);  // Ev100
+          }
 
           const bool compileOk = material->Compile();
           std::fprintf(stderr,
