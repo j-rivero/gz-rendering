@@ -92,6 +92,8 @@
 #include <Atom/RPI.Reflect/Material/MaterialAsset.h>
 #include <Atom/RPI.Public/Material/Material.h>
 #include <Atom/Feature/CoreLights/PhotometricValue.h>
+// M8: Camera::Configuration for directional cascade-shadow camera frustum setup.
+#include <AzFramework/Components/CameraBus.h>
 #include <Atom/RPI.Public/Image/AttachmentImage.h>
 #include <Atom/RPI.Public/Image/AttachmentImagePool.h>
 #include <Atom/RPI.Public/Image/ImageSystemInterface.h>
@@ -2336,18 +2338,82 @@ void O3deBackend::Impl::SubmitLights()
         if (!this->dirLightFp)
           break;
         dirIds.insert(light.id);
+        // M8 cascade shadows are gated separately from the spot shadow: they
+        // add a full-screen shadow pass whose cost scales with the (here 2x-
+        // supersampled) render res -- ~33 ms/frame at the default window, more
+        // when maximized. GZ_O3DE_DEMO_NO_SUN_SHADOW=1 drops just the sun shadow
+        // (keeping the cheap spot shadow); GZ_O3DE_DEMO_NO_SHADOW=1 drops both.
+        static const bool noSunShadow =
+            noShadow || (std::getenv("GZ_O3DE_DEMO_NO_SUN_SHADOW") != nullptr);
         auto it = this->dirLightHandles.find(light.id);
-        if (it == this->dirLightHandles.end())
+        const bool firstSighting = (it == this->dirLightHandles.end());
+        if (firstSighting)
         {
           it = this->dirLightHandles.emplace(
               light.id, this->dirLightFp->AcquireLight()).first;
           std::fprintf(stderr,
               "[gz-o3de] M6 dir light acquired: id=0x%X (total dir=%zu)\n",
               light.id, this->dirLightHandles.size());
+          // M8: enable CASCADE shadows on the sun (one-time). Unlike the spot's
+          // single projected shadow, a directional light shadows the WHOLE scene
+          // by splitting the camera frustum into N cascades, each a shadowmap
+          // sized for its depth slice. SetShadowFarClipDistance packs the
+          // cascades into the near ~30 m (the scene is ~10 m) instead of the
+          // camera's 1000 m far, so the shadows have real resolution. The
+          // per-frame camera config/transform below is what the FP segments.
+          if (!noSunShadow)
+          {
+            this->dirLightFp->SetShadowEnabled(it->second, true);
+            this->dirLightFp->SetShadowmapSize(it->second,
+                AZ::Render::ShadowmapSize::Size1024);  // 1024^2 is plenty for the
+                                                       // ~10 m demo scene
+            this->dirLightFp->SetCascadeCount(it->second, 2);  // 2 cascades keep
+                // the shadow passes cheap at the 2x-supersampled render res
+            this->dirLightFp->SetShadowmapFrustumSplitSchemeRatio(it->second,
+                0.7f);  // bias detail toward the near cascade
+            this->dirLightFp->SetShadowFilterMethod(it->second,
+                AZ::Render::ShadowFilterMethod::Pcf);
+            this->dirLightFp->SetFilteringSampleCount(it->second, 4);
+            this->dirLightFp->SetShadowFarClipDistance(it->second, 30.0f);
+            this->dirLightFp->SetViewFrustumCorrectionEnabled(it->second, true);
+            std::fprintf(stderr,
+                "[gz-o3de] M8 directional cascade shadows enabled: id=0x%X "
+                "(4 cascades, 2048^2, PCF)\n", light.id);
+          }
         }
         this->dirLightFp->SetRgbIntensity(it->second,
             AZ::Render::PhotometricColor<AZ::Render::PhotometricUnit::Lux>(rgb));
         this->dirLightFp->SetDirection(it->second, dir);
+
+        // M8: per-frame cascade camera segmentation. The cascades are fitted to
+        // the live camera frustum, so they MUST track the gz camera every frame
+        // (built here exactly as ApplyCamera builds the RPI view: gz +X-forward
+        // mapped to O3DE's +Y view dir via a local -90 deg yaw).
+        if (!noSunShadow)
+        {
+          const float aspect = (this->outputHeight > 0u)
+              ? static_cast<float>(this->outputWidth) /
+                    static_cast<float>(this->outputHeight)
+              : 1.0f;
+          const float hFov = static_cast<float>(this->camera.hfov);
+          const float vFov = 2.0f * std::atan(std::tan(hFov * 0.5f) / aspect);
+          const float nearC = static_cast<float>(this->camera.nearClip);
+          const float farC = static_cast<float>(this->camera.farClip);
+          Camera::Configuration camCfg;
+          camCfg.m_fovRadians = vFov;
+          camCfg.m_nearClipDistance = nearC;
+          camCfg.m_farClipDistance = farC;
+          camCfg.m_frustumHeight = 2.0f * nearC * std::tan(vFov * 0.5f);
+          camCfg.m_frustumWidth = camCfg.m_frustumHeight * aspect;
+          const AZ::Quaternion gzToView =
+              AZ::Quaternion::CreateRotationZ(-AZ::Constants::HalfPi);
+          const AZ::Quaternion camRot = GzQuat(this->camera.quat) * gzToView;
+          const AZ::Transform camXform =
+              AZ::Transform::CreateFromQuaternionAndTranslation(
+                  camRot, GzVec(this->camera.pos));
+          this->dirLightFp->SetCameraConfiguration(it->second, camCfg);
+          this->dirLightFp->SetCameraTransform(it->second, camXform);
+        }
         break;
       }
       case O3deLightData::Type::POINT:
@@ -3400,12 +3466,17 @@ static void MaybeInjectDemoLights(std::vector<O3deLightData> &_lights)
     O3deLightData sun;
     sun.type = O3deLightData::Type::DIRECTIONAL;
     sun.id = 0xD0003u;
-    // Normalized (0.286, 0, -0.958): down with a forward tilt.
-    sun.dir[0] = 0.286; sun.dir[1] = 0.0; sun.dir[2] = -0.958;
+    // Normalized (-0.35, 0.15, -0.925): down, tilted toward -X (the camera) and
+    // +Y so the cascade shadows of the lit meshes fall toward the camera onto
+    // open, visible floor (a +X tilt threw them behind the objects, out of view).
+    sun.dir[0] = -0.35; sun.dir[1] = 0.15; sun.dir[2] = -0.925;
     sun.diffuseColor[0] = 1.0; sun.diffuseColor[1] = 0.98;
     sun.diffuseColor[2] = 0.95;
-    sun.intensity = 3.0;  // lux; gentle warm sun fill (trimmed 8->3 so it does
-                          // not re-wash the floor the fill trim just darkened)
+    sun.intensity = 14.0;  // lux; now a real key (not just fill) so its M8
+                           // directional CASCADE shadow actually reads. Tune via
+                           // GZ_O3DE_SUN_INTENSITY; M8 cascade setup in SubmitLights.
+                           // (Isolate the sun shadow with GZ_O3DE_SPOT_INTENSITY=0
+                           // GZ_O3DE_SUN_INTENSITY=30 GZ_O3DE_DEMO_NO_BOXFILL=1.)
     if (const char *si = std::getenv("GZ_O3DE_SUN_INTENSITY"))
       sun.intensity = std::atof(si);
     _lights.push_back(sun);
