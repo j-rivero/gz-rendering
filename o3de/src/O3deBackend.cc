@@ -1970,22 +1970,18 @@ void O3deBackend::Impl::AcquireDemoMeshes()
         AZ::Vector3(10.0f, 10.0f, 0.1f),
         "flat-sphere-receiver" },
   };
-  // SHADOW A/B DIAGNOSTIC (GZ_O3DE_COOKED_CASTER): inject a *cooked* elevated
-  // sphere caster inside the spot beam. The cooked sphere wears basic_grey
-  // (a real Atom StandardPBR material that ships the shadowmap depth-pass
-  // shader variant), so it MUST draw into the spot shadowmap. The runtime
-  // gz-common hero box is the suspect caster. Decisive A/B: if this cooked
-  // ball throws a shadow on the lit cone but the runtime box does not, the
-  // runtime model's material is missing the shadow variant; if NEITHER casts,
-  // the shadow setup itself (bias/receiver/frustum) is the fault, not the
-  // material. Elevated at the spot's aim point (1.5,0,~1.3) so its shadow
-  // lands on the floor just beyond it, inside the lit footprint.
-  if (std::getenv("GZ_O3DE_COOKED_CASTER"))
+  // SHADOW SHOWCASE (default-on): a cooked basic_grey sphere floats in the spot
+  // beam over OPEN, camera-visible floor so its cast shadow lands on clear floor
+  // and is plainly visible -- the demo's deliberate "look, shadows" element. The
+  // cooked sphere wears a real StandardPBR material (ships the shadowmap depth-
+  // pass variant) so it draws into the spot shadowmap. (This same hook proved,
+  // via GZ_O3DE_CASTER_POS sweeps, that the runtime hero box ALSO casts -- the
+  // earlier "shadow not visible" was scene placement, see commit d4e468eb.)
+  // Position/scale overridable for tests; turn the showcase off entirely with
+  // GZ_O3DE_DEMO_NO_SHADOWCASTER=1.
+  if (!std::getenv("GZ_O3DE_DEMO_NO_SHADOWCASTER"))
   {
-    // Float over OPEN, camera-visible, spot-lit floor away from the box/cylinder
-    // so the cast shadow lands on clear floor with nothing to occlude or confuse
-    // it. Position/scale overridable so the beam sweep needs no rebuild.
-    float cx = 2.5f, cy = -1.0f, cz = 1.5f, cs = 0.8f;
+    float cx = -1.4f, cy = 0.8f, cz = 1.3f, cs = 0.85f;
     if (const char *p = std::getenv("GZ_O3DE_CASTER_POS"))
       std::sscanf(p, "%f %f %f", &cx, &cy, &cz);
     if (const char *s = std::getenv("GZ_O3DE_CASTER_SCALE"))
@@ -1993,9 +1989,9 @@ void O3deBackend::Impl::AcquireDemoMeshes()
     demos.push_back({ "models/sphere.fbx.azmodel",
         AZ::Vector3(cx, cy, cz),
         AZ::Vector3(cs, cs, cs),
-        "cooked-sphere-caster" });
+        "shadow-showcase-caster" });
     std::fprintf(stderr,
-        "[gz-o3de] SHADOW A/B: cooked sphere caster @ (%.2f,%.2f,%.2f) scale %.2f\n",
+        "[gz-o3de] shadow showcase: cooked caster @ (%.2f,%.2f,%.2f) scale %.2f\n",
         cx, cy, cz, cs);
   }
 
@@ -3132,6 +3128,84 @@ static void MaybeInjectDemoShapes(std::vector<O3deShapeData> &_shapes)
   plane.scale[0] = 4.0; plane.scale[1] = 7.0; plane.scale[2] = 1.0;
   plane.color[0] = 0.85f; plane.color[1] = 0.45f; plane.color[2] = 0.15f;
   _shapes.push_back(plane);
+
+  // ---- Light-source markers (demo aid: "where are the lights?") ----
+  // The demo lights are invisible (lights emit no geometry), so the scene gives
+  // no clue where they are. Drop a small bright constant-colour AuxGeom sphere
+  // (unlit => reads as a glowing bulb) exactly on each positional demo light,
+  // tinted with that light's own colour; and draw the SPOT's beam as a thin
+  // cylinder from the spot to its aim point + an arrowhead cone, so the cone
+  // direction -- and thus WHERE the cast shadow falls -- is obvious. The marker
+  // positions/colours MUST track MaybeInjectDemoLights below. AuxGeom markers
+  // are unlit and never draw into the shadowmap, so they cast no spurious
+  // shadows of their own. Off with GZ_O3DE_DEMO_NO_LIGHT_MARKERS=1.
+  if (!std::getenv("GZ_O3DE_DEMO_NO_LIGHT_MARKERS"))
+  {
+    // Vivid, saturated, colour-matched to each light (AuxGeom shading otherwise
+    // desaturates them to grey). Warm orange = the warm point key; strong blue =
+    // the cool spot; blues = the cool fills.
+    struct LightMark { double p[3]; float c[3]; double r; };
+    const LightMark marks[] = {
+        {{ 0.0,  0.0, 4.5}, {1.0f, 0.55f, 0.05f}, 0.30},  // point key (warm)
+        {{-3.0,  3.0, 4.0}, {0.15f, 0.35f, 1.0f}, 0.32},  // spot (cool blue)
+        {{-4.5,  0.0, 1.8}, {0.3f, 0.6f, 1.0f},   0.22},  // -X fill (cool)
+        {{-0.8, -1.4, 1.7}, {0.5f, 0.8f, 1.0f},   0.16},  // relight key
+        {{ 3.6,  1.5, 1.5}, {0.5f, 0.8f, 1.0f},   0.16},  // relight fill
+    };
+    for (const auto &m : marks)
+    {
+      O3deShapeData bulb;
+      bulb.type = O3deShapeData::Type::SPHERE;
+      bulb.pos[0] = m.p[0]; bulb.pos[1] = m.p[1]; bulb.pos[2] = m.p[2];
+      bulb.scale[0] = 2.0 * m.r; bulb.scale[1] = 2.0 * m.r;
+      bulb.scale[2] = 2.0 * m.r;
+      bulb.color[0] = m.c[0]; bulb.color[1] = m.c[1]; bulb.color[2] = m.c[2];
+      _shapes.push_back(bulb);
+    }
+
+    // Spot beam: thin cylinder spanning spot->target, + a cone arrowhead at the
+    // target end. Reuses the spot's own aim math so the beam always matches the
+    // light. Local cylinder/cone axis is +Z, so rotate +Z onto the beam dir.
+    const double sp[3] = {-3.0, 3.0, 4.0};
+    double tg[3] = {-0.5, 0.0, 0.0};  // keep in sync with the spot's default tgt
+    if (const char *tt = std::getenv("GZ_O3DE_SPOT_TARGET"))
+      std::sscanf(tt, "%lf %lf %lf", &tg[0], &tg[1], &tg[2]);
+    double bd[3] = {tg[0] - sp[0], tg[1] - sp[1], tg[2] - sp[2]};
+    const double bl = std::sqrt(bd[0]*bd[0] + bd[1]*bd[1] + bd[2]*bd[2]);
+    if (bl > 1e-6) { bd[0] /= bl; bd[1] /= bl; bd[2] /= bl; }
+    double bq[4] = {1.0, 0.0, 0.0, 0.0};  // w,x,y,z
+    {
+      double ax = -bd[1], ay = bd[0];     // (0,0,1) x dir, z-component is 0
+      const double al = std::sqrt(ax*ax + ay*ay), cz = bd[2];
+      if (al > 1e-6)
+      {
+        ax /= al; ay /= al;
+        const double an = std::acos(std::max(-1.0, std::min(1.0, cz)));
+        const double s = std::sin(an * 0.5);
+        bq[0] = std::cos(an * 0.5); bq[1] = ax * s; bq[2] = ay * s; bq[3] = 0.0;
+      }
+      else if (cz < 0.0) { bq[0] = 0.0; bq[1] = 1.0; }  // beam points -Z
+    }
+    O3deShapeData beam;
+    beam.type = O3deShapeData::Type::CYLINDER;
+    beam.pos[0] = sp[0] + bd[0]*bl*0.5;
+    beam.pos[1] = sp[1] + bd[1]*bl*0.5;
+    beam.pos[2] = sp[2] + bd[2]*bl*0.5;   // midpoint of spot->target
+    beam.quat[0] = bq[0]; beam.quat[1] = bq[1];
+    beam.quat[2] = bq[2]; beam.quat[3] = bq[3];
+    beam.scale[0] = 0.035; beam.scale[1] = 0.035; beam.scale[2] = bl;
+    beam.color[0] = 0.45f; beam.color[1] = 0.6f; beam.color[2] = 1.0f;
+    _shapes.push_back(beam);
+
+    O3deShapeData beamTip;
+    beamTip.type = O3deShapeData::Type::CONE;
+    beamTip.pos[0] = tg[0]; beamTip.pos[1] = tg[1]; beamTip.pos[2] = tg[2];
+    beamTip.quat[0] = bq[0]; beamTip.quat[1] = bq[1];
+    beamTip.quat[2] = bq[2]; beamTip.quat[3] = bq[3];
+    beamTip.scale[0] = 0.22; beamTip.scale[1] = 0.22; beamTip.scale[2] = 0.3;
+    beamTip.color[0] = 0.45f; beamTip.color[1] = 0.6f; beamTip.color[2] = 1.0f;
+    _shapes.push_back(beamTip);
+  }
 }
 
 // Demo aid (M6 Phase C): when GZ_O3DE_DEMO_SHAPES is set and the caller did
@@ -3162,7 +3236,10 @@ static void MaybeInjectDemoLights(std::vector<O3deLightData> &_lights)
   point.pos[0] = 0.0; point.pos[1] = 0.0; point.pos[2] = 4.5;
   point.diffuseColor[0] = 1.0; point.diffuseColor[1] = 0.85;
   point.diffuseColor[2] = 0.7;
-  point.intensity = 300.0;  // candela
+  point.intensity = 110.0;  // candela; trimmed 300->110. The floor must be DARK
+                            // without the spot so that blocking the spot (the
+                            // cast shadow) reads as a clear dark disc; a bright
+                            // ambient floor leaves no range for the shadow.
   point.attenRange = 14.0;
   _lights.push_back(point);
 
@@ -3192,7 +3269,10 @@ static void MaybeInjectDemoLights(std::vector<O3deLightData> &_lights)
   // empty space and the spot lit nothing -- the real cause of "M7 spot shadow not
   // visible".) So we compute the shortest arc q : (0,0,+1) -> dir(target).
   // Target overridable via GZ_O3DE_SPOT_TARGET="x y z" for quick aiming tests.
-  double tgt[3] = { 1.5, 0.0, 0.0 };  // floor under the spinning hero-box caster
+  // Aim into the FOREGROUND open floor where the shadow-showcase caster floats
+  // (~(-1.4,0.8,1.3)) so the bright cone pool + the caster's cast shadow disc
+  // both land on clear, camera-visible floor (the row sits at x=0; x<0 is open).
+  double tgt[3] = { -0.5, 0.0, 0.0 };
   if (const char *t = std::getenv("GZ_O3DE_SPOT_TARGET"))
     std::sscanf(t, "%lf %lf %lf", &tgt[0], &tgt[1], &tgt[2]);
   {
@@ -3227,7 +3307,10 @@ static void MaybeInjectDemoLights(std::vector<O3deLightData> &_lights)
   }
   spot.diffuseColor[0] = 0.3; spot.diffuseColor[1] = 0.5;
   spot.diffuseColor[2] = 1.0;
-  spot.intensity = 1500.0;  // candela (was 300; spot footprint was invisible)
+  spot.intensity = 1900.0;  // candela; the dominant demo light. Now that the
+                            // ambient fills are trimmed, 1900 cd lights its floor
+                            // pool brightly WITHOUT clipping, so the cast shadow
+                            // disc inside the pool reads with strong contrast.
   if (const char *si = std::getenv("GZ_O3DE_SPOT_INTENSITY"))
     spot.intensity = std::atof(si);
   spot.attenRange = 10.0;
@@ -3257,7 +3340,9 @@ static void MaybeInjectDemoLights(std::vector<O3deLightData> &_lights)
   fill.pos[0] = -4.5; fill.pos[1] = 0.0; fill.pos[2] = 1.8;
   fill.diffuseColor[0] = 0.75; fill.diffuseColor[1] = 0.85;
   fill.diffuseColor[2] = 1.0;
-  fill.intensity = 700.0;  // candela
+  fill.intensity = 110.0;  // candela; trimmed 700->110 -- this -X fill was the
+                           // main culprit washing the foreground floor to white
+                           // and erasing the spot's cast shadow there
   fill.attenRange = 16.0;
   _lights.push_back(fill);
 
@@ -3285,9 +3370,9 @@ static void MaybeInjectDemoLights(std::vector<O3deLightData> &_lights)
     // keeps a visible light->dark falloff across the cube (3D shading).
     struct { double x, y, z, cd; uint64_t id; } fills[] = {
         // camera-side key (camera ~(-4,0,1.2) looks +X): low, offset -Y, raking
-        { -0.8, -1.4, 1.7, 120.0, 0xD0005u},
+        { -0.8, -1.4, 1.7, 80.0, 0xD0005u},
         // far-side fill (+X/+Y), dimmer -> lifts the away-faces off pure black
-        {  3.6,  1.5, 1.5,  55.0, 0xD0006u},
+        {  3.6,  1.5, 1.5, 40.0, 0xD0006u},
     };
     for (const auto &l : fills)
     {
@@ -3300,7 +3385,7 @@ static void MaybeInjectDemoLights(std::vector<O3deLightData> &_lights)
       f.attenRange = 9.0;
       _lights.push_back(f);
     }
-    std::fprintf(stderr, "[gz-o3de] hero-box relight: opposed key+fill (120/55 cd)\n");
+    std::fprintf(stderr, "[gz-o3de] hero-box relight: opposed key+fill (80/40 cd)\n");
   }
 
   // M8: directional "sun" light, gated by the same GZ_O3DE_ENABLE_DIRECTIONAL
@@ -3319,7 +3404,8 @@ static void MaybeInjectDemoLights(std::vector<O3deLightData> &_lights)
     sun.dir[0] = 0.286; sun.dir[1] = 0.0; sun.dir[2] = -0.958;
     sun.diffuseColor[0] = 1.0; sun.diffuseColor[1] = 0.98;
     sun.diffuseColor[2] = 0.95;
-    sun.intensity = 8.0;  // lux; gentle warm sun fill over the already-lit scene
+    sun.intensity = 3.0;  // lux; gentle warm sun fill (trimmed 8->3 so it does
+                          // not re-wash the floor the fill trim just darkened)
     if (const char *si = std::getenv("GZ_O3DE_SUN_INTENSITY"))
       sun.intensity = std::atof(si);
     _lights.push_back(sun);
