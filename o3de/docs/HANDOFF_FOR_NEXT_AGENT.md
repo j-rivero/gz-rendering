@@ -5,7 +5,7 @@ this proof-of-concept without re-reading every commit. Read this top to
 bottom; everything else is reference linked from here.
 
 Last updated: **2026-06-03** by Opus 4.8. Last commit on the branch:
-`8e717897` (M7 spot direction fix). Since the 2026-06-01 handoff:
+`d4e468eb` (M7 cast shadow RESOLVED — placement artifact). Since the 2026-06-01 handoff:
 runtime-mesh-unlit RESOLVED + relight promoted to default; M7 spot light
 direction fixed (spot was emitting no light); single-light-greys disproven.
 
@@ -127,8 +127,8 @@ that came after. Status as of 2026-06-01:
 | M4 | Native Vulkan→Vulkan zero-copy via `VkImportMemoryFdInfoKHR`; consumer (gz-gui) imports the Atom image onto its `VkDevice` and samples directly. Working in `GZ_O3DE_INTEROP_LIVE=1`. | ✓ landed; had a long grey-display bug-hunt (QSG sampling race); see `zero-copy-interop-findings.md` |
 | M5 | Capsule + Mesh-no-op + ArrowVisual + AxisVisual + FrustumVisual primitives | ✓ A/B/C/D all landed |
 | M6 | Atom `LightFeatureProcessor` integration (point + spot light handles, per-frame `Set*` sync) | ✓ A + C landed; B was folded into A |
-| M7 | Shadows: cache `ProjectedShadowFP`, paired projected-shadow handle per spot, cooked Mesh caster + receiver, `SetShadowsEnabled` on `SimpleSpotLight` | ✓ A1, A2, B, C landed. Spot **cone tint now visible** (direction bug fixed, `8e717897`). Cast **shadow** still not visually confirmed — the one remaining M7 follow-up. |
-| M8 | Directional "sun" light (`DirectionalLightFeatureProcessor`) | ✓ landed `540471f1`. Enabled by default (was deferred at M6-A for a grey-screen that proved to be the FP-independent present race). 8 lux warm sun; `GZ_O3DE_DEMO_NO_SUN=1` / `GZ_O3DE_SUN_INTENSITY=<lux>`. Directional **cascade shadows** not yet wired — a follow-up alongside the spot shadow. |
+| M7 | Shadows: cache `ProjectedShadowFP`, paired projected-shadow handle per spot, cooked Mesh caster + receiver, `SetShadowsEnabled` on `SimpleSpotLight` | ✓ A1, A2, B, C landed. Spot **cone tint visible** (direction bug fixed `8e717897`). Cast **shadow RESOLVED** (`d4e468eb`): shadows DO render — a cooked sphere AND the runtime hero box both cast clear shadows when floated over open floor (`screenshots/m7-shadow-ab-both-cast.png`). The "not visible" was scene placement/occlusion, not a render bug; material-variant hypothesis refuted. Cleanup TODO: the manual A2 ProjectedShadow is redundant (SimpleSpotLight owns its own). |
+| M8 | Directional "sun" light (`DirectionalLightFeatureProcessor`) | ✓ landed `540471f1`. Enabled by default (was deferred at M6-A for a grey-screen that proved to be the FP-independent present race). 8 lux warm sun; `GZ_O3DE_DEMO_NO_SUN=1` / `GZ_O3DE_SUN_INTENSITY=<lux>`. Directional **cascade shadows** not yet wired (SetCascadeCount/SetShadowmapSize/SetCameraConfiguration) — now the **only** remaining shadow work, since the spot cast shadow is resolved (`d4e468eb`). |
 
 ### Commit stack (most recent on top)
 
@@ -155,7 +155,7 @@ them before re-attempting either; both have hypothesis lists for the
 
 | Memory entry | Status |
 |---|---|
-| [`o3de-m7-spot-shadow-not-visible`](file:///home/jrivero/.claude/memory/project_o3de_m7_spot_shadow_not_visible.md) | **Light: RESOLVED** (commit `8e717897`). The spot emitted zero light — aimed local -Z but Atom's SimpleSpotLight emits along +Z (`transform.GetBasisZ()`); the cone pointed 180° away. Fixed with a code-computed look-at `q:(0,0,+1)->dir`; spot now lights a clear blue cone (`srgb(0,0,0)`->`srgb(195,212,233)`). The 6 old hypotheses were all wrong. **Cast SHADOW still open** (small): the shadow FP is active but the cluttered hero-box caster throws no distinct shadow. |
+| [`o3de-m7-spot-shadow-not-visible`](file:///home/jrivero/.claude/memory/project_o3de_m7_spot_shadow_not_visible.md) | **Light: RESOLVED** (commit `8e717897`). The spot emitted zero light — aimed local -Z but Atom's SimpleSpotLight emits along +Z (`transform.GetBasisZ()`); the cone pointed 180° away. Fixed with a code-computed look-at `q:(0,0,+1)->dir`; spot now lights a clear blue cone (`srgb(0,0,0)`->`srgb(195,212,233)`). The 6 old hypotheses were all wrong. **Cast SHADOW also RESOLVED** (commit `d4e468eb`): shadows DO render — a cooked sphere AND the runtime hero box both throw clear black cast shadows when floated over open, spot-lit floor (`GZ_O3DE_DEMO_ONLY_LIGHT=spot` + `GZ_O3DE_COOKED_CASTER`/`GZ_O3DE_CASTER_POS`/`GZ_O3DE_HERO_POS`; `screenshots/m7-shadow-ab-both-cast.png`). The "not visible" was scene placement/occlusion; the material-variant hypothesis is refuted (runtime mesh casts fine). Cleanup TODO: the backend's manual A2 ProjectedShadow is redundant (SimpleSpotLight owns its own shadow). |
 | [`o3de-single-light-greys-render`](file:///home/jrivero/.claude/memory/project_o3de_single_light_greys_render.md) | **DISPROVEN** (2026-06-02). Not a light-count bug — it's the intermittent QSG/present-race grey that strikes regardless of 1 vs 2 lights or shadow on/off. The capture harness now grey-detects (centre-crop colors==1) and retries. |
 | [`o3de-runtime-mesh-unlit`](file:///home/jrivero/.claude/memory/project_o3de_runtime_mesh_unlit.md) | **RESOLVED** (commits `0aa2ef9e`, `f4b9d7a8`). The runtime hero box rendering black under light was light-facing, not a renderer bug (proven via RenderDoc). Hero-box relight (2 opposed fills) promoted to demo default; emissive crutch dropped. |
 
