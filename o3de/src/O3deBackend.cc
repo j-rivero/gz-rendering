@@ -141,6 +141,7 @@
 #include "O3deBackend.hh"
 #include "O3deGlInterop.hh"  // plain-types declaration; no GL headers leak here
 #include "O3deVkInterop.hh"  // plain-types declaration; no Vulkan headers leak here
+#include "renderdoc_app.h"   // in-app RenderDoc capture trigger (diagnostic only)
 
 namespace gz
 {
@@ -3480,6 +3481,50 @@ bool O3deBackend::Impl::RenderOneFrame()
     }
     this->ApplyCamera(lw, lh);
 
+    // DIAGNOSTIC (runtime-mesh-unlit): RenderDoc in-app capture trigger. Atom
+    // renders OFFSCREEN to a windowless device (no swapchain), so RenderDoc's
+    // F12/window capture only ever grabs the Qt swapchain frame (GUI chrome) and
+    // never Atom's StandardPBR draws. The in-app API is the only way to capture a
+    // presentation-less device. Gated by GZ_O3DE_RDC_FRAME=<frameNum>: when that
+    // frame renders, bracket the Atom GPU submit so the .rdc contains the scene
+    // draws (run the demo under `renderdoccmd capture` so the layer is loaded).
+    static RENDERDOC_API_1_4_0 *s_rdoc = []() -> RENDERDOC_API_1_4_0 * {
+      if (void *mod = dlopen("librenderdoc.so", RTLD_NOW | RTLD_NOLOAD))
+      {
+        if (auto getApi = reinterpret_cast<pRENDERDOC_GetAPI>(
+                dlsym(mod, "RENDERDOC_GetAPI")))
+        {
+          RENDERDOC_API_1_4_0 *api = nullptr;
+          if (getApi(eRENDERDOC_API_Version_1_4_0,
+                  reinterpret_cast<void **>(&api)) == 1)
+            return api;
+        }
+      }
+      return nullptr;
+    }();
+    const char *rdocFrameEnv = std::getenv("GZ_O3DE_RDC_FRAME");
+    const bool rdocCapture = s_rdoc != nullptr && rdocFrameEnv != nullptr &&
+        frameNum == std::atoi(rdocFrameEnv);
+    // The RENDERDOC_DevicePointer must identify ATOM's device specifically -- with
+    // two VkDevices in-process (Atom offscreen + Qt swapchain), NULL attaches to
+    // the wrong (idle) one and captures zero draws. For Vulkan the device pointer
+    // is the loader dispatch key: *(void**)VkDevice.
+    void *rdocDevPtr = nullptr;
+    if (rdocCapture)
+    {
+      if (AZ::RHI::Device *dev = AZ::RHI::RHISystemInterface::Get()->GetDevice(
+              AZ::RHI::MultiDevice::DefaultDeviceIndex))
+      {
+        const VkDevice vkDev = AZ::Vulkan::GetDeviceNativeHandle(*dev);
+        if (vkDev != VK_NULL_HANDLE)
+          rdocDevPtr = *reinterpret_cast<void **>(vkDev);
+      }
+      std::fprintf(stderr,
+          "[gz-o3de] RDOC StartFrameCapture frame=%d devPtr=%p\n",
+          frameNum, rdocDevPtr);
+      s_rdoc->StartFrameCapture(rdocDevPtr, nullptr);
+    }
+
     // Render the scene into the exportable image. AuxGeom is re-submitted each
     // tick (the draw queue is consumed per rendered frame).
     this->pipeline->AddToRenderTick();
@@ -3499,6 +3544,12 @@ bool O3deBackend::Impl::RenderOneFrame()
     }
     this->signalFenceThisTick = false;
     this->pipeline->RemoveFromRenderTick();
+
+    if (rdocCapture)
+    {
+      const uint32_t rdocOk = s_rdoc->EndFrameCapture(rdocDevPtr, nullptr);
+      std::fprintf(stderr, "[gz-o3de] RDOC EndFrameCapture ok=%u\n", rdocOk);
+    }
 
     // Host-sync (interim, until the render-finished semaphore #26 is wired via a
     // custom RPI::Pass): block until the GPU has finished rendering into the
