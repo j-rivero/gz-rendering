@@ -90,12 +90,14 @@ export GZ_O3DE_INTEROP_LIVE=1
 export GZ_O3DE_INTEROP_SEM=1
 # Inject the box/sphere/cylinder when the scene is empty (stands in for gz-sim).
 export GZ_O3DE_DEMO_SHAPES=1
-# Make the gz::common->Atom runtime hero mesh visible. Runtime-built ModelAssets
-# currently render unlit/black under scene lighting (a known Atom-pipeline issue
-# isolated in O3deBackend.cc, where the world-space vertex normal reads as zero);
-# this drives the mesh colour through emissive so the mesh is visible in the demo
-# until the lighting path is fixed. Drop this line once runtime meshes shade.
-export GZ_O3DE_MESH_EMISSIVE=1
+# NOTE: the gz::common->Atom runtime hero mesh used to need GZ_O3DE_MESH_EMISSIVE=1
+# (drive colour through emissive) because it rendered black under scene lighting.
+# RenderDoc proved that was never a renderer bug -- the box shades correctly; its
+# camera-visible vertical faces simply faced away from the overhead lights. It now
+# shades from baseColor + dedicated fill lights (the hero-box relight in
+# MaybeInjectDemoLights), so the emissive crutch is dropped. To restore the old
+# self-lit look set GZ_O3DE_MESH_EMISSIVE=1; to disable the relight fills set
+# GZ_O3DE_DEMO_NO_BOXFILL=1.
 
 # WSI present-prime workaround. On Qt 6.4.2 + QRhi-Vulkan + NVIDIA proprietary
 # 580, the first few vkQueuePresentKHR calls race against the producer-side

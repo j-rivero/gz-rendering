@@ -2212,10 +2212,11 @@ void O3deBackend::Impl::SubmitMeshes()
 
           const bool compileOk = material->Compile();
           std::fprintf(stderr,
-              "[gz-o3de] mesh id=%llu colour=(%.2f,%.2f,%.2f) emissive-visible "
-              "compile=%d\n",
+              "[gz-o3de] mesh id=%llu colour=(%.2f,%.2f,%.2f) %s compile=%d\n",
               static_cast<unsigned long long>(m.id),
-              m.color[0], m.color[1], m.color[2], compileOk ? 1 : 0);
+              m.color[0], m.color[1], m.color[2],
+              std::getenv("GZ_O3DE_MESH_EMISSIVE") ? "emissive" : "lit",
+              compileOk ? 1 : 0);
           this->meshMaterials[m.id] = material;
         }
         else
@@ -3178,18 +3179,20 @@ static void MaybeInjectDemoLights(std::vector<O3deLightData> &_lights)
   fill.attenRange = 16.0;
   _lights.push_back(fill);
 
-  // RELIGHT (GZ_O3DE_DEMO_BOXFILL): RenderDoc proved the runtime hero box at
+  // HERO-BOX RELIGHT (always on): RenderDoc proved the runtime hero box at
   // (1.5,0,0.7) shades CORRECTLY (cyan albedo, valid unit normals, lit up-faces)
   // but its camera-visible VERTICAL faces point ~+X/-Y/down -- away from all the
   // scene lights (overhead +Z key, -X fill) and into the dark lower IBL hemisphere,
-  // so they read black. This adds dedicated fill lights so those faces catch a
-  // near-horizontal rake. Two intensities were probed and rejected on the way here:
-  // a RING of 3 fills (lit the box but washed the cyan to flat white), and a SINGLE
-  // fill (shaded nicely but strobed black whenever the spin rotated the lit face
-  // away). The shipped form below -- two OPPOSED fills, brighter camera-side key +
-  // dimmer far-side fill -- keeps the box cyan-shaded at every spin angle and never
-  // fully black. Env-gated so the committed demo is unchanged until promoted.
-  if (std::getenv("GZ_O3DE_DEMO_BOXFILL"))
+  // so they read black. These two dedicated fills make those faces catch a
+  // near-horizontal rake. This REPLACES the old GZ_O3DE_MESH_EMISSIVE crutch (the
+  // demo no longer sets it): the box now shades from baseColor + scene lights like
+  // every other primitive. Two intensities were probed and rejected on the way
+  // here: a RING of 3 fills (lit the box but washed the cyan to flat white), and a
+  // SINGLE fill (shaded nicely but strobed black whenever the spin rotated the lit
+  // face away). The form below -- two OPPOSED fills, brighter camera-side key +
+  // dimmer far-side fill -- keeps the box cyan-shaded at every spin angle, never
+  // fully black. Kept env-overridable via GZ_O3DE_DEMO_NO_BOXFILL=1 (escape hatch).
+  if (!std::getenv("GZ_O3DE_DEMO_NO_BOXFILL"))
   {
     // Two OPPOSED fills, not a ring and not a single light. A single light
     // strobes the spinning box black whenever its camera-facing face rotates
@@ -3215,7 +3218,7 @@ static void MaybeInjectDemoLights(std::vector<O3deLightData> &_lights)
       f.attenRange = 9.0;
       _lights.push_back(f);
     }
-    std::fprintf(stderr, "[gz-o3de] BOXFILL: opposed key+fill (120/55 cd)\n");
+    std::fprintf(stderr, "[gz-o3de] hero-box relight: opposed key+fill (120/55 cd)\n");
   }
 
   // M8: directional "sun" light, gated by the same GZ_O3DE_ENABLE_DIRECTIONAL
