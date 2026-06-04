@@ -3329,15 +3329,16 @@ static void MaybeInjectDemoShapes(std::vector<O3deShapeData> &_shapes)
   capsule.color[0] = 1.0f; capsule.color[1] = 0.1f; capsule.color[2] = 1.0f;
   _shapes.push_back(capsule);
 
-  // Small white satellite orbiting high above the hero mesh (1.5, 0) at z=1.8,
-  // r=1.3 -- a live circular motion that stays in a clear lane above every
-  // other element, so it never overlaps them.
+  // Small white satellite orbiting above the hero mesh (1.5, 0) at z=1.55,
+  // r=1.3 -- a live circular motion in its own clear lane: above the hero
+  // box (top ~1.25) and below the M11 showcase shelf at z=2.6 (bottom
+  // ~2.25; the old z=1.8 orbit would have clipped a lower shelf).
   const double satA = t * 0.8;
   O3deShapeData satellite;
   satellite.type = O3deShapeData::Type::SPHERE;
   satellite.pos[0] = 1.5 + 1.3 * std::cos(satA);
   satellite.pos[1] = 1.3 * std::sin(satA);
-  satellite.pos[2] = 1.8;
+  satellite.pos[2] = 1.55;
   satellite.scale[0] = 0.28; satellite.scale[1] = 0.28; satellite.scale[2] = 0.28;
   satellite.color[0] = 1.0f; satellite.color[1] = 1.0f; satellite.color[2] = 0.9f;
   _shapes.push_back(satellite);
@@ -3886,10 +3887,19 @@ static void MaybeInjectDemoMeshData(std::vector<O3deMeshData> &_meshes)
     // Roughness sweep: 5 mid-grey dielectric spheres, roughness .05 -> .95.
     // In PBR_ONLY isolation the roughness sweep is the BACK row (lifted, pushed
     // back) so the front row [gold | checker | steel] stays unobstructed.
-    const float rowY0 = 2.2f;      // screen-left start (gz +Y = left)
-    const float rowDy = -1.1f;     // step toward screen-right
-    const double rowX = pbrOnly ? 1.6 : 0.3;
-    const double rowZ = pbrOnly ? 1.55 : 0.45;
+    // In the FULL demo the whole M11 family sits on one elevated "showcase
+    // shelf" at x=0.9, z=2.6: [gold | sweep x5 | steel], 0.8 apart. The shelf
+    // is its own clear lane above every floor element (the old x=0.3/z=0.45
+    // row sat INSIDE the primitives lane -- each sphere collided with the
+    // box/sphere/gnomon/cylinder/capsule respectively), z=2.6 keeps the row
+    // clear of the floating shadow-caster's large screen footprint from the
+    // default camera (at z=2.3 the caster occluded the two left spheres),
+    // it stays under the (0,0,4.5) key light so the specular spread tracks
+    // roughness, and it clears the satellite's z=1.55 orbit.
+    const float rowY0 = pbrOnly ? 2.2f : 1.6f;  // screen-left start (+Y = left)
+    const float rowDy = pbrOnly ? -1.1f : -0.8f;  // step toward screen-right
+    const double rowX = pbrOnly ? 1.6 : 0.9;
+    const double rowZ = pbrOnly ? 1.55 : 2.6;
     for (int i = 0; i < kRoughN; ++i)
     {
       O3deMeshData s;
@@ -3904,13 +3914,18 @@ static void MaybeInjectDemoMeshData(std::vector<O3deMeshData> &_meshes)
       _meshes.push_back(s);
     }
 
-    // Metallic pair (gold + steel) one row back, so the metal/dielectric
+    // Metallic pair (gold + steel), warm vs cool so the metal/dielectric
     // contrast is visible side by side. Dark without IBL, but the warm vs cool
     // specular tint still distinguishes them.
     // PBR_ONLY: gold + steel flank the textured sphere as the FRONT row, close
     // to the camera and unobstructed so the IBL environment reflection is plain.
-    const float metZ = pbrOnly ? 0.95f : 0.45f, metX = pbrOnly ? -0.3f : 1.9f;
-    const float metY = pbrOnly ? 1.3f : 0.7f;
+    // FULL demo: they bookend the roughness sweep on the showcase shelf
+    // ([gold | sweep | steel] at y=+/-2.4) -- every candidate FLOOR spot was
+    // either physically inside another element's lane, outside the default
+    // camera's frame, or sightline-occluded by the floating shadow caster
+    // (which dominates the left-mid screen region from the default pose).
+    const float metZ = pbrOnly ? 0.95f : 2.6f, metX = pbrOnly ? -0.3f : 0.9f;
+    const float metY = pbrOnly ? 1.3f : 2.4f;
     O3deMeshData gold;
     gold.id = kPbrRowBase + kRoughN;
     gold.pos[0] = metX; gold.pos[1] = metY; gold.pos[2] = metZ;
@@ -3929,10 +3944,13 @@ static void MaybeInjectDemoMeshData(std::vector<O3deMeshData> &_meshes)
     // M11 Phase B: a textured sphere -- base-color checkerboard sampled through
     // the StandardPBR baseColor.textureMap (proves the runtime CPU->Atom texture
     // path + UVs). Front-and-centre on open floor so the checker is legible.
+    // FULL demo: front-right at (-1.0,-1.6) -- the old (0,-1.7) intersected
+    // the blue cylinder, and this spot stays clear of the camera->cast-shadow
+    // sightline so the shadow showcase remains unobstructed.
     O3deMeshData textured;
     textured.id = kPbrRowBase + kRoughN + 2;
-    textured.pos[0] = pbrOnly ? -0.3 : 0.0;
-    textured.pos[1] = pbrOnly ? 0.0 : -1.7;
+    textured.pos[0] = pbrOnly ? -0.3 : -1.0;
+    textured.pos[1] = pbrOnly ? 0.0 : -1.6;
     textured.pos[2] = pbrOnly ? 0.95 : 0.55;
     textured.scale[0] = textured.scale[1] = textured.scale[2] =
         pbrOnly ? 1.3 : 1.2;
