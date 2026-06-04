@@ -208,6 +208,9 @@ int main(int _argc, char **_argv)
       camera->ImageWidth(), camera->ImageHeight(), common::Image::RGB_INT8);
   out.SavePNG(outPath);
   std::printf("[pbr_materials] wrote %s\n", outPath.c_str());
+  // The o3de backend leaves the process via std::quick_exit, which skips
+  // stdio flushing -- without this the line above never reaches a log file.
+  std::fflush(stdout);
 
   // No teardown: the o3de backend is a process-wide singleton by design
   // (see O3deBackend docs); process exit is the supported shutdown.

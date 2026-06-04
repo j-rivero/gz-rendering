@@ -22,7 +22,7 @@ cmake --build build -j5
 ./pbr_materials.sh out.png         # custom output path
 ```
 
-Expect: bottom row of 5 chrome-like spheres going mirror→dull left to
+Expect: bottom row of 5 chrome-like spheres going dull→mirror left to
 right, a gold sphere and a "gz-rendering"-textured sphere floating above,
 all PBR-lit on a grey ground. Compare with
 `../../docs/screenshots/m12-pbr-materials-gz-api.png`.
