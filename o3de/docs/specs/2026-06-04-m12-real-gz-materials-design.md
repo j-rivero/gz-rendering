@@ -67,7 +67,9 @@ the scene entirely through the public gz-rendering API:
   - 1 textured sphere: `SetTexture(<abs path>/gz_albedo_demo.png)`
     (reuses the existing demo asset)
 - Ground: a flattened `unit_box` mesh with a rough dielectric material.
-- Lights via the gz API: 1 directional + 1 point (already wired, M6/M8).
+- Lights via the gz API: a key + fill point-light pair using the same
+  values as the backend's `GZ_O3DE_DEMO_PBR_ONLY` lighting, so the
+  capture compares 1:1 against the M11 reference screenshots.
 - Camera: `scene->CreateCamera()`, ~1280×720,
   `camera->Capture(image)` → save PNG via `gz::common::Image`. This is
   the M0/M2 CPU-readback path — no Qt, no interop env vars, no QSG
