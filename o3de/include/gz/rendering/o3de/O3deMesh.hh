@@ -28,17 +28,19 @@ namespace gz
   {
     inline namespace GZ_RENDERING_VERSION_NAMESPACE {
     //
-    /// \brief O3DE no-op mesh fallback (M5 Phase B).
+    /// \brief O3DE mesh geometry.
     ///
-    /// Returns a real Mesh instance with an empty submesh store so callers
-    /// that funnel through Scene::CreateMesh(...) -- in particular
-    /// BaseArrowVisual::Init, which adds a "rotation ring" mesh geometry to
-    /// its third child visual -- can complete initialization without crashing.
-    ///
-    /// The geometry type stays GeometryType::OTHER so ToBackendType() returns
-    /// false in the per-frame gather; the mesh therefore contributes no
-    /// AuxGeom draws. Real mesh rendering (asset import + MeshFeatureProcessor)
-    /// is M9 in the post-beta1 roadmap.
+    /// Started as the M5 Phase B no-op fallback (so callers funnelling
+    /// through Scene::CreateMesh(...) -- e.g. BaseArrowVisual::Init's
+    /// "rotation ring" -- could complete initialization). Since M9-B real
+    /// meshes render through the MeshFeatureProcessor: CreateMeshImpl
+    /// registers the gz-common geometry with the backend keyed by this
+    /// mesh's id, and GatherFrame emits an O3deMeshData per frame (the
+    /// geometry type stays GeometryType::OTHER, so it never produces
+    /// AuxGeom draws). Since M12 the attached gz material's
+    /// diffuse/metalness/roughness/texture ride the same snapshot.
+    /// The submesh store stays EMPTY -- per-submesh materials are out of
+    /// scope (see O3deSubMesh::SetMaterialImpl).
     class GZ_RENDERING_O3DE_VISIBLE O3deMesh :
       public BaseMesh<O3deGeometry>
     {
