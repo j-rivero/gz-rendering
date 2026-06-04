@@ -5,14 +5,18 @@ this proof-of-concept without re-reading every commit. Read this top to
 bottom; everything else is reference linked from here.
 
 Last updated: **2026-06-04** by Opus 4.8. Last commit on the branch:
-`d8a5c0ce` (M11 Phase D real albedo texture files). **M11 real PBR materials &
+`b9de0cba` (M12 reference capture + example polish). **M11 real PBR materials &
 textures landed** (metallic/roughness factors + base-color texture + IBL
 reflections + real albedo FILE loading on runtime meshes), and
 the long-standing **runtime-mesh-unlit bug is finally root-caused & fixed**
 (inverted shading normals vs reversed winding — commit `075caed7`). All shadow
 work (spot + directional cascade) was already complete. Since the 2026-06-01
 handoff: M7 spot light direction fixed; M8 cascade shadows; single-light-greys
-disproven; M11 PBR; runtime-mesh-unlit RESOLVED with the real cause.
+disproven; M11 PBR; runtime-mesh-unlit RESOLVED with the real cause. **M12
+landed**: real gz materials now flow from the public gz-rendering API to the
+Atom backend on runtime meshes (`GatherFrame` wiring + `O3deMaterial` property
+storage + `O3deMesh::Material()` fix), proven by the new headless `pbr_materials`
+example — the first scene content that is 100% gz-sourced (no demo injection).
 
 ---
 
@@ -135,6 +139,7 @@ that came after. Status as of 2026-06-01:
 | M7 | Shadows: cache `ProjectedShadowFP`, paired projected-shadow handle per spot, cooked Mesh caster + receiver, `SetShadowsEnabled` on `SimpleSpotLight` | ✓ A1, A2, B, C landed. Spot **cone tint visible** (direction bug fixed `8e717897`). Cast **shadow RESOLVED** (`d4e468eb`): shadows DO render — a cooked sphere AND the runtime hero box both cast clear shadows when floated over open floor (`screenshots/m7-shadow-ab-both-cast.png`). The "not visible" was scene placement/occlusion, not a render bug; material-variant hypothesis refuted. Cleanup TODO: the manual A2 ProjectedShadow is redundant (SimpleSpotLight owns its own). |
 | M8 | Directional "sun" light (`DirectionalLightFeatureProcessor`) + **cascade shadows** | ✓ light landed `540471f1`; **cascade shadows landed** (`o3de: M8 — directional sun CASCADE shadows`). Per-frame `SetCameraConfiguration`+`SetCameraTransform` (cascades fit the live camera), one-time `SetShadowEnabled`/`SetShadowmapSize(1024)`/`SetCascadeCount(2)`/`SetShadowFarClipDistance(30 m)`/PCF. Verified in isolation (`screenshots/m8-directional-cascade-shadow.png`) and in the default demo alongside the spot shadow (`screenshots/demo-both-shadows-spot-and-sun.png`). Sun 14 lux, dir `(-0.35,0.15,-0.925)`. Perf: shadow pass scales with render res (~33 ms default window, ~85 ms maximized); `GZ_O3DE_DEMO_NO_SUN_SHADOW=1` drops just the sun shadow. **All shadow work is now complete.** |
 | M11 | **Real PBR materials & textures** on runtime meshes | ✓ **Phase A** (`075caed7`): `O3deMeshData` gains `metallic`/`roughness`; `SubmitMeshes` sets `metallic.factor`/`roughness.factor` per-mesh. Demo roughness sweep (5 spheres .05→.95) + gold/steel pair. **Also root-caused & FIXED the long-standing runtime-mesh-unlit bug** (see below). ✓ **Phase B** (`1060d5b1`): base-color texture — `DemoBaseColorImage()` builds a checkerboard `StreamingImage` via `CreateFromCpuData`, bound to `baseColor.textureMap`+`useTexture` on `textured=true` meshes; textured sphere UV-maps + shades correctly. Isolate with `GZ_O3DE_DEMO_PBR_ONLY=1`. Screenshots `m11-pbr-*.png`. ✓ **Phase C** (`ab66c94f`): **IBL cubemap** — `SetupIbl()` feeds the registered `ImageBasedLightFeatureProcessor` the project's cooked default IBL cubemaps (`lightingpresets/default_iblskyboxcm_{iblspecular,ibldiffuse}.exr.streamingimage`); metals go from near-black to convincing reflective metal (gold warm, steel = chrome mirror — `m11-pbr-ibl-ab.png`). IBL washes the tuned shadow contrast, so it's **default-on only in PBR_ONLY**; the shadow demo keeps it off unless `GZ_O3DE_DEMO_IBL=1` (`GZ_O3DE_DEMO_NO_IBL=1` force-off, `GZ_O3DE_IBL_EXPOSURE` tunes). ✓ **Phase D** (`d8a5c0ce`): **real albedo texture FILES** — `O3deMeshData.texturePath` decoded at runtime by `FileBaseColorImage()` via `gz::common::Image` (already linked) → `CreateFromCpuData`, cached per path; takes precedence over the checker. The demo ships `assets/gz_albedo_demo.png` and points `GZ_O3DE_DEMO_TEXTURE` at it; the decoded image UV-wraps the sphere (text visibly wraps) and coexists with cast shadows (`m11-pbr-texture-file*.png`, `m11-pbr-full-demo-textured.png`). This is the exact path a real gz material's base-color map takes. |
+| M12 | **Real gz materials on runtime meshes** — the public-API chain | ✓ landed (`58da3c50`..`b9de0cba`). `GatherFrame`'s mesh branch copies `Metalness()`/`Roughness()`/`Texture()` from the attached gz material into `O3deMeshData` (backend consumes them unchanged since M11). TWO latent base-class traps fixed along the way: (1) `BaseMaterial`'s PBR setters are no-ops — `O3deMaterial` now stores texture/roughness/metalness itself (`403a786b`; defaults metalness 0 + roughness 1 so color-only materials read plain diffuse); (2) `BaseMesh::Material()` reads submesh 0 and returns null on an empty store — `O3deMesh::Material()` overrides to return the mesh-level material (`41eadce4`). Proven by `o3de/examples/pbr_materials/` — a headless example building the scene 100% via the public gz API (CreateMesh + CreateMaterial + CreatePointLight, no demo injection, no Qt) and capturing through the CPU-readback path; fails loudly (exit 1) if the backend never renders. Verified capture: `m12-pbr-materials-gz-api.png` (roughness sweep, gold, file-textured sphere). Scope: mesh geometries only (primitives stay AuxGeom); proven property set only. Per-submesh materials still no-op. Spec: `o3de/docs/specs/2026-06-04-m12-real-gz-materials-design.md`. |
 
 ### Commit stack (most recent on top)
 
@@ -297,26 +302,25 @@ In rough order of "most useful next":
    camera now responds to mouse — orbit/pan/zoom should both verify
    M5/M6/M7 elements visually and confirm the InteractiveViewControl
    change works.
-2. **Tackle [`o3de-single-light-greys-render`]** as a single-variable
-   test: keep both lights but remove the `SetShadowsEnabled` call in
-   `SubmitLights`. If the scene still renders, then shadow setup +
-   1-light combination is the issue. If it greys, then it's purely a
-   light-count thing and the spot's shadow isn't the cause.
-3. After (2), revisit [`o3de-m7-spot-shadow-not-visible`] — if the
-   1-light failure traces back to shadow plumbing, that may already
-   explain why the receiver doesn't show the spot's contribution.
-4. **Shadows (the remaining lighting work)**: neither the spot's cast
-   shadow nor directional cascade shadows are visually confirmed. The
-   spot/directional LIGHTS both work now; the shadow *passes* are the
-   open piece. Start with a clean caster+receiver (a single PBR caster
-   between the light and an otherwise-dim floor patch) and a RenderDoc
-   capture to confirm the caster draws into the shadowmap; check whether
-   runtime-built meshes register as shadow casters at all (cooked vs
-   runtime, echoing the runtime-mesh saga). M8 directional sun itself is
-   DONE (landed `540471f1`, on by default).
-5. **Eventually push to `j-rivero/gz-rendering`**: needs explicit
-   confirmation before pushing per the memory rule. No PR has been
-   opened yet; commits are local only.
+2. **Cleanup TODOs**: (a) the redundant manual A2 `ProjectedShadow`
+   (SimpleSpotLight owns its own shadow path — the A2 projector is dead
+   weight); (b) the now-cosmetic BOXFILL relight (was a masking workaround
+   for the inverted-normals bug, no longer needed); (c) the inert emissive
+   crutch. None of these is a blocker, but they add noise to future diffs.
+3. **Consume a real gz-sim scene end-to-end.** The gz-material chain is
+   now proven by the `pbr_materials` example (M12). The next step is
+   wiring a gz-sim world's actual scene/visual stream through
+   `O3deScene::CreateVisualImpl` so a stock `shapes.sdf` world renders
+   with real PBR materials. Also route primitives through the mesh path
+   (currently they go via AuxGeom) so the `shapes.sdf` spheres/boxes get
+   the same PBR treatment as mesh visuals.
+4. **Qt 6.8 upgrade** to drop the DPR=1 + WSI-prime grey workarounds. See
+   `live_demo.sh` comments (`QT_SCALE_FACTOR=1`, `QT_AUTO_SCREEN_SCALE_FACTOR=0`,
+   the `VK_LAYER_GZ_swapchain_dump` MAX_FRAMES=4 fence fence-wait); commit
+   `a15c3519` in the Qt tree covers the relevant QQuickRt change.
+5. **Push to `j-rivero/gz-rendering`**: needs explicit user confirmation
+   before pushing per the memory rule. No PR has been opened yet; all
+   commits are local only.
 
 ## Hand-off contract
 
