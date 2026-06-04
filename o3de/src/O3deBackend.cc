@@ -25,6 +25,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
+#include <memory>
 #include <string>
 
 // M4 interop (GZ_O3DE_INTEROP): runtime resolution of the Vulkan loader entry
@@ -141,9 +143,11 @@
 // position/normal/UV and the index list that the Atom ModelAssetHelpers builder
 // consumes; MeshManager supplies a built-in primitive for the demo gate.
 #include <gz/common/Image.hh>
+#include <gz/common/Material.hh>
 #include <gz/common/Mesh.hh>
-#include <gz/common/SubMesh.hh>
 #include <gz/common/MeshManager.hh>
+#include <gz/common/Pbr.hh>
+#include <gz/common/SubMesh.hh>
 
 #include "O3deBackend.hh"
 #include "O3deGlInterop.hh"  // plain-types declaration; no GL headers leak here
@@ -268,6 +272,31 @@ struct MeshGeometryCpu
   std::vector<float> uvs;
 
   bool Empty() const { return this->positions.empty() || this->indices.empty(); }
+};
+
+/// \brief M13: the material a mesh FILE carries (GLB embedded PBR texture
+/// set, .dae sidecar textures), extracted once on the gz thread at
+/// RegisterMesh and consumed on the render thread when the per-mesh
+/// StandardPBR instance is built. Plain data + gz-common image handles --
+/// no Atom/AzCore types, safe to build off-thread. Applied only when the
+/// frame snapshot carries the M12 sentinels (no explicit gz material);
+/// an explicitly-set gz material wins ENTIRELY (no mixing).
+struct MeshFileMaterialCpu
+{
+  bool present = false;
+  float color[4] = {0.8f, 0.8f, 0.8f, 1.0f};  //!< common::Material diffuse.
+  float metalness = 0.0f;  //!< Pbr metallic factor (0 when no Pbr block).
+  float roughness = 1.0f;  //!< Pbr roughness factor (1 when no Pbr block).
+  // In-memory images (GLB embedded textures; null when absent). Albedo
+  // comes from common::Material::TextureData(); the other three from the
+  // Pbr block's *MapData(). gz-common pre-splits the combined glTF
+  // metallic-roughness texture into separate images.
+  std::shared_ptr<const gz::common::Image> albedoImg, normalImg,
+                                           metalnessImg, roughnessImg;
+  // File-path forms (.dae sidecar textures; empty when absent). The
+  // in-memory form takes precedence at apply time: for GLB the "name" in
+  // TextureImage() is not a resolvable file.
+  std::string albedoPath, normalPath, metalnessPath, roughnessPath;
 };
 
 /// \brief Private Atom-owning data for O3deBackend.
@@ -469,6 +498,11 @@ class O3deBackend::Impl
   // Ids the gz thread asked to drop; the render thread releases their handles
   // in SubmitMeshes and clears this list. Guarded by `mutex`.
   public: std::vector<uint64_t> meshUnregister;
+  // M13: the mesh FILE's material, extracted at RegisterMesh, keyed by gz
+  // id. Guarded by `mutex` (gz thread writes, render thread reads at
+  // first-sight material creation). Only ids whose mesh actually carries a
+  // material have an entry.
+  public: std::unordered_map<uint64_t, MeshFileMaterialCpu> meshFileMaterials;
   // Render-thread-only caches: built model + live MeshFP handle per id.
   public: std::unordered_map<uint64_t,
       AZ::Data::Asset<AZ::RPI::ModelAsset>> meshModels;
@@ -1828,6 +1862,76 @@ namespace
     return g;
   }
 
+  /// \brief M13: extract the mesh file's material[0] into plain data on the
+  /// gz thread (no Atom calls). Selection: the first submesh that names a
+  /// material index picks it; otherwise material 0. Multi-material meshes
+  /// get material[0] applied to the whole flattened mesh (logged once here;
+  /// per-submesh material slots are a future milestone).
+  MeshFileMaterialCpu ExtractMeshFileMaterial(const gz::common::Mesh *_mesh)
+  {
+    MeshFileMaterialCpu out;
+    if (_mesh == nullptr || _mesh->MaterialCount() == 0u)
+      return out;
+
+    if (_mesh->MaterialCount() > 1u)
+    {
+      std::fprintf(stderr,
+          "[gz-o3de] M13 mesh '%s' has %u materials; applying material[0] "
+          "to the whole mesh (per-submesh materials not supported yet)\n",
+          _mesh->Name().c_str(), _mesh->MaterialCount());
+    }
+
+    gz::common::MaterialPtr mat;
+    for (unsigned int s = 0; s < _mesh->SubMeshCount() && !mat; ++s)
+    {
+      auto subMesh = _mesh->SubMeshByIndex(s).lock();
+      if (!subMesh)
+        continue;
+      if (auto idx = subMesh->GetMaterialIndex())
+        mat = _mesh->MaterialByIndex(*idx);
+    }
+    if (!mat)
+      mat = _mesh->MaterialByIndex(0u);
+    if (!mat)
+      return out;
+
+    out.present = true;
+    const gz::math::Color c = mat->Diffuse();
+    out.color[0] = c.R();
+    out.color[1] = c.G();
+    out.color[2] = c.B();
+    out.color[3] = c.A();
+
+    // Albedo lives on common::Material itself (AssimpLoader stores the GLB
+    // embedded base-color via SetTextureImage; ColladaLoader stores a path).
+    out.albedoImg = mat->TextureData();
+    out.albedoPath = mat->TextureImage();
+
+    if (const gz::common::Pbr *pbr = mat->PbrMaterial())
+    {
+      out.metalness = static_cast<float>(pbr->Metalness());
+      out.roughness = static_cast<float>(pbr->Roughness());
+      if (!out.albedoImg && out.albedoPath.empty())
+        out.albedoPath = pbr->AlbedoMap();
+      if (pbr->NormalMapType() == gz::common::NormalMapSpace::TANGENT)
+      {
+        out.normalImg = pbr->NormalMapData();
+        out.normalPath = pbr->NormalMap();
+      }
+      else if (pbr->NormalMapData() || !pbr->NormalMap().empty())
+      {
+        std::fprintf(stderr,
+            "[gz-o3de] M13 mesh '%s': non-TANGENT normal map skipped\n",
+            _mesh->Name().c_str());
+      }
+      out.metalnessImg = pbr->MetalnessMapData();
+      out.metalnessPath = pbr->MetalnessMap();
+      out.roughnessImg = pbr->RoughnessMapData();
+      out.roughnessPath = pbr->RoughnessMap();
+    }
+    return out;
+  }
+
   // Build a Ready Atom ModelAsset from extracted CPU geometry. Atom asset
   // construction -- MUST run on the render thread (see the AssetManager note on
   // O3deBackend::Impl).
@@ -2290,6 +2394,7 @@ void O3deBackend::Impl::SubmitMeshes()
       this->meshMaterials.erase(id);
       std::lock_guard<std::mutex> lock(this->mutex);
       this->meshGeometry.erase(id);
+      this->meshFileMaterials.erase(id);
     }
   }
 
@@ -4088,10 +4193,12 @@ void O3deBackend::RegisterMesh(uint64_t _id, const gz::common::Mesh *_mesh)
   // geometry to the render thread, which builds the Atom model lazily. A null
   // or geometry-less mesh is treated as an unregister.
   MeshGeometryCpu geom = ExtractMeshGeometry(_mesh);
+  MeshFileMaterialCpu fileMat = ExtractMeshFileMaterial(_mesh);
   std::lock_guard<std::mutex> lock(d.mutex);
   if (geom.Empty())
   {
     d.meshGeometry.erase(_id);
+    d.meshFileMaterials.erase(_id);
     d.meshUnregister.push_back(_id);
     return;
   }
@@ -4100,6 +4207,10 @@ void O3deBackend::RegisterMesh(uint64_t _id, const gz::common::Mesh *_mesh)
   // Re-registering the same id with new geometry is not a supported case here
   // (it would keep the already-built model); UnregisterMesh first if needed.
   d.meshGeometry[_id] = std::move(geom);
+  if (fileMat.present)
+    d.meshFileMaterials[_id] = std::move(fileMat);
+  else
+    d.meshFileMaterials.erase(_id);
 }
 
 //////////////////////////////////////////////////
@@ -4108,6 +4219,7 @@ void O3deBackend::UnregisterMesh(uint64_t _id)
   Impl &d = *this->dataPtr;
   std::lock_guard<std::mutex> lock(d.mutex);
   d.meshGeometry.erase(_id);
+  d.meshFileMaterials.erase(_id);
   d.meshUnregister.push_back(_id);
 }
 
