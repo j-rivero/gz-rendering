@@ -32,8 +32,10 @@ namespace gz
     //
     /// \brief O3DE implementation of the Material class.
     ///
-    /// The color/PBR state is held by BaseMaterial; no Atom-side object
-    /// exists per gz material. Properties cross to the renderer via the
+    /// Colors and common flags are held by BaseMaterial; the PBR
+    /// texture/roughness/metalness are stored here (BaseMaterial's
+    /// accessors for those are no-ops). No Atom-side object exists per
+    /// gz material. Properties cross to the renderer via the
     /// per-frame snapshot: O3deRenderTarget::GatherFrame reads Diffuse /
     /// Metalness / Roughness / Texture into O3deMeshData (M12) and the
     /// backend applies them to the per-mesh StandardPBR material instance
