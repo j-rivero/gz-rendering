@@ -140,6 +140,7 @@
 // M9: gz-common mesh geometry source. SubMesh exposes per-vertex
 // position/normal/UV and the index list that the Atom ModelAssetHelpers builder
 // consumes; MeshManager supplies a built-in primitive for the demo gate.
+#include <gz/common/Image.hh>
 #include <gz/common/Mesh.hh>
 #include <gz/common/SubMesh.hh>
 #include <gz/common/MeshManager.hh>
@@ -486,6 +487,13 @@ class O3deBackend::Impl
   // (Same slot a file-decoded gz::common::Image albedo map would fill.)
   public: AZ::Data::Instance<AZ::RPI::StreamingImage> demoBaseColorImage;
   public: AZ::Data::Instance<AZ::RPI::StreamingImage> DemoBaseColorImage();
+  // M11 Phase D: real albedo-map files decoded with gz::common::Image and
+  // uploaded once per unique path (the path a gz material carries). Cached so a
+  // mesh seen every frame uploads only on first sight.
+  public: std::unordered_map<std::string,
+      AZ::Data::Instance<AZ::RPI::StreamingImage>> fileTextures;
+  public: AZ::Data::Instance<AZ::RPI::StreamingImage> FileBaseColorImage(
+      const std::string &_path);
   /// \brief M9: acquire/update/release Atom mesh handles for this->meshes,
   /// mirroring SubmitLights()'s id-keyed lifecycle (render thread only).
   public: void SubmitMeshes();
@@ -2205,6 +2213,58 @@ AZ::Data::Instance<AZ::RPI::StreamingImage> O3deBackend::Impl::DemoBaseColorImag
 }
 
 //////////////////////////////////////////////////
+// M11 Phase D: decode a real albedo-map file with gz::common::Image and upload it
+// to Atom as a StreamingImage (cached per path). This is the path a real gz
+// material's base-color texture takes -- identical to DemoBaseColorImage() except
+// the RGBA pixels come from a decoded file instead of a procedural pattern. Must
+// run on the render thread. Returns null on any failure (caller falls back).
+AZ::Data::Instance<AZ::RPI::StreamingImage> O3deBackend::Impl::FileBaseColorImage(
+    const std::string &_path)
+{
+  auto cached = this->fileTextures.find(_path);
+  if (cached != this->fileTextures.end())
+    return cached->second;
+
+  AZ::Data::Instance<AZ::RPI::StreamingImage> result;  // null until built
+  gz::common::Image img(_path);
+  if (!img.Valid())
+  {
+    std::fprintf(stderr, "[gz-o3de] M11 Phase D: texture file invalid: %s\n",
+        _path.c_str());
+    this->fileTextures[_path] = result;  // cache the failure (don't retry)
+    return result;
+  }
+
+  const std::vector<unsigned char> rgba = img.RGBAData();
+  const uint32_t w = img.Width();
+  const uint32_t h = img.Height();
+  if (rgba.size() < static_cast<size_t>(w) * h * 4u || w == 0u || h == 0u)
+  {
+    std::fprintf(stderr,
+        "[gz-o3de] M11 Phase D: texture decode produced no pixels: %s\n",
+        _path.c_str());
+    this->fileTextures[_path] = result;
+    return result;
+  }
+
+  auto *imageSystem = AZ::RPI::ImageSystemInterface::Get();
+  const AZ::Data::Instance<AZ::RPI::StreamingImagePool> pool =
+      imageSystem ? imageSystem->GetSystemStreamingPool()
+                  : AZ::Data::Instance<AZ::RPI::StreamingImagePool>();
+  if (pool)
+  {
+    result = AZ::RPI::StreamingImage::CreateFromCpuData(
+        *pool, AZ::RHI::ImageDimension::Image2D, AZ::RHI::Size(w, h, 1u),
+        AZ::RHI::Format::R8G8B8A8_UNORM_SRGB, rgba.data(), rgba.size());
+  }
+  std::fprintf(stderr,
+      "[gz-o3de] M11 Phase D: albedo file %s (%ux%u) -> texture %s\n",
+      _path.c_str(), w, h, result ? "READY" : "FAILED");
+  this->fileTextures[_path] = result;
+  return result;
+}
+
+//////////////////////////////////////////////////
 void O3deBackend::Impl::SubmitMeshes()
 {
   if (!this->meshFp)
@@ -2360,14 +2420,17 @@ void O3deBackend::Impl::SubmitMeshes()
                   std::clamp(m.metallic, 0.0f, 1.0f));
           }
 
-          // M11 Phase B: bind the base-color texture (procedural checker for the
-          // demo; the same SetPropertyValue<Instance<Image>> path takes a
-          // file-decoded albedo map). baseColor.useTexture must be true for the
-          // StandardPBR shader to sample textureMap instead of the flat color.
-          if (m.textured)
+          // M11 Phase B/D: bind a base-color texture. A real albedo FILE
+          // (texturePath, decoded via gz::common::Image -- the gz-material path)
+          // takes precedence; otherwise the procedural checker. Same
+          // SetPropertyValue<Instance<Image>> binding either way;
+          // baseColor.useTexture must be true for StandardPBR to sample
+          // textureMap instead of the flat color.
+          if (!m.texturePath.empty() || m.textured)
           {
             const AZ::Data::Instance<AZ::RPI::StreamingImage> tex =
-                this->DemoBaseColorImage();
+                !m.texturePath.empty() ? this->FileBaseColorImage(m.texturePath)
+                                       : this->DemoBaseColorImage();
             const auto texIdx =
                 material->FindPropertyIndex(AZ::Name("baseColor.textureMap"));
             const auto useTexIdx =
@@ -3876,7 +3939,14 @@ static void MaybeInjectDemoMeshData(std::vector<O3deMeshData> &_meshes)
     textured.color[0] = 1.0f; textured.color[1] = 1.0f; textured.color[2] = 1.0f;
     textured.color[3] = 1.0f;
     textured.roughness = 0.55f;
-    textured.textured = true;
+    // M11 Phase D: if a real albedo file is provided (the live demo points this
+    // at a shipped PNG), decode + bind THAT; otherwise fall back to the
+    // procedural checker. This is exactly how a gz material's base-color texture
+    // path would drive the mesh.
+    if (const char *tf = std::getenv("GZ_O3DE_DEMO_TEXTURE"))
+      textured.texturePath = tf;
+    else
+      textured.textured = true;
     _meshes.push_back(textured);
   }
 }

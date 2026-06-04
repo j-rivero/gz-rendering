@@ -90,6 +90,10 @@ export GZ_O3DE_INTEROP_LIVE=1
 export GZ_O3DE_INTEROP_SEM=1
 # Inject the box/sphere/cylinder when the scene is empty (stands in for gz-sim).
 export GZ_O3DE_DEMO_SHAPES=1
+# M11 Phase D: point the demo's textured sphere at a real albedo PNG, decoded at
+# runtime via gz::common::Image (the path a gz material's base-color texture
+# takes). Unset to fall back to the procedural checkerboard.
+export GZ_O3DE_DEMO_TEXTURE="${GZ_O3DE_DEMO_TEXTURE:-$SCRIPT_DIR/assets/gz_albedo_demo.png}"
 # NOTE: the gz::common->Atom runtime hero mesh used to need GZ_O3DE_MESH_EMISSIVE=1
 # (drive colour through emissive) because it rendered black under scene lighting.
 # RenderDoc proved that was never a renderer bug -- the box shades correctly; its

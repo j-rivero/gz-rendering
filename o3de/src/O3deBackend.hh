@@ -19,6 +19,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 // NOTE: This header is the *only* bridge between the gz-rendering wrapper
@@ -184,11 +185,13 @@ namespace gz
       // "leave the material default" so callers that don't care don't override.
       float metallic = -1.0f;   //!< StandardPBR metallic.factor (<0 = default).
       float roughness = -1.0f;  //!< StandardPBR roughness.factor (<0 = default).
-      // M11 Phase B: when true the per-mesh material binds a base-color texture
-      // (baseColor.textureMap + useTexture). The backend currently supplies a
-      // procedural RGBA checkerboard StreamingImage; the same path accepts a
-      // file-decoded albedo map (gz::common::Image) with no API change.
-      bool textured = false;    //!< Bind the demo base-color texture.
+      // M11 Phase B: when true the per-mesh material binds the procedural
+      // checkerboard base-color texture (baseColor.textureMap + useTexture).
+      bool textured = false;    //!< Bind the demo checker base-color texture.
+      // M11 Phase D: a real base-color (albedo) texture FILE, decoded at runtime
+      // via gz::common::Image and uploaded to Atom -- the path a real gz material
+      // carries. Takes precedence over `textured` when non-empty.
+      std::string texturePath;  //!< Albedo map file path (empty = none).
     };
 
     /// \brief Camera pose + projection for one frame, in gz world coordinates.
