@@ -521,13 +521,30 @@ class O3deBackend::Impl
   // (Same slot a file-decoded gz::common::Image albedo map would fill.)
   public: AZ::Data::Instance<AZ::RPI::StreamingImage> demoBaseColorImage;
   public: AZ::Data::Instance<AZ::RPI::StreamingImage> DemoBaseColorImage();
-  // M11 Phase D: real albedo-map files decoded with gz::common::Image and
-  // uploaded once per unique path (the path a gz material carries). Cached so a
-  // mesh seen every frame uploads only on first sight.
-  public: std::unordered_map<std::string,
+  // M11 Phase D / M13: textures decoded with gz::common::Image and uploaded
+  // once to Atom, cached so a mesh seen every frame uploads only on first
+  // sight. Two sources, each keyed WITH the srgb flag (albedo is sRGB;
+  // normal/metalness/roughness data is linear -- uploading those as sRGB is
+  // the classic washed-out-normals bug):
+  //  - fileTextures: by file path (.dae sidecar textures, gz-API texture
+  //    files). Failures are cached as null so a bad path logs once.
+  //  - memTextures: by image object address (GLB embedded textures).
+  //    Decode failures are likewise cached as null (keyed by the live image
+  //    address) so a bad image logs once. The shared_ptr in
+  //    meshFileMaterials keeps the image alive while its mesh is registered,
+  //    so the key cannot dangle while cached entries are reachable; a
+  //    recycled address after unregister could at worst serve a stale
+  //    texture to a brand-new image (accepted PoC risk).
+  public: std::map<std::pair<std::string, bool>,
       AZ::Data::Instance<AZ::RPI::StreamingImage>> fileTextures;
-  public: AZ::Data::Instance<AZ::RPI::StreamingImage> FileBaseColorImage(
-      const std::string &_path);
+  public: std::map<std::pair<const void *, bool>,
+      AZ::Data::Instance<AZ::RPI::StreamingImage>> memTextures;
+  public: AZ::Data::Instance<AZ::RPI::StreamingImage>
+      StreamingImageFromCommonImage(const gz::common::Image &_img, bool _srgb);
+  public: AZ::Data::Instance<AZ::RPI::StreamingImage> FileTexture(
+      const std::string &_path, bool _srgb);
+  public: AZ::Data::Instance<AZ::RPI::StreamingImage> MemTexture(
+      const std::shared_ptr<const gz::common::Image> &_img, bool _srgb);
   /// \brief M9: acquire/update/release Atom mesh handles for this->meshes,
   /// mirroring SubmitLights()'s id-keyed lifecycle (render thread only).
   public: void SubmitMeshes();
@@ -2317,39 +2334,22 @@ AZ::Data::Instance<AZ::RPI::StreamingImage> O3deBackend::Impl::DemoBaseColorImag
 }
 
 //////////////////////////////////////////////////
-// M11 Phase D: decode a real albedo-map file with gz::common::Image and upload it
-// to Atom as a StreamingImage (cached per path). This is the path a real gz
-// material's base-color texture takes -- identical to DemoBaseColorImage() except
-// the RGBA pixels come from a decoded file instead of a procedural pattern. Must
-// run on the render thread. Returns null on any failure (caller falls back).
-AZ::Data::Instance<AZ::RPI::StreamingImage> O3deBackend::Impl::FileBaseColorImage(
-    const std::string &_path)
+// M11 Phase D / M13: upload a decoded gz::common::Image to Atom as a
+// StreamingImage. _srgb selects R8G8B8A8_UNORM_SRGB (albedo/base-color) vs
+// R8G8B8A8_UNORM (linear data: normal, metalness, roughness maps). Must run
+// on the render thread. Returns null on any failure (caller falls back).
+AZ::Data::Instance<AZ::RPI::StreamingImage>
+O3deBackend::Impl::StreamingImageFromCommonImage(
+    const gz::common::Image &_img, bool _srgb)
 {
-  auto cached = this->fileTextures.find(_path);
-  if (cached != this->fileTextures.end())
-    return cached->second;
-
   AZ::Data::Instance<AZ::RPI::StreamingImage> result;  // null until built
-  gz::common::Image img(_path);
-  if (!img.Valid())
-  {
-    std::fprintf(stderr, "[gz-o3de] M11 Phase D: texture file invalid: %s\n",
-        _path.c_str());
-    this->fileTextures[_path] = result;  // cache the failure (don't retry)
+  if (!_img.Valid())
     return result;
-  }
-
-  const std::vector<unsigned char> rgba = img.RGBAData();
-  const uint32_t w = img.Width();
-  const uint32_t h = img.Height();
+  const std::vector<unsigned char> rgba = _img.RGBAData();
+  const uint32_t w = _img.Width();
+  const uint32_t h = _img.Height();
   if (rgba.size() < static_cast<size_t>(w) * h * 4u || w == 0u || h == 0u)
-  {
-    std::fprintf(stderr,
-        "[gz-o3de] M11 Phase D: texture decode produced no pixels: %s\n",
-        _path.c_str());
-    this->fileTextures[_path] = result;
     return result;
-  }
 
   auto *imageSystem = AZ::RPI::ImageSystemInterface::Get();
   const AZ::Data::Instance<AZ::RPI::StreamingImagePool> pool =
@@ -2359,12 +2359,57 @@ AZ::Data::Instance<AZ::RPI::StreamingImage> O3deBackend::Impl::FileBaseColorImag
   {
     result = AZ::RPI::StreamingImage::CreateFromCpuData(
         *pool, AZ::RHI::ImageDimension::Image2D, AZ::RHI::Size(w, h, 1u),
-        AZ::RHI::Format::R8G8B8A8_UNORM_SRGB, rgba.data(), rgba.size());
+        _srgb ? AZ::RHI::Format::R8G8B8A8_UNORM_SRGB
+              : AZ::RHI::Format::R8G8B8A8_UNORM,
+        rgba.data(), rgba.size());
   }
+  return result;
+}
+
+//////////////////////////////////////////////////
+// Decode a texture FILE and upload it (cached per path+srgb, failures
+// cached as null so a bad path logs once). This is the path a gz material's
+// Texture() or a .dae sidecar texture takes.
+AZ::Data::Instance<AZ::RPI::StreamingImage> O3deBackend::Impl::FileTexture(
+    const std::string &_path, bool _srgb)
+{
+  const auto key = std::make_pair(_path, _srgb);
+  auto cached = this->fileTextures.find(key);
+  if (cached != this->fileTextures.end())
+    return cached->second;
+
+  gz::common::Image img(_path);
+  AZ::Data::Instance<AZ::RPI::StreamingImage> result =
+      img.Valid() ? this->StreamingImageFromCommonImage(img, _srgb)
+                  : AZ::Data::Instance<AZ::RPI::StreamingImage>();
   std::fprintf(stderr,
-      "[gz-o3de] M11 Phase D: albedo file %s (%ux%u) -> texture %s\n",
-      _path.c_str(), w, h, result ? "READY" : "FAILED");
-  this->fileTextures[_path] = result;
+      "[gz-o3de] texture file %s (srgb=%d) -> %s\n",
+      _path.c_str(), _srgb ? 1 : 0, result ? "READY" : "FAILED");
+  this->fileTextures[key] = result;
+  return result;
+}
+
+//////////////////////////////////////////////////
+// M13: upload an IN-MEMORY gz::common::Image (GLB embedded texture, already
+// decoded by the mesh loader), cached per image address+srgb.
+AZ::Data::Instance<AZ::RPI::StreamingImage> O3deBackend::Impl::MemTexture(
+    const std::shared_ptr<const gz::common::Image> &_img, bool _srgb)
+{
+  if (!_img)
+    return {};
+  const auto key = std::make_pair(
+      static_cast<const void *>(_img.get()), _srgb);
+  auto cached = this->memTextures.find(key);
+  if (cached != this->memTextures.end())
+    return cached->second;
+
+  AZ::Data::Instance<AZ::RPI::StreamingImage> result =
+      this->StreamingImageFromCommonImage(*_img, _srgb);
+  std::fprintf(stderr,
+      "[gz-o3de] M13 in-memory texture %ux%u (srgb=%d) -> %s\n",
+      _img->Width(), _img->Height(), _srgb ? 1 : 0,
+      result ? "READY" : "FAILED");
+  this->memTextures[key] = result;
   return result;
 }
 
@@ -2534,7 +2579,7 @@ void O3deBackend::Impl::SubmitMeshes()
           if (!m.texturePath.empty() || m.textured)
           {
             const AZ::Data::Instance<AZ::RPI::StreamingImage> tex =
-                !m.texturePath.empty() ? this->FileBaseColorImage(m.texturePath)
+                !m.texturePath.empty() ? this->FileTexture(m.texturePath, true)
                                        : this->DemoBaseColorImage();
             const auto texIdx =
                 material->FindPropertyIndex(AZ::Name("baseColor.textureMap"));
