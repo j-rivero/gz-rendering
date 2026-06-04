@@ -2593,6 +2593,94 @@ void O3deBackend::Impl::SubmitMeshes()
             }
           }
 
+          // M13: no explicit gz material on this mesh (all-sentinel
+          // snapshot: GatherFrame sets metallic/roughness/texturePath
+          // unconditionally when a gz material is attached) -> auto-apply
+          // the material the mesh FILE carries, extracted at RegisterMesh.
+          // An explicitly-set gz material wins ENTIRELY (no mixing).
+          // m.textured (the demo checker) counts as explicit too, keeping
+          // this block mutually exclusive with the M11 binding above.
+          const bool explicitMat = m.metallic >= 0.0f ||
+              m.roughness >= 0.0f || !m.texturePath.empty() || m.textured;
+          if (!explicitMat)
+          {
+            MeshFileMaterialCpu fm;
+            {
+              std::lock_guard<std::mutex> lock(this->mutex);
+              auto fIt = this->meshFileMaterials.find(m.id);
+              if (fIt != this->meshFileMaterials.end())
+                fm = fIt->second;  // cheap: floats + shared_ptrs
+            }
+            if (fm.present)
+            {
+              const auto fcIdx =
+                  material->FindPropertyIndex(AZ::Name("baseColor.color"));
+              if (fcIdx.IsValid())
+                material->SetPropertyValue(fcIdx, AZ::Color(
+                    fm.color[0], fm.color[1], fm.color[2], fm.color[3]));
+              const auto fmIdx =
+                  material->FindPropertyIndex(AZ::Name("metallic.factor"));
+              if (fmIdx.IsValid())
+                material->SetPropertyValue(fmIdx,
+                    std::clamp(fm.metalness, 0.0f, 1.0f));
+              const auto frIdx =
+                  material->FindPropertyIndex(AZ::Name("roughness.factor"));
+              if (frIdx.IsValid())
+                material->SetPropertyValue(frIdx,
+                    std::clamp(fm.roughness, 0.0f, 1.0f));
+
+              // One map = one StandardPBR property group. Prefer the
+              // in-memory image (GLB embedded), else the file path (.dae).
+              // Returns the source tag for the telemetry line.
+              auto bindMap = [&](const char *_group,
+                  const std::shared_ptr<const gz::common::Image> &_img,
+                  const std::string &_path, bool _srgb) -> const char *
+              {
+                AZ::Data::Instance<AZ::RPI::StreamingImage> tex;
+                const char *src = "none";
+                if (_img)
+                {
+                  tex = this->MemTexture(_img, _srgb);
+                  src = "mem";
+                }
+                else if (!_path.empty())
+                {
+                  tex = this->FileTexture(_path, _srgb);
+                  src = "path";
+                }
+                else
+                {
+                  return src;  // map not present on this material
+                }
+                if (!tex)
+                  return "fail";  // decode/upload failed (already logged)
+                const auto texIdx = material->FindPropertyIndex(AZ::Name(
+                    AZStd::string::format("%s.textureMap", _group)));
+                const auto useIdx = material->FindPropertyIndex(AZ::Name(
+                    AZStd::string::format("%s.useTexture", _group)));
+                if (!texIdx.IsValid() || !useIdx.IsValid())
+                  return "fail";
+                material->SetPropertyValue(texIdx,
+                    AZ::Data::Instance<AZ::RPI::Image>(tex));
+                material->SetPropertyValue(useIdx, true);
+                return src;
+              };
+              const char *aSrc =
+                  bindMap("baseColor", fm.albedoImg, fm.albedoPath, true);
+              const char *nSrc =
+                  bindMap("normal", fm.normalImg, fm.normalPath, false);
+              const char *mSrc = bindMap("metallic",
+                  fm.metalnessImg, fm.metalnessPath, false);
+              const char *rSrc = bindMap("roughness",
+                  fm.roughnessImg, fm.roughnessPath, false);
+              std::fprintf(stderr,
+                  "[gz-o3de] M13 file-material id=%llu albedo=%s normal=%s "
+                  "metal=%s rough=%s factors m=%.2f r=%.2f\n",
+                  static_cast<unsigned long long>(m.id),
+                  aSrc, nSrc, mSrc, rSrc, fm.metalness, fm.roughness);
+            }
+          }
+
           // Emissive visibility workaround (see limitation note above). Gated by
           // GZ_O3DE_MESH_EMISSIVE (the live demo sets it) so it is opt-in: once
           // the runtime-mesh-unlit bug is fixed the mesh will shade from baseColor
