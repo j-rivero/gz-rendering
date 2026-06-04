@@ -43,4 +43,6 @@ export GZ_O3DE_DEMO_IBL=1
 TEX="$SCRIPT_DIR/../native_vulkan_live/assets/gz_albedo_demo.png"
 OUT="${1:-/tmp/m12_pbr_materials.png}"
 
+[ -f "$TEX" ] || echo "WARN: texture not found at $TEX -- textured sphere will be plain white" >&2
+
 exec "$SCRIPT_DIR/build/pbr_materials" "$TEX" "$OUT"

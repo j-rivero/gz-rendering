@@ -24,8 +24,10 @@
 // Usage: pbr_materials [albedo.png] [output.png]
 // (run via pbr_materials.sh, which sets up the plugin + Atom runtime env)
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <thread>
 
@@ -84,6 +86,11 @@ int main(int _argc, char **_argv)
   }
 
   ScenePtr scene = engine->CreateScene("scene");
+  if (!scene)
+  {
+    std::fprintf(stderr, "[pbr_materials] CreateScene failed\n");
+    return 1;
+  }
   scene->SetAmbientLight(0.3, 0.3, 0.3);
   VisualPtr root = scene->RootVisual();
 
@@ -173,11 +180,27 @@ int main(int _argc, char **_argv)
 
   // Capture. The first frames ride out Atom's boot/warmup (~3 s); each
   // Capture() drives a full synchronous offscreen frame + CPU readback.
+  // Zero the (uninitialized) buffer first: Copy() leaves it untouched on
+  // failure, so "still all-zero afterwards" is a sound failed-render probe
+  // (the lit scene below never renders fully black).
   Image image = camera->CreateImage();
+  const std::size_t bufSize = static_cast<std::size_t>(
+      camera->ImageWidth()) * camera->ImageHeight() * 3u;
+  std::memset(image.Data<unsigned char>(), 0, bufSize);
   for (int frame = 0; frame < 30; ++frame)
   {
     camera->Capture(image);
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+
+  const unsigned char *buf = image.Data<unsigned char>();
+  if (std::all_of(buf, buf + bufSize,
+      [](unsigned char _b) { return _b == 0u; }))
+  {
+    std::fprintf(stderr, "[pbr_materials] ERROR: every frame came back "
+        "black/untouched -- the backend never rendered (stale plugin .so? "
+        "check GZ_RENDERING_PLUGIN_PATH and the engine log above)\n");
+    return 1;
   }
 
   common::Image out;

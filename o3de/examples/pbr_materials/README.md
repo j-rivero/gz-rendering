@@ -9,7 +9,8 @@ path and writes a PNG.
 ## Build
 
 ```bash
-source /home/jrivero/code/gz/ws_o3de_rendering/install/setup.bash
+# GZ_O3DE_WS defaults to /home/jrivero/code/gz/ws_o3de_rendering in the launcher
+source "${GZ_O3DE_WS:-/home/jrivero/code/gz/ws_o3de_rendering}"/install/setup.bash
 cmake -S . -B build
 cmake --build build -j5
 ```
