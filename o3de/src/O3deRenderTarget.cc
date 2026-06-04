@@ -183,6 +183,15 @@ namespace
             md.color[1] = c.G();
             md.color[2] = c.B();
             md.color[3] = c.A();
+            // M12: real gz material -> Atom StandardPBR. Set unconditionally
+            // when a material is attached: gz defaults are legitimate values;
+            // the -1 "leave Atom default" sentinels remain only for
+            // material-less meshes. A non-empty texture path is decoded +
+            // cached backend-side (FileBaseColorImage, M11-D); empty means
+            // no albedo map, exactly as before.
+            md.metallic = mat->Metalness();
+            md.roughness = mat->Roughness();
+            md.texturePath = mat->Texture();
           }
           _meshes.push_back(md);
           continue;

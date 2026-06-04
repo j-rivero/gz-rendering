@@ -29,9 +29,13 @@ namespace gz
     //
     /// \brief O3DE implementation of the Material class.
     ///
-    /// For the M0 stub the color/PBR state is held by BaseMaterial; no
-    /// Atom material asset is created yet. A later milestone will map the
-    /// diffuse/ambient color onto AuxGeom draws.
+    /// The color/PBR state is held by BaseMaterial; no Atom-side object
+    /// exists per gz material. Properties cross to the renderer via the
+    /// per-frame snapshot: O3deRenderTarget::GatherFrame reads Diffuse /
+    /// Metalness / Roughness / Texture into O3deMeshData (M12) and the
+    /// backend applies them to the per-mesh StandardPBR material instance
+    /// (M11). Mesh geometries only; AuxGeom primitives use the flat
+    /// diffuse colour.
     class GZ_RENDERING_O3DE_VISIBLE O3deMaterial :
       public BaseMaterial<O3deObject>
     {
