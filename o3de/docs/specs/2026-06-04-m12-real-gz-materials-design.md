@@ -49,9 +49,10 @@ extend the existing `if (MaterialPtr mat = o3deMesh->Material())` body:
   caches per path — unchanged.
 - `md.color` from `Diffuse()` — already present.
 
-No backend (`O3deBackend.cc`) changes. No `O3deMaterial.cc` changes;
-update its class comment to say properties are consumed via the frame
-snapshot in `GatherFrame`.
+No backend (`O3deBackend.cc`) changes. `O3deMaterial` gains storage
+overrides for texture/roughness/metalness (see Context above), and its
+class comment says properties are consumed via the frame snapshot in
+`GatherFrame`.
 
 ## Part 2 — Driver example (`o3de/examples/pbr_materials/`)
 
