@@ -68,6 +68,7 @@
 // processors we acquire/release/sync handles against. PhotometricValue
 // supplies the strongly-typed colour types Set*Intensity takes.
 #include <Atom/Feature/CoreLights/DirectionalLightFeatureProcessorInterface.h>
+#include <Atom/Feature/ImageBasedLights/ImageBasedLightFeatureProcessorInterface.h>
 #include <Atom/Feature/CoreLights/SimplePointLightFeatureProcessorInterface.h>
 #include <Atom/Feature/CoreLights/SimpleSpotLightFeatureProcessorInterface.h>
 #include <Atom/Feature/Shadows/ProjectedShadowFeatureProcessorInterface.h>
@@ -100,6 +101,7 @@
 #include <Atom/RPI.Public/Image/StreamingImage.h>
 #include <Atom/RPI.Public/Image/StreamingImagePool.h>
 #include <Atom/RPI.Reflect/Image/AttachmentImageAssetCreator.h>
+#include <Atom/RPI.Reflect/Image/StreamingImageAsset.h>
 #include <Atom/RPI.Reflect/System/SceneDescriptor.h>
 #include <Atom/RPI.Reflect/System/RenderPipelineDescriptor.h>
 #include <Atom/RHI/RHISystemInterface.h>
@@ -419,6 +421,10 @@ class O3deBackend::Impl
       = nullptr;
   public: AZ::Render::SimpleSpotLightFeatureProcessorInterface *spotLightFp
       = nullptr;
+  // M11 Phase C: image-based lighting. Cached FP + a one-shot loader that feeds
+  // it the cooked default IBL cubemaps so metals reflect an environment.
+  public: AZ::Render::ImageBasedLightFeatureProcessorInterface *iblFp = nullptr;
+  public: void SetupIbl();
   // M7 Phase A1: ProjectedShadowFP. Cached only -- Acquire/SetShadowProperties
   // wiring lands in Phase A2 once we have proof that registering this FP
   // doesn't grey-screen the demo the way DirectionalLightFP did.
@@ -711,6 +717,8 @@ bool O3deBackend::Impl::SetupScene(uint32_t _width, uint32_t _height)
         AZ::Render::ProjectedShadowFeatureProcessorInterface>();
     this->meshFp = this->scene->GetFeatureProcessor<
         AZ::Render::MeshFeatureProcessorInterface>();
+    this->iblFp = this->scene->GetFeatureProcessor<
+        AZ::Render::ImageBasedLightFeatureProcessorInterface>();
     std::fprintf(stderr,
         "[gz-o3de] M6 light FPs cached: dir=%p point=%p spot=%p\n",
         static_cast<void *>(this->dirLightFp),
@@ -720,6 +728,7 @@ bool O3deBackend::Impl::SetupScene(uint32_t _width, uint32_t _height)
         "[gz-o3de] M7 shadow FPs cached: projected=%p mesh=%p\n",
         static_cast<void *>(this->projectedShadowFp),
         static_cast<void *>(this->meshFp));
+    this->SetupIbl();
     this->AcquireDemoMeshes();
     // Create the exportable image + pipeline at the bootstrap placeholder size so
     // the consumer has an image to import the moment it builds its texture node
@@ -804,6 +813,8 @@ bool O3deBackend::Impl::SetupScene(uint32_t _width, uint32_t _height)
       AZ::Render::ProjectedShadowFeatureProcessorInterface>();
   this->meshFp = this->scene->GetFeatureProcessor<
       AZ::Render::MeshFeatureProcessorInterface>();
+  this->iblFp = this->scene->GetFeatureProcessor<
+      AZ::Render::ImageBasedLightFeatureProcessorInterface>();
   std::fprintf(stderr,
       "[gz-o3de] M6 light FPs cached: dir=%p point=%p spot=%p\n",
       static_cast<void *>(this->dirLightFp),
@@ -813,6 +824,7 @@ bool O3deBackend::Impl::SetupScene(uint32_t _width, uint32_t _height)
       "[gz-o3de] M7 shadow FPs cached: projected=%p mesh=%p\n",
       static_cast<void *>(this->projectedShadowFp),
       static_cast<void *>(this->meshFp));
+  this->SetupIbl();
   this->AcquireDemoMeshes();
 
   // Apply the multisample state at the application level *after* the scene is
@@ -2081,6 +2093,65 @@ void O3deBackend::Impl::AcquireDemoMeshes()
         aznumeric_cast<float>(d.scale.GetZ()),
         this->demoMeshHandles.size());
   }
+}
+
+//////////////////////////////////////////////////
+// M11 Phase C: feed the registered ImageBasedLightFeatureProcessor the cooked
+// default IBL cubemaps (specular = prefiltered-mip cubemap, diffuse = irradiance
+// cubemap) so metallic/smooth surfaces reflect an environment instead of reading
+// black. One-shot; safe to call once per scene setup.
+//
+// Policy: IBL ambient lifts the whole scene, which WASHES OUT the full demo's
+// tuned cast-shadow contrast (floor measured srgb~240 with IBL vs ~148 without).
+// So IBL is enabled by default ONLY in the materials showcase
+// (GZ_O3DE_DEMO_PBR_ONLY, which has no shadows); in the normal shadow demo it is
+// off unless explicitly requested with GZ_O3DE_DEMO_IBL=1. GZ_O3DE_DEMO_NO_IBL=1
+// force-disables; GZ_O3DE_IBL_EXPOSURE (stops, EV) tunes brightness.
+void O3deBackend::Impl::SetupIbl()
+{
+  if (!this->iblFp)
+    return;
+  if (std::getenv("GZ_O3DE_DEMO_NO_IBL"))
+    return;
+  const bool pbrOnly = std::getenv("GZ_O3DE_DEMO_PBR_ONLY") != nullptr;
+  const bool forceIbl = std::getenv("GZ_O3DE_DEMO_IBL") != nullptr;
+  if (!pbrOnly && !forceIbl)
+  {
+    std::fprintf(stderr,
+        "[gz-o3de] M11 Phase C IBL: skipped (preserves shadow contrast; set "
+        "GZ_O3DE_DEMO_IBL=1 to enable in the full demo)\n");
+    return;
+  }
+
+  // Cooked products in this project's asset cache (lightingpresets/). The
+  // specular variant carries the prefiltered roughness mip chain; the diffuse
+  // variant is the low-order irradiance cubemap.
+  auto specular = AZ::RPI::AssetUtils::LoadCriticalAsset<
+      AZ::RPI::StreamingImageAsset>(
+          "lightingpresets/default_iblskyboxcm_iblspecular.exr.streamingimage",
+          AZ::RPI::AssetUtils::TraceLevel::Warning);
+  auto diffuse = AZ::RPI::AssetUtils::LoadCriticalAsset<
+      AZ::RPI::StreamingImageAsset>(
+          "lightingpresets/default_iblskyboxcm_ibldiffuse.exr.streamingimage",
+          AZ::RPI::AssetUtils::TraceLevel::Warning);
+  if (!specular.IsReady() || !diffuse.IsReady())
+  {
+    std::fprintf(stderr,
+        "[gz-o3de] M11 Phase C IBL: cubemap load FAILED (spec ready=%d diff "
+        "ready=%d) -- metals stay dark\n",
+        specular.IsReady() ? 1 : 0, diffuse.IsReady() ? 1 : 0);
+    return;
+  }
+
+  this->iblFp->SetSpecularImage(specular);
+  this->iblFp->SetDiffuseImage(diffuse);
+  float exposure = -0.5f;
+  if (const char *e = std::getenv("GZ_O3DE_IBL_EXPOSURE"))
+    exposure = static_cast<float>(std::atof(e));
+  this->iblFp->SetExposure(exposure);
+  std::fprintf(stderr,
+      "[gz-o3de] M11 Phase C IBL: default cubemaps bound (exposure %.2f EV)\n",
+      exposure);
 }
 
 //////////////////////////////////////////////////
@@ -3750,12 +3821,12 @@ static void MaybeInjectDemoMeshData(std::vector<O3deMeshData> &_meshes)
     }
 
     // Roughness sweep: 5 mid-grey dielectric spheres, roughness .05 -> .95.
-    // In PBR_ONLY isolation the row is lifted to camera height (z=1.1) and
-    // pushed slightly back on an empty floor so all five frame cleanly.
+    // In PBR_ONLY isolation the roughness sweep is the BACK row (lifted, pushed
+    // back) so the front row [gold | checker | steel] stays unobstructed.
     const float rowY0 = 2.2f;      // screen-left start (gz +Y = left)
     const float rowDy = -1.1f;     // step toward screen-right
-    const double rowX = pbrOnly ? 0.8 : 0.3;
-    const double rowZ = pbrOnly ? 1.1 : 0.45;
+    const double rowX = pbrOnly ? 1.6 : 0.3;
+    const double rowZ = pbrOnly ? 1.55 : 0.45;
     for (int i = 0; i < kRoughN; ++i)
     {
       O3deMeshData s;
@@ -3773,16 +3844,21 @@ static void MaybeInjectDemoMeshData(std::vector<O3deMeshData> &_meshes)
     // Metallic pair (gold + steel) one row back, so the metal/dielectric
     // contrast is visible side by side. Dark without IBL, but the warm vs cool
     // specular tint still distinguishes them.
-    const float metZ = pbrOnly ? 1.1f : 0.45f, metX = pbrOnly ? 2.6f : 1.9f;
+    // PBR_ONLY: gold + steel flank the textured sphere as the FRONT row, close
+    // to the camera and unobstructed so the IBL environment reflection is plain.
+    const float metZ = pbrOnly ? 0.95f : 0.45f, metX = pbrOnly ? -0.3f : 1.9f;
+    const float metY = pbrOnly ? 1.3f : 0.7f;
     O3deMeshData gold;
     gold.id = kPbrRowBase + kRoughN;
-    gold.pos[0] = metX; gold.pos[1] = 0.7; gold.pos[2] = metZ;
+    gold.pos[0] = metX; gold.pos[1] = metY; gold.pos[2] = metZ;
+    gold.scale[0] = gold.scale[1] = gold.scale[2] = pbrOnly ? 1.3 : 1.0;
     gold.color[0] = 1.0f; gold.color[1] = 0.78f; gold.color[2] = 0.34f;
     gold.color[3] = 1.0f; gold.metallic = 1.0f; gold.roughness = 0.25f;
     _meshes.push_back(gold);
     O3deMeshData steel;
     steel.id = kPbrRowBase + kRoughN + 1;
-    steel.pos[0] = metX; steel.pos[1] = -0.7; steel.pos[2] = metZ;
+    steel.pos[0] = metX; steel.pos[1] = -metY; steel.pos[2] = metZ;
+    steel.scale[0] = steel.scale[1] = steel.scale[2] = pbrOnly ? 1.3 : 1.0;
     steel.color[0] = 0.92f; steel.color[1] = 0.94f; steel.color[2] = 1.0f;
     steel.color[3] = 1.0f; steel.metallic = 1.0f; steel.roughness = 0.18f;
     _meshes.push_back(steel);
@@ -3792,11 +3868,11 @@ static void MaybeInjectDemoMeshData(std::vector<O3deMeshData> &_meshes)
     // path + UVs). Front-and-centre on open floor so the checker is legible.
     O3deMeshData textured;
     textured.id = kPbrRowBase + kRoughN + 2;
-    textured.pos[0] = pbrOnly ? 0.2 : 0.0;
+    textured.pos[0] = pbrOnly ? -0.3 : 0.0;
     textured.pos[1] = pbrOnly ? 0.0 : -1.7;
-    textured.pos[2] = pbrOnly ? 1.1 : 0.55;
+    textured.pos[2] = pbrOnly ? 0.95 : 0.55;
     textured.scale[0] = textured.scale[1] = textured.scale[2] =
-        pbrOnly ? 1.6 : 1.2;
+        pbrOnly ? 1.3 : 1.2;
     textured.color[0] = 1.0f; textured.color[1] = 1.0f; textured.color[2] = 1.0f;
     textured.color[3] = 1.0f;
     textured.roughness = 0.55f;
