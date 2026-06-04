@@ -2629,6 +2629,20 @@ void O3deBackend::Impl::SubmitMeshes()
                 material->SetPropertyValue(frIdx,
                     std::clamp(fm.roughness, 0.0f, 1.0f));
 
+              // Render file-material meshes double-sided. glTF assets are
+              // routinely authored with doubleSided=true thin shells (the
+              // jetty Forklift's wheel faces and chassis panels vanish under
+              // back-face culling), and gz-common only propagates the glTF
+              // flag for alphaMode=MASK materials (AssimpLoader reads
+              // AI_MATKEY_TWOSIDED inside the MASK branch only), so the
+              // authored value is unrecoverable for OPAQUE assets. Closed
+              // meshes render identically (back faces are occluded); the
+              // only cost is the lost back-face cull.
+              const auto dsIdx = material->FindPropertyIndex(
+                  AZ::Name("general.doubleSided"));
+              if (dsIdx.IsValid())
+                material->SetPropertyValue(dsIdx, true);
+
               // One map = one StandardPBR property group. Prefer the
               // in-memory image (GLB embedded), else the file path (.dae).
               // Returns the source tag for the telemetry line.
