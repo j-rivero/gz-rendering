@@ -4091,6 +4091,68 @@ static void MaybeInjectDemoMeshData(std::vector<O3deMeshData> &_meshes)
   if (!pbrOnly)
     _meshes.push_back(m);
 
+  // M13 demo aid: drop a real mesh FILE (GLB/.dae/...) into the live demo so
+  // the auto-applied mesh-file material can be inspected interactively.
+  // Loaded via gz-common once; the model is recentred so it slow-spins IN
+  // PLACE about +Z with its bounding box resting on the floor. Default berth:
+  // centre stage in PBR_ONLY isolation (pair with GZ_O3DE_DEMO_NO_PBR=1 for a
+  // clean look at just the asset), the open right lane in the full demo.
+  // GZ_O3DE_DEMO_MESH_FILE_POS="x y" overrides the berth;
+  // GZ_O3DE_DEMO_ANIMATE=0 freezes the spin.
+  if (const char *mf = std::getenv("GZ_O3DE_DEMO_MESH_FILE"))
+  {
+    constexpr uint64_t kFileMeshId = 0xD00B0u;
+    static bool fileTried = false;
+    static bool fileOk = false;
+    static double fileCx = 0.0, fileCy = 0.0, fileZ0 = 0.0;
+    if (!fileTried)
+    {
+      fileTried = true;
+      const gz::common::Mesh *fileMesh =
+          gz::common::MeshManager::Instance()->Load(mf);
+      if (fileMesh != nullptr && fileMesh->VertexCount() > 0u)
+      {
+        O3deBackend::Instance().RegisterMesh(kFileMeshId, fileMesh);
+        const gz::math::Vector3d mn = fileMesh->Min(), mx = fileMesh->Max();
+        fileCx = 0.5 * (mn.X() + mx.X());
+        fileCy = 0.5 * (mn.Y() + mx.Y());
+        fileZ0 = -mn.Z();
+        fileOk = true;
+        std::fprintf(stderr,
+            "[gz-o3de] M13 DEMO_MESH_FILE: registered %s id=0x%llx "
+            "(%u verts, footprint %.2fx%.2f, h=%.2f)\n",
+            mf, static_cast<unsigned long long>(kFileMeshId),
+            fileMesh->VertexCount(), mx.X() - mn.X(), mx.Y() - mn.Y(),
+            mx.Z() - mn.Z());
+      }
+      else
+      {
+        std::fprintf(stderr,
+            "[gz-o3de] M13 DEMO_MESH_FILE: FAILED to load %s\n", mf);
+      }
+    }
+    if (fileOk)
+    {
+      double bx = pbrOnly ? 0.5 : 1.4;
+      double by = pbrOnly ? 0.0 : -2.9;
+      if (const char *fp = std::getenv("GZ_O3DE_DEMO_MESH_FILE_POS"))
+        std::sscanf(fp, "%lf %lf", &bx, &by);
+      const double fyaw = t * 0.35;
+      const double fc = std::cos(fyaw), fs = std::sin(fyaw);
+      O3deMeshData fd;
+      fd.id = kFileMeshId;
+      // Rotate the recentring offset with the yaw so the model spins about
+      // its own centre instead of orbiting the mesh-file origin.
+      fd.pos[0] = bx - (fc * fileCx - fs * fileCy);
+      fd.pos[1] = by - (fs * fileCx + fc * fileCy);
+      fd.pos[2] = fileZ0;
+      fd.quat[0] = std::cos(fyaw * 0.5);
+      fd.quat[3] = std::sin(fyaw * 0.5);
+      // All-sentinel material: the M13 mesh-file material auto-applies.
+      _meshes.push_back(fd);
+    }
+  }
+
   // M11 PBR showcase: a tidy row of runtime spheres sweeping StandardPBR
   // roughness (left=mirror-sharp .05 -> right=fully-diffuse .95) plus a short
   // metallic pair, all driven through the per-mesh material instance in
