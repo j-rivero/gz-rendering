@@ -175,35 +175,43 @@ Everything in this table is closed. Remaining cleanup TODOs: (1) the manual A2 P
 ## How the demo scene maps to milestones (visual verify guide)
 
 When the demo is running with the default camera pose, the camera looks
-at the world origin from `(-4, 0, 1.2)` pitched down `0.12 rad`. From
-there you should see (left→right):
+at the world origin from `(-4, 0, 1.2)` pitched down `0.12 rad`. After
+the scene reorg + the M11 showcase-shelf polish (`a600e522`, see
+`screenshots/demo-m11-showcase-shelf.png` for the exact expected frame)
+you should see:
 
-* M5-D cyan frustum wireframe (top-left)
-* M0/M3 red box (spinning), green sphere (bobbing), blue cylinder
-  (orbiting), yellow wirebox cage tracking the green sphere
-* M5-C tiny RGB axis arrows at origin
-* M0/M3 orange wall plane (back-centre, lit dim brown without a
-  directional light)
-* M5-A magenta capsule (right, slowly tilting)
-* M0/M3 grey grid floor
-* **M7-B white shaded PBR sphere** stacked above the green sphere — this
-  is the cooked-mesh caster
-* **M7-B solid lit ground disc** under all of it — the flat-sphere
-  receiver
-* (Subtle) M6-C warm yellow tint on the M7 caster's upward-facing cap —
-  the point light contributing on the PBR surface
+* **M11 showcase shelf** floating high across the frame (x=0.9, z=2.6):
+  [gold | roughness sweep .05→.95 | steel] — 7 runtime spheres, metals
+  bookending the sweep (metals read dark without IBL; set
+  `GZ_O3DE_DEMO_IBL=1` to make them reflect)
+* M0/M3 front row on the floor, left→right: red box (spinning in
+  place), green sphere (bobbing) with its yellow wirebox cage, enlarged
+  RGB axis gnomon at the clear origin, blue cylinder (spinning in
+  place), magenta capsule (tilting)
+* **M9/M10 cyan hero box** (runtime gz-common mesh) spinning behind the
+  origin, with the small white satellite orbiting above it at z=1.55
+* **M7/M11-D textured sphere** front-right at (-1.0,-1.6) — the real
+  albedo PNG UV-wrapped (gz "swirl" image)
+* **M7 white cooked caster sphere** floating left-of-centre in the spot
+  beam (its blue beam marker line crosses the frame) with its **cast
+  shadow** on the open floor below-right of it
+* M5-D cyan frustum wireframe (top-right), M0/M3 orange backdrop wall,
+  grey grid floor, M7-B flat-sphere ground disc under everything
+* (Subtle) M6-C warm point-light tint on upward-facing surfaces
 
 The full checklist is `o3de/docs/MANUAL_VERIFY_M5_M7.md` (12 items,
 camera + telemetry).
 
 Reference captures:
 
+* `o3de/docs/screenshots/demo-m11-showcase-shelf.png` — current default
+  frame after the M11 shelf polish (the layout described above)
 * `o3de/docs/screenshots/m7-phase-b-meshes.png` — pre-M7-C, white sphere
-  visible on top of green
+  visible on top of green (historical layout)
 * `o3de/docs/screenshots/m7-phase-c-cranked-lights.png` — M7-C, brighter
-  lighting, no ground disc yet
+  lighting, no ground disc yet (historical layout)
 * `o3de/docs/screenshots/m7-flat-receiver-disc.png` — final M7-C with
-  flat receiver disc visible
+  flat receiver disc visible (historical layout)
 
 ## Architecture quick-reference
 
