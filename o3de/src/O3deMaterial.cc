@@ -28,3 +28,54 @@ O3deMaterial::O3deMaterial()
 O3deMaterial::~O3deMaterial()
 {
 }
+
+//////////////////////////////////////////////////
+void O3deMaterial::SetTexture(const std::string &_texture,
+    const std::shared_ptr<const common::Image> &/*_img*/)
+{
+  // The backend decodes from the file path (FileBaseColorImage, M11-D);
+  // a caller-supplied in-memory image is not consumed yet.
+  this->texture = _texture;
+}
+
+//////////////////////////////////////////////////
+std::string O3deMaterial::Texture() const
+{
+  return this->texture;
+}
+
+//////////////////////////////////////////////////
+bool O3deMaterial::HasTexture() const
+{
+  return !this->texture.empty();
+}
+
+//////////////////////////////////////////////////
+void O3deMaterial::ClearTexture()
+{
+  this->texture.clear();
+}
+
+//////////////////////////////////////////////////
+void O3deMaterial::SetRoughness(const float _roughness)
+{
+  this->roughness = _roughness;
+}
+
+//////////////////////////////////////////////////
+float O3deMaterial::Roughness() const
+{
+  return this->roughness;
+}
+
+//////////////////////////////////////////////////
+void O3deMaterial::SetMetalness(const float _metalness)
+{
+  this->metalness = _metalness;
+}
+
+//////////////////////////////////////////////////
+float O3deMaterial::Metalness() const
+{
+  return this->metalness;
+}

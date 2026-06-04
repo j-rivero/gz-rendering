@@ -19,9 +19,10 @@ injection. This is the first milestone where scene content + materials are
   `Material()->Diffuse()` into `O3deMeshData.color`.
 - `O3deMeshData` already carries `metallic`, `roughness`, `texturePath`
   (M11) — but only the backend's demo injection ever sets them.
-- `O3deMaterial` is a pure `BaseMaterial` stub. That is sufficient:
-  `BaseMaterial` stores all PBR properties; nothing Atom-specific is
-  needed on the gz wrapper side.
+- `O3deMaterial` stores texture path / roughness / metalness itself:
+  `BaseMaterial`'s accessors for these are no-ops (only color and common
+  flags are stored there). Diffuse is stored by `BaseMaterial`. Nothing
+  Atom-specific is needed on the gz wrapper side.
 - All current demo content is backend-injected (`MaybeInjectDemoShapes`),
   bypassing the gz scene graph; the gz scene in the live demo is empty.
 
