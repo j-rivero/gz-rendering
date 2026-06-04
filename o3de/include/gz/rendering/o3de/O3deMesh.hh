@@ -51,6 +51,17 @@ namespace gz
       /// \brief Get the (empty) submesh store backing this fallback mesh.
       protected: virtual SubMeshStorePtr SubMeshes() const override;
 
+      /// \brief Get the mesh-level material (M12).
+      ///
+      /// BaseMesh::Material() reads the material from submesh 0 and returns
+      /// null when the submesh store is empty -- which it always is here
+      /// (the backend consumes the gz-common geometry directly; per-submesh
+      /// materials are out of scope, see O3deSubMesh::SetMaterialImpl).
+      /// Return the mesh-level material BaseMesh::SetMaterial stored
+      /// instead, so O3deRenderTarget::GatherFrame sees the material the
+      /// caller attached.
+      public: virtual MaterialPtr Material() const override;
+
       /// \brief Empty store, allocated once in the constructor and shared.
       protected: O3deSubMeshStorePtr subMeshes;
 

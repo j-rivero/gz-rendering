@@ -38,6 +38,14 @@ SubMeshStorePtr O3deMesh::SubMeshes() const
 }
 
 //////////////////////////////////////////////////
+MaterialPtr O3deMesh::Material() const
+{
+  // Not BaseMesh::Material(): that reads submesh 0 and our store is empty,
+  // so it would always return null (see the header comment).
+  return this->material;
+}
+
+//////////////////////////////////////////////////
 O3deSubMesh::O3deSubMesh() = default;
 
 //////////////////////////////////////////////////
