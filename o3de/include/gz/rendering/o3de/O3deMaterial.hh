@@ -87,6 +87,8 @@ namespace gz
       private: std::string texture;
 
       /// \brief StandardPBR roughness factor (1 = fully diffuse).
+      /// Deliberately 1.0 (not gz-common's Pbr default 0.5): a color-only
+      /// material should read as plain Lambert, with no specular sheen.
       private: float roughness = 1.0f;
 
       /// \brief StandardPBR metalness factor (0 = dielectric).
