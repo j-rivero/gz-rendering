@@ -30,6 +30,8 @@
 #include "gz/rendering/ogre/OgreRTShaderSystem.hh"
 #include "gz/rendering/ogre/OgreScene.hh"
 
+#include "OgreResourcePath.hh"
+
 #if OGRE_VERSION_MAJOR == 1 && OGRE_VERSION_MINOR >= 11
 // Since OGRE 1.11, the once public
 // Ogre::TerrainMaterialGeneratorA::SM2Profile::ShaderHelper
@@ -625,25 +627,16 @@ void OgreHeightmap::Init()
     defaultimp.layerList.resize(this->descriptor.TextureCount());
 
     // The worldSize decides how big each splat of textures will be.
-    // A smaller value will increase the resolution.
-    //
-    // OGRE's FileSystemArchive indexes files by basename. The
-    // TextureManager::load() lookup performed by stock
-    // TerrainMaterialGeneratorA's SM2Profile asks for a resource by the
-    // exact name pushed here -- an absolute file path never matches an
-    // archive entry, the prepare step logs "Cannot locate resource <abs
-    // path> in resource group General" and the texture unit becomes blank.
-    // Push the basename so the lookup hits the parent directory archive
-    // that AddResourcePath above just registered.
+    // A smaller value will increase the resolution
     for (unsigned int i = 0; i < this->descriptor.TextureCount(); ++i)
     {
       auto texture = this->descriptor.TextureByIndex(i);
 
       defaultimp.layerList[i].worldSize = texture->Size();
       defaultimp.layerList[i].textureNames.push_back(
-          common::basename(texture->Diffuse()));
+          OgreResourcePath(texture->Diffuse()));
       defaultimp.layerList[i].textureNames.push_back(
-          common::basename(texture->Normal()));
+          OgreResourcePath(texture->Normal()));
     }
   }
 
