@@ -32,7 +32,6 @@
 #include <OgreTextureManager.h>
 #include <RTShaderSystem/OgreShaderGenerator.h>
 
-#include <gz/common/Filesystem.hh>
 #include <gz/common/Image.hh>
 #include <gz/common/Profiler.hh>
 #include "gz/rendering/ogre/OgreCamera.hh"
@@ -42,6 +41,8 @@
 #include "gz/rendering/ogre/OgreRTShaderSystem.hh"
 #include "gz/rendering/ogre/OgreScene.hh"
 #include "gz/rendering/Utils.hh"
+
+#include "OgreResourcePath.hh"
 
 using namespace gz;
 using namespace rendering;
@@ -565,23 +566,10 @@ void OgreProjectorListener::AddDecalToMaterial(
   this->BindProjectorShader(pass);
   pass->setLightingEnabled(false);
 
-  // Attach the decal texture by name. OGRE's STBI codec (loaded in
-  // OgreRenderEngine::LoadPlugins) decodes the PNG/JPG OGRE 1.12 indexes
-  // textures by basename within a resource location, so register the parent
-  // directory and reference the file by basename (see
-  // OgreMaterial::SetTextureImpl for the same fix).
-  const std::string decalFile = common::basename(this->textureName);
-  const std::string decalDir = common::parentPath(this->textureName);
-  auto &rgm = Ogre::ResourceGroupManager::getSingleton();
-  if (!decalDir.empty() && decalDir != this->textureName &&
-      !rgm.resourceLocationExists(decalDir,
-          Ogre::ResourceGroupManager::DEFAULT_RESOURCE_GROUP_NAME))
-  {
-    rgm.addResourceLocation(decalDir, "FileSystem",
-        Ogre::ResourceGroupManager::DEFAULT_RESOURCE_GROUP_NAME);
-  }
-
-  Ogre::TextureUnitState *texState = pass->createTextureUnitState(decalFile);
+  // A file path is opened by the AbsolutePathLoadingListener installed by
+  // OgreRenderEngine, any other name is looked up in the resource groups
+  Ogre::TextureUnitState *texState =
+      pass->createTextureUnitState(OgreResourcePath(this->textureName));
   texState->setProjectiveTexturing(true, this->frustum.get());
   texState->setTextureAddressingMode(Ogre::TextureUnitState::TAM_BORDER);
   texState->setTextureFiltering(Ogre::TFO_ANISOTROPIC);
