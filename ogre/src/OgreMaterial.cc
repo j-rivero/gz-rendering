@@ -572,9 +572,12 @@ void OgreMaterial::SetVertexShader(const std::string &_path)
       Ogre::HighLevelGpuProgramManager::getSingletonPtr()->createProgram(
           programName, this->ogreGroup,
           "glsl", Ogre::GpuProgramType::GPT_VERTEX_PROGRAM);
+    vertexShader->setSourceFile(path);
   }
-
-  vertexShader->setSourceFile(path);
+  // A program found by name (e.g. when a material is cloned) is already
+  // loaded from the same file. setSourceFile() would clear its source
+  // without reloading it, and the GL render system parses that source to
+  // bind vertex attributes when it links the program.
   vertexShader->load();
 
   assert(vertexShader->isLoaded());
@@ -628,9 +631,11 @@ void OgreMaterial::SetFragmentShader(const std::string &_path)
       Ogre::HighLevelGpuProgramManager::getSingleton().createProgram(
           programName, this->ogreGroup,
           "glsl", Ogre::GpuProgramType::GPT_FRAGMENT_PROGRAM);
+    fragmentShader->setSourceFile(path);
   }
-
-  fragmentShader->setSourceFile(path);
+  // A program found by name (e.g. when a material is cloned) is already
+  // loaded from the same file. setSourceFile() would clear its source
+  // without reloading it, see SetVertexShader.
   fragmentShader->load();
 
   assert(fragmentShader->isLoaded());
