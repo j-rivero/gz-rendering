@@ -1028,10 +1028,18 @@ void OgreHeightmap::CreateMaterial()
 
     this->dataPtr->terrainGlobals->setDefaultMaterialGenerator(ptr);
 #else
-    // On OGRE >= 1.11 rely on TerrainGlobalOptions' stock
-    // TerrainMaterialGeneratorA, whose active Profile is an SM2Profile and
-    // therefore accepts SetupShadows' SM2Profile setters without the ABI
-    // mismatch that GzTerrainMatGen exposed against 1.12.10.
+    // On OGRE >= 1.11 use the stock TerrainMaterialGeneratorA, whose active
+    // Profile is an SM2Profile and therefore accepts SetupShadows'
+    // SM2Profile setters without the ABI mismatch that GzTerrainMatGen
+    // exposed against 1.12.10.
+    // Install a new one per heightmap, as the branch above does:
+    // terrainGlobals outlives the render engine, and a generator kept from
+    // a previous Ogre::Root still points to the composite map scene manager
+    // destroyed with it. It also replaces a TerrainMaterial generator
+    // installed by a previous heightmap with a custom material.
+    this->dataPtr->terrainGlobals->setDefaultMaterialGenerator(
+        Ogre::TerrainMaterialGeneratorPtr(
+            OGRE_NEW Ogre::TerrainMaterialGeneratorA()));
 #endif
 
     this->SetupShadows(true);
