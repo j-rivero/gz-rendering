@@ -1146,6 +1146,18 @@ bool OgreHeightmap::InitBlendMaps(Ogre::Terrain *_terrain)
     map->update();
   }
 
+  // TerrainLayerBlendMap::update() marks the composite map dirty and defers
+  // its update by 2 seconds. OGRE runs the deferred update from
+  // Terrain::preFindVisibleObjects, i.e. inside the first render pass that
+  // finds the terrain once the delay is over. Rendering the composite map
+  // there leaves its render target and projection active for the rest of
+  // that pass, e.g. a GpuRays first pass then renders nothing.
+  // Update it now, outside any render pass, and cancel the deferred update.
+  // The terrain still updates the composite map itself, outside the render
+  // passes, when its derived data (normals, lightmap) is finalised.
+  _terrain->updateCompositeMap();
+  _terrain->updateCompositeMapWithDelay(0);
+
   return true;
 }
 
