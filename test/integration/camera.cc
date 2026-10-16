@@ -799,6 +799,62 @@ TEST_F(CameraTest, GZ_UTILS_TEST_DISABLED_ON_WIN32(ShadersWithSameFileName))
 }
 
 /////////////////////////////////////////////////
+TEST_F(CameraTest, GZ_UTILS_TEST_DISABLED_ON_WIN32(ShaderWithBuiltInFileName))
+{
+  // The engine's own media has a fragment_shader.glsl that draws green
+  // (ogre/src/media/materials/programs). A material using another file with
+  // that name must render that file: the box is red.
+  CHECK_SUPPORTED_ENGINE("ogre");
+
+  ScenePtr scene = engine->CreateScene("scene");
+  ASSERT_NE(nullptr, scene);
+
+  VisualPtr root = scene->RootVisual();
+  ASSERT_NE(nullptr, root);
+
+  const std::string programsPath = gz::common::joinPaths(
+      TEST_MEDIA_PATH, "materials", "programs");
+  MaterialPtr shader = scene->CreateMaterial();
+  shader->SetVertexShader(
+      gz::common::joinPaths(programsPath, "simple_color_vs.glsl"));
+  shader->SetFragmentShader(
+      gz::common::joinPaths(programsPath, "same_name", "fragment_shader.glsl"));
+
+  VisualPtr visual = scene->CreateVisual();
+  visual->AddGeometry(scene->CreateBox());
+  visual->SetWorldPosition(3.0, 0.0, 0.0);
+  visual->SetMaterial(shader);
+  root->AddChild(visual);
+
+  // visual will clone and create a unique material
+  // so destroy this one
+  scene->DestroyMaterial(shader);
+
+  CameraPtr camera = scene->CreateCamera("camera");
+  ASSERT_NE(nullptr, camera);
+  camera->SetImageWidth(100);
+  camera->SetImageHeight(100);
+  camera->SetAspectRatio(1.0);
+  camera->SetHFOV(GZ_PI / 2);
+  root->AddChild(camera);
+
+  Image image = camera->CreateImage();
+  camera->Capture(image);
+
+  unsigned char *data = image.Data<unsigned char>();
+  unsigned int height = camera->ImageHeight();
+  unsigned int width = camera->ImageWidth();
+  unsigned int mid = (height / 2 * width + width / 2) * 3u;
+
+  EXPECT_GT(data[mid], 200);
+  EXPECT_LT(data[mid + 1], 50);
+  EXPECT_LT(data[mid + 2], 50);
+
+  // Clean up
+  engine->DestroyScene(scene);
+}
+
+/////////////////////////////////////////////////
 TEST_F(CameraTest, GZ_UTILS_TEST_DISABLED_ON_WIN32(AspectRatioTest))
 {
   ScenePtr scene = engine->CreateScene("scene");
