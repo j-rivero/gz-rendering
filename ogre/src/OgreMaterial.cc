@@ -468,35 +468,19 @@ void OgreMaterial::UpdateShaderParams(ConstShaderParamsPtr _params,
     else if (ShaderParam::PARAM_TEXTURE == name_param.second.Type() ||
              ShaderParam::PARAM_TEXTURE_CUBE == name_param.second.Type())
     {
-      // add the textures to the resource path
       std::string value;
       uint32_t uvSetIndex = 0;
       name_param.second.Value(value, uvSetIndex);
       ShaderParam::ParamType type = name_param.second.Type();
 
-      std::string baseName = value;
-      std::string dirPath = value;
-      if (common::isFile(value))
-      {
-        baseName = common::basename(value);
-        size_t idx = value.rfind(baseName);
-        if (idx != std::string::npos)
-        {
-          dirPath = value.substr(0, idx);
-          if (!dirPath.empty() &&
-            !Ogre::ResourceGroupManager::getSingleton().resourceLocationExists(
-            dirPath))
-          {
-            Ogre::ResourceGroupManager::getSingleton().addResourceLocation(
-                dirPath, "FileSystem", this->ogreGroup);
-          }
-        }
-      }
-      else
+      if (!common::isFile(value))
       {
         gzerr << "Shader param texture not found: " << value << std::endl;
         continue;
       }
+      // The AbsolutePathLoadingListener installed by OgreRenderEngine opens
+      // the absolute path, see OgreResourcePath
+      const std::string texturePath = OgreResourcePath(value);
 
       // get the material and create the texture unit state if it does not exist
       auto texUnit = this->ogrePass->getTextureUnitState(name_param.first);
@@ -516,12 +500,12 @@ void OgreMaterial::UpdateShaderParams(ConstShaderParamsPtr _params,
       // regular 2d texture
       if (type == ShaderParam::ParamType::PARAM_TEXTURE)
       {
-        texUnit->setTextureName(baseName);
+        texUnit->setTextureName(texturePath);
       }
       // cube maps
       else if (type == ShaderParam::ParamType::PARAM_TEXTURE_CUBE)
       {
-        texUnit->setCubicTextureName(baseName, true);
+        texUnit->setCubicTextureName(texturePath, true);
         // must apply this check for Metal rendering to work
         // (i.e. not segfault). See the discussion in:
         // https://github.com/gazebosim/gz-rendering/pull/541
