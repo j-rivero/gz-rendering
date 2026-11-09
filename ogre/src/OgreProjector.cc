@@ -542,10 +542,8 @@ void OgreProjectorListener::AddDecalToMaterial(
 
   Ogre::MaterialPtr mat = static_cast<Ogre::MaterialPtr>(
     Ogre::MaterialManager::getSingleton().getByName(_matName));
-  // OGRE 1.12's MaterialManager::getByName returns a null MaterialPtr on miss
-  // instead of throwing — and this code path is reached from the scheme
-  // listener with a name that has been trimmed (the "_MissingTech_" prefix
-  // stripped), so the lookup *can* legitimately fail. Don't dereference null.
+  // MaterialManager::getByName returns a null MaterialPtr if the material is
+  // not found
   if (!mat)
   {
     gzerr << "OgreProjector: cannot add decal — material '" << _matName
